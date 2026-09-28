@@ -1,0 +1,37 @@
+name: keyvaultsync
+metadata:
+  template: azd-init@1.17.0
+hooks:
+  preprovision:
+    posix:
+      shell: sh
+      run: ./scripts/preprovision-resource-group-tag.sh
+      interactive: true
+    windows:
+      shell: pwsh
+      run: ./scripts/PreProvision-ResourceGroupTag.ps1
+      interactive: true
+  predeploy:
+    posix:
+      shell: sh
+      run: ./scripts/verify-deployment-storage.sh
+    windows:
+      shell: pwsh
+      run: ./scripts/Verify-DeploymentStorage.ps1
+  postdeploy:
+    posix:
+      shell: sh
+      run: ./scripts/postdeploy-keyvault-access.sh
+      interactive: true
+    windows:
+      shell: pwsh
+      run: ./scripts/PostDeploy-KeyVaultAccess.ps1
+      interactive: true
+services:
+  keyvaultsync:
+    project: ./src/KeyVaultSync.Function
+    language: dotnet
+    host: function
+infra:
+  provider: bicep
+  path: ./infra

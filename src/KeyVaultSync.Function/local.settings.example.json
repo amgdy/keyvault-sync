@@ -1,0 +1,16 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "<set-from-local-application-insights-resource>",
+    "AZURE_SUBSCRIPTION_ID": "<subscription-id>",
+    "KEYVAULTSYNC_STORAGE_ACCOUNT_URI": "https://<storage-account>.blob.core.windows.net/",
+    "KEYVAULTSYNC_RESOURCE_GROUP": "<resource-group-or-empty>",
+    "KEYVAULTSYNC_PAIR_TAG": "sync-vault-id",
+    "KEYVAULTSYNC_STATE_CONTAINER": "keyvaultsync-state",
+    "KEYVAULTSYNC_RUNS_CONTAINER": "keyvaultsync-runs",
+    "KEYVAULTSYNC_TIMER_SCHEDULE": "0 */10 * * * *",
+    "KEYVAULTSYNC_LOG_LEVEL": "Information"
+  }
+}

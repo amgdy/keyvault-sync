@@ -1,0 +1,62 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "build: KeyVaultSync Runner",
+			"type": "process",
+			"command": "dotnet",
+			"args": [
+				"build",
+				"${workspaceFolder}/src/KeyVaultSync.Runner/KeyVaultSync.Runner.csproj",
+				"--no-restore"
+			],
+			"problemMatcher": "$msCompile",
+			"group": {
+				"kind": "build",
+				"isDefault": false
+			}
+		},
+		{
+			"label": "Azure Functions: Start KeyVaultSync locally",
+			"type": "shell",
+			"command": "func",
+			"args": [
+				"start",
+				"--verbose"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/src/KeyVaultSync.Function"
+			},
+			"isBackground": true,
+			"problemMatcher": {
+				"owner": "azure-functions",
+				"pattern": {
+					"regexp": ".*"
+				},
+				"background": {
+					"activeOnStart": true,
+					"beginsPattern": ".*Host lock lease acquired.*"
+				}
+			}
+		},
+		{
+			"label": "Temporary OSS release verification",
+			"type": "shell",
+			"command": "pwsh",
+			"args": [
+				"-NoProfile",
+				"-Command",
+				"$ErrorActionPreference='Stop'; dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj --no-restore; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj --no-restore -p:GenerateDocumentationFile=true -warnaserror; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bash tests/grant-keyvault-access.tests.sh; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bash tests/preprovision-resource-group-tag.tests.sh; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bash tests/bicep-tag-wiring.tests.sh; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bash tests/verify-deployment-storage.tests.sh; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bash tests/postdeploy-keyvault-access.tests.sh; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pwsh -NoProfile -File tests/Grant-KeyVaultAccess.Tests.ps1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pwsh -NoProfile -File tests/PreProvision-ResourceGroupTag.Tests.ps1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pwsh -NoProfile -File tests/Verify-DeploymentStorage.Tests.ps1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pwsh -NoProfile -File tests/PostDeploy-KeyVaultAccess.Tests.ps1; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; az bicep build --file infra/main.bicep --outfile /tmp/keyvaultsync-oss-main.json; exit $LASTEXITCODE"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "Temporary OSS release verification",
+			"type": "shell",
+			"command": "dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj --no-restore && dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj --no-restore -p:GenerateDocumentationFile=true -warnaserror && bash tests/grant-keyvault-access.tests.sh && bash tests/preprovision-resource-group-tag.tests.sh && bash tests/bicep-tag-wiring.tests.sh && bash tests/verify-deployment-storage.tests.sh && bash tests/postdeploy-keyvault-access.tests.sh && pwsh -NoProfile -File tests/Grant-KeyVaultAccess.Tests.ps1 && pwsh -NoProfile -File tests/PreProvision-ResourceGroupTag.Tests.ps1 && pwsh -NoProfile -File tests/Verify-DeploymentStorage.Tests.ps1 && pwsh -NoProfile -File tests/PostDeploy-KeyVaultAccess.Tests.ps1 && az bicep build --file infra/main.bicep --outfile /tmp/keyvaultsync-oss-main.json",
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
