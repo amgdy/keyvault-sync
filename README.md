@@ -2,7 +2,7 @@
 
 KeyVaultSync is a .NET 10 Azure Functions application and console runner for discovering mapped Azure Key Vault pairs, inventorying their contents, and automatically running supported synchronization for enabled pairs.
 
-The project is intentionally narrower than a full vault replication product. It does not create source or target vaults. It inventories secrets, keys, certificates, and authorization declarations; standalone secrets can be synchronized with guarded writes, and eligible keys or certificate groups can be seeded once through native backup/restore. Native seeds do not rotate later versions. Delete/purge and authorization reconciliation remain plan-only.
+The project is intentionally narrower than a full vault replication product. It does not create source or target vaults. It inventories secrets, keys, certificates, and authorization declarations; standalone secrets can be synchronized with guarded writes, and eligible keys or certificate groups can be seeded once through native backup/restore. Native seeds do not rotate later versions. The planner proposes a mode-first exact mirror for legacy access policies or direct vault-scoped RBAC assignments, including target-only removals, but never applies authorization changes. Delete/purge also remain plan-only.
 
 ## Use Cases
 

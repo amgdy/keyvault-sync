@@ -570,29 +570,25 @@ try {
     }
 
     foreach ($rolePlan in $customRolePlans) {
-        $existingAfterPreflight = @(Invoke-AzJson -Arguments @(
-            'role', 'definition', 'list', '--name', $rolePlan.Name, '--scope', $rolePlan.SubscriptionScope,
-            '--subscription', $rolePlan.SubscriptionId
-        ))
-        if ($existingAfterPreflight.Count -ne 0) {
-            throw "The custom role '$($rolePlan.Name)' appeared after preflight; rerun the preview before applying."
+        $recheckedRolePlan = Get-CustomRolePlan -Name $rolePlan.Name -PlaceholderId $rolePlan.PlaceholderId `
+            -SubscriptionId $rolePlan.SubscriptionId -SubscriptionScope $rolePlan.SubscriptionScope -Definition $rolePlan.Definition
+        if ($recheckedRolePlan.Id -ne $rolePlan.PlaceholderId) {
+            $rolePlan.Id = $recheckedRolePlan.Id
+            Write-Host "REUSE exact custom role '$($rolePlan.Name)' that appeared after preflight; scope and permissions verified."
         }
-        if ($PSCmdlet.ShouldProcess($rolePlan.SubscriptionScope, "Create custom role '$($rolePlan.Name)'")) {
+        elseif ($PSCmdlet.ShouldProcess($rolePlan.SubscriptionScope, "Create custom role '$($rolePlan.Name)'")) {
             $definitionJson = ConvertTo-Json -InputObject $rolePlan.Definition -Depth 20 -Compress
             $createdRole = Invoke-AzJson -Arguments @(
                 'role', 'definition', 'create', '--role-definition', $definitionJson, '--subscription', $rolePlan.SubscriptionId
             )
             $rolePlan.Id = $createdRole.name
-            if ($rolePlan.PlaceholderId -eq $pendingWriterRoleId) { $script:writerRoleId = $rolePlan.Id }
-            elseif ($rolePlan.PlaceholderId -eq $pendingNativeBackupRoleId) { $script:nativeBackupRoleId = $rolePlan.Id }
-            elseif ($rolePlan.PlaceholderId -eq $pendingNativeRestoreRoleId) { $script:nativeRestoreRoleId = $rolePlan.Id }
         }
         else {
             $rolePlan.Id = $null
-            if ($rolePlan.PlaceholderId -eq $pendingWriterRoleId) { $script:writerRoleId = $null }
-            elseif ($rolePlan.PlaceholderId -eq $pendingNativeBackupRoleId) { $script:nativeBackupRoleId = $null }
-            elseif ($rolePlan.PlaceholderId -eq $pendingNativeRestoreRoleId) { $script:nativeRestoreRoleId = $null }
         }
+        if ($rolePlan.PlaceholderId -eq $pendingWriterRoleId) { $script:writerRoleId = $rolePlan.Id }
+        elseif ($rolePlan.PlaceholderId -eq $pendingNativeBackupRoleId) { $script:nativeBackupRoleId = $rolePlan.Id }
+        elseif ($rolePlan.PlaceholderId -eq $pendingNativeRestoreRoleId) { $script:nativeRestoreRoleId = $rolePlan.Id }
     }
 
     foreach ($plan in $plans) {

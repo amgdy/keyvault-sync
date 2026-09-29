@@ -508,8 +508,8 @@ internal static class SyncPlanner
 
     private sealed record KeyVaultObjectReference(string Name, string Version);
 
-    /// <summary>Reports incomplete authorization, model differences, RBAC inventory, or canonical legacy-policy differences.</summary>
-    /// <remarks>No branch grants/revokes access. Even equal declarations are not a proof of effective authorization.</remarks>
+    /// <summary>Plans a mode-first exact mirror of the source's active authorization declarations.</summary>
+    /// <remarks>No branch grants/revokes access. RBAC mirroring is limited to direct vault-scoped role assignments; ancestor scopes are context only.</remarks>
     private static void AddAuthorizationPlan(ICollection<PlanItem> plan, VaultInventory source, VaultInventory target)
     {
         if (source.Authorization.Warnings.Count > 0 || target.Authorization.Warnings.Count > 0)
@@ -519,27 +519,95 @@ internal static class SyncPlanner
             return;
         }
 
+        var sourceUsesRbac = source.Authorization.UsesRbac;
+        var targetUsesRbac = target.Authorization.UsesRbac;
+        IReadOnlyList<RoleAssignmentSummary> sourceDirectAssignments = sourceUsesRbac
+            ? GetDirectRoleAssignments(source.Authorization.RoleAssignments, source.VaultId)
+            : [];
+        IReadOnlyList<RoleAssignmentSummary> targetDirectAssignments = sourceUsesRbac
+            ? GetDirectRoleAssignments(target.Authorization.RoleAssignments, target.VaultId)
+            : [];
+
+        if (sourceUsesRbac
+            && (source.Authorization.RoleAssignments.Concat(target.Authorization.RoleAssignments)
+                .Any(assignment => string.IsNullOrWhiteSpace(assignment.Scope))
+                || sourceDirectAssignments.Concat(targetDirectAssignments)
+                    .Any(assignment => string.IsNullOrWhiteSpace(assignment.PrincipalId)
+                        || string.IsNullOrWhiteSpace(assignment.RoleDefinitionId))))
+        {
+            plan.Add(Item("Authorization", source.VaultName, "CompareDeclaredIntent", "AUTHORIZATION_INVENTORY_INCOMPLETE", null, null,
+                "One or more RBAC assignment records lacks the scope, principal, or role-definition ID required for an exact direct-assignment comparison."));
+            return;
+        }
+
+        if (!sourceUsesRbac
+            && source.Authorization.AccessPolicies.Concat(target.Authorization.AccessPolicies)
+                .Any(policy => string.IsNullOrWhiteSpace(policy.TenantId) || string.IsNullOrWhiteSpace(policy.ObjectId)))
+        {
+            plan.Add(Item("Authorization", source.VaultName, "CompareDeclaredIntent", "AUTHORIZATION_INVENTORY_INCOMPLETE", null, null,
+                "One or more legacy access-policy records lacks the tenant or principal ID required for an exact policy comparison."));
+            return;
+        }
+
         if (source.Authorization.UsesRbac != target.Authorization.UsesRbac)
         {
-            plan.Add(Item("Authorization", source.VaultName, "ReconcileDeclaredIntent", "PERMISSION_MODEL_MISMATCH", null, null,
-                "Source and target use different authorization models. Compile declared regional intent; do not clone the source document."));
-            return;
+            var sourceModel = sourceUsesRbac ? "Azure RBAC" : "legacy access policies";
+            var targetModel = targetUsesRbac ? "Azure RBAC" : "legacy access policies";
+            plan.Add(Item("Authorization", source.VaultName, "SetTargetAuthorizationModel", "PERMISSION_MODEL_MISMATCH", null, null,
+                $"Target uses {targetModel}; source uses {sourceModel}. Plan the target mode change first, then mirror the source model's active declarations. Switching modes can activate or deactivate stored target declarations. No authorization changes are applied."));
         }
 
-        if (source.Authorization.UsesRbac)
+        if (sourceUsesRbac)
         {
-            plan.Add(Item("Authorization", source.VaultName, "InventoryDirectRoleAssignments", "RBAC_INVENTORY_ONLY", null, null,
-                $"Inventory sees {source.Authorization.RoleAssignments.Count} scoped role assignments on source and {target.Authorization.RoleAssignments.Count} on target. Group membership, PIM, deny assignments, and management-group inheritance are not resolved."));
+            AddRbacAssignmentPlan(plan, source, target, sourceDirectAssignments, targetDirectAssignments);
             return;
         }
 
-        var policiesMatch = NormalizeAccessPolicies(source.Authorization.AccessPolicies)
-            .SequenceEqual(NormalizeAccessPolicies(target.Authorization.AccessPolicies), StringComparer.Ordinal);
-        var status = policiesMatch ? "ACCESS_POLICY_INTENT_MATCH" : "ACCESS_POLICY_INTENT_DIFFERS";
-        plan.Add(Item("Authorization", source.VaultName, "CompareDeclaredIntent", status, null, null,
+        var policyDifferences = CompareDeclarations(
+            NormalizeAccessPolicies(source.Authorization.AccessPolicies),
+            NormalizeAccessPolicies(target.Authorization.AccessPolicies));
+        var policiesMatch = policyDifferences.SourceOnly == 0 && policyDifferences.TargetOnly == 0;
+        var status = policiesMatch
+            ? "ACCESS_POLICY_INTENT_MATCH"
+            : "ACCESS_POLICY_INTENT_DIFFERS";
+        plan.Add(Item("Authorization", source.VaultName,
+            status == "ACCESS_POLICY_INTENT_MATCH" ? "CompareDeclaredIntent" : "MirrorAccessPolicies",
+            status, null, null,
             policiesMatch
                 ? $"Source and target declare the same {source.Authorization.AccessPolicies.Count} legacy access policies, including principals and permission sets."
-                : $"Source and target declare different legacy access policies ({source.Authorization.AccessPolicies.Count} source, {target.Authorization.AccessPolicies.Count} target). No authorization changes are applied."));
+                : $"Exact legacy policy plan: {policyDifferences.SourceOnly} source-only declarations to add and {policyDifferences.TargetOnly} target-only declarations to remove ({source.Authorization.AccessPolicies.Count} source, {target.Authorization.AccessPolicies.Count} target). No authorization changes are applied."));
+    }
+
+    private static void AddRbacAssignmentPlan(
+        ICollection<PlanItem> plan,
+        VaultInventory source,
+        VaultInventory target,
+        IReadOnlyList<RoleAssignmentSummary> sourceDirectAssignments,
+        IReadOnlyList<RoleAssignmentSummary> targetDirectAssignments)
+    {
+        var differences = CompareDeclarations(
+            NormalizeRoleAssignments(sourceDirectAssignments),
+            NormalizeRoleAssignments(targetDirectAssignments));
+        var assignmentsMatch = differences.SourceOnly == 0 && differences.TargetOnly == 0;
+        var sourceAncestorCount = source.Authorization.RoleAssignments.Count(assignment => !IsSameResourceId(assignment.Scope, source.VaultId));
+        var targetAncestorCount = target.Authorization.RoleAssignments.Count(assignment => !IsSameResourceId(assignment.Scope, target.VaultId));
+        var conditionCount = sourceDirectAssignments.Count(assignment => !string.IsNullOrWhiteSpace(assignment.Condition))
+            + targetDirectAssignments.Count(assignment => !string.IsNullOrWhiteSpace(assignment.Condition));
+
+        plan.Add(Item("Authorization", source.VaultName,
+            assignmentsMatch ? "CompareDirectRoleAssignments" : "MirrorDirectRoleAssignments",
+            assignmentsMatch ? "RBAC_ASSIGNMENT_INTENT_MATCH" : "RBAC_ASSIGNMENT_INTENT_DIFFERS",
+            null, null,
+            assignmentsMatch
+                ? $"Source and target direct vault-scoped RBAC assignment declarations match ({sourceDirectAssignments.Count} each). Resource-group/subscription assignments remain context only (source {sourceAncestorCount}, target {targetAncestorCount}); the runner does not resolve effective access."
+                : $"Exact direct vault-scoped RBAC plan: {differences.SourceOnly} source-only assignments to add and {differences.TargetOnly} target-only assignments to remove ({sourceDirectAssignments.Count} source, {targetDirectAssignments.Count} target). Resource-group/subscription assignments remain context only (source {sourceAncestorCount}, target {targetAncestorCount}); the runner does not resolve effective access."));
+
+        if (conditionCount > 0)
+        {
+            plan.Add(Item("Authorization", source.VaultName, "ReviewConditionalRoleAssignments",
+                "RBAC_CONDITIONAL_ASSIGNMENTS_REVIEW_REQUIRED", null, null,
+                $"The direct assignment inventory contains {conditionCount} conditional declarations. Condition text and version are compared as declared, but their meaning is not evaluated and may be scope-dependent; review before applying any change."));
+        }
     }
 
     /// <summary>Canonicalizes principal IDs and sorted permission categories/values for order-insensitive declaration comparison.</summary>
@@ -569,6 +637,64 @@ internal static class SyncPlanner
             }))
             .Order(StringComparer.Ordinal)
             .ToArray();
+    }
+
+    private static string[] NormalizeRoleAssignments(IReadOnlyList<RoleAssignmentSummary> assignments)
+    {
+        return assignments
+            .Select(assignment => JsonSerializer.Serialize(new
+            {
+                PrincipalId = assignment.PrincipalId.Trim().ToLowerInvariant(),
+                PrincipalType = assignment.PrincipalType?.Trim().ToLowerInvariant(),
+                RoleDefinitionId = NormalizeResourceId(assignment.RoleDefinitionId),
+                Condition = assignment.Condition?.Trim(),
+                ConditionVersion = assignment.ConditionVersion?.Trim(),
+                DelegatedManagedIdentityResourceId = NormalizeResourceId(assignment.DelegatedManagedIdentityResourceId),
+            }))
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
+    private static IReadOnlyList<RoleAssignmentSummary> GetDirectRoleAssignments(
+        IReadOnlyList<RoleAssignmentSummary> assignments,
+        string vaultId)
+    {
+        return assignments.Where(assignment => IsSameResourceId(assignment.Scope, vaultId)).ToArray();
+    }
+
+    private static bool IsSameResourceId(string left, string right)
+    {
+        return left.TrimEnd('/').Equals(right.TrimEnd('/'), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string? NormalizeResourceId(string? resourceId)
+    {
+        return string.IsNullOrWhiteSpace(resourceId)
+            ? null
+            : resourceId.Trim().TrimEnd('/').ToLowerInvariant();
+    }
+
+    private static (int SourceOnly, int TargetOnly) CompareDeclarations(
+        IReadOnlyList<string> sourceDeclarations,
+        IReadOnlyList<string> targetDeclarations)
+    {
+        var targetCounts = targetDeclarations
+            .GroupBy(declaration => declaration, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.Ordinal);
+        var sourceOnly = 0;
+        foreach (var declaration in sourceDeclarations)
+        {
+            if (targetCounts.TryGetValue(declaration, out var targetCount) && targetCount > 0)
+            {
+                targetCounts[declaration] = targetCount - 1;
+            }
+            else
+            {
+                sourceOnly++;
+            }
+        }
+
+        return (sourceOnly, targetCounts.Values.Sum());
     }
 
     /// <summary>Compares the subscription segments of already admitted vault IDs without an ARM lookup.</summary>

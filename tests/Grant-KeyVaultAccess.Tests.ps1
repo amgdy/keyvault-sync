@@ -80,6 +80,8 @@ function Reset-Fixture {
         Calls = [System.Collections.Generic.List[object]]::new()
         Drift = $false
         FailTarget = $false
+        DelayedRoleName = $null
+        DelayedRoleListed = $false
     }
 }
 
@@ -150,6 +152,10 @@ function az {
         }
         '^role definition list$' {
             $name = Get-MockArgument $argumentsList '--name'
+            if ($global:Fixture.DelayedRoleName -eq $name -and -not $global:Fixture.DelayedRoleListed) {
+                $global:Fixture.DelayedRoleListed = $true
+                return (Convert-FixtureToJson -Value @())
+            }
             return (Convert-FixtureToJson -Value @($global:Fixture.Definitions | Where-Object { $_.roleName -eq $name }))
         }
         '^role definition create$' {
@@ -244,6 +250,65 @@ Assert-True ((@($backupDefinition.permissions[0].dataActions | Sort-Object) -joi
 Assert-True ((@($restoreDefinition.permissions[0].dataActions | Sort-Object) -join ',') -eq
     'Microsoft.KeyVault/vaults/certificates/restore/action,Microsoft.KeyVault/vaults/keys/restore/action') 'target restore role actions'
 Write-Output 'PASS PowerShell default RBAC grants include narrow secret and native permissions'
+
+Reset-Fixture -Mode Rbac
+$writerRoleName = "KeyVaultSync Secret Writer ($subscriptionId)"
+$writerDataActions = @(
+    'Microsoft.KeyVault/vaults/secrets/readMetadata/action',
+    'Microsoft.KeyVault/vaults/secrets/getSecret/action',
+    'Microsoft.KeyVault/vaults/secrets/setSecret/action',
+    'Microsoft.KeyVault/vaults/secrets/update/action'
+)
+$global:Fixture.Definitions = @([pscustomobject]@{
+    name = $fixtureWriterRoleId
+    roleName = $writerRoleName
+    roleType = 'CustomRole'
+    assignableScopes = @($subscriptionScope)
+    permissions = @([pscustomobject]@{
+        actions = @()
+        notActions = @()
+        dataActions = $writerDataActions
+        notDataActions = @()
+    })
+})
+$global:Fixture.DelayedRoleName = $writerRoleName
+$output = & $grantScript -IdentityResourceId $identityId -SourceVaultResourceId $sourceId -Apply -Confirm:$false 6>&1 | Out-String
+$writerAssignments = @($global:Fixture.Assignments | Where-Object {
+    $_.scope -ieq $targetId -and $_.roleDefinitionId -like "*/$fixtureWriterRoleId"
+})
+$createdRoleCalls = @($global:Fixture.Calls | Where-Object {
+    $_.Count -ge 3 -and $_[0] -eq 'role' -and $_[1] -eq 'definition' -and $_[2] -eq 'create'
+})
+Assert-True ($global:Fixture.Assignments.Count -eq 6) 'an exact role appearing after preflight should still permit the pair grants'
+Assert-True ($writerAssignments.Count -eq 1) 'the target should use the exact role that appeared after preflight'
+Assert-True ($global:Fixture.Definitions.Count -eq 3 -and $createdRoleCalls.Count -eq 2) 'the appeared role must not be created again'
+Assert-True ($output.Contains('REUSE exact custom role')) 'reuse of the appeared role should be reported'
+Write-Output 'PASS PowerShell reuses an exact custom role that appears after preflight'
+
+Reset-Fixture -Mode Rbac
+$global:Fixture.Definitions = @([pscustomobject]@{
+    name = $fixtureWriterRoleId
+    roleName = $writerRoleName
+    roleType = 'CustomRole'
+    assignableScopes = @($subscriptionScope)
+    permissions = @([pscustomobject]@{
+        actions = @()
+        notActions = @()
+        dataActions = @('*')
+        notDataActions = @()
+    })
+})
+$global:Fixture.DelayedRoleName = $writerRoleName
+$appearedMismatchFailed = $false
+try {
+    $null = & $grantScript -IdentityResourceId $identityId -SourceVaultResourceId $sourceId -Apply -Confirm:$false 6>&1
+}
+catch {
+    $appearedMismatchFailed = $true
+}
+Assert-True $appearedMismatchFailed 'a mismatched custom role appearing after preflight should fail'
+Assert-NoWrites
+Write-Output 'PASS PowerShell rejects a mismatched custom role that appears after preflight'
 
 Reset-Fixture -Mode Rbac
 $global:Fixture.Vaults[0].tags.PSObject.Properties.Remove('sync-vault-id')

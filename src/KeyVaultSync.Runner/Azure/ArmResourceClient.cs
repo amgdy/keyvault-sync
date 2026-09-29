@@ -502,6 +502,8 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
                         PrincipalType = GetString(properties, "principalType"),
                         RoleDefinitionId = GetString(properties, "roleDefinitionId") ?? string.Empty,
                         Condition = GetString(properties, "condition"),
+                        ConditionVersion = GetString(properties, "conditionVersion"),
+                        DelegatedManagedIdentityResourceId = GetString(properties, "delegatedManagedIdentityResourceId"),
                     });
                 }
             }

@@ -78,6 +78,15 @@ az() {
             ;;
         'role definition list')
             definition_name=$(argument --name "$@")
+            if [[ ${mock_delayed_role_name:-} == "$definition_name" ]]; then
+                delayed_list_count=$(jq -sr --arg name "$definition_name" '
+                    [.[] | select(.[0:3] == ["role","definition","list"])
+                    | select(.[(index("--name") + 1)] == $name)] | length' "$fixture_directory/calls.jsonl")
+                if [[ "$delayed_list_count" == 1 ]]; then
+                    printf '[]\n'
+                    return
+                fi
+            fi
             jq --arg name "$definition_name" '[.[] | select(.roleName == $name)]' "$fixture_directory/definitions.json"
             ;;
         'role definition create')
@@ -114,7 +123,7 @@ az() {
 export -f az argument permission_values
 
 reset_fixture() {
-    export mock_drift=false mock_fail_read=false mock_fail_target=false
+    export mock_drift=false mock_fail_read=false mock_fail_target=false mock_delayed_role_name=''
     printf '' >"$fixture_directory/calls.jsonl"
     printf '[]\n' >"$fixture_directory/assignments.json"
     printf '[]\n' >"$fixture_directory/definitions.json"
@@ -197,6 +206,40 @@ mv "$fixture_directory/next.json" "$fixture_directory/definitions.json"
 expect_failure --apply
 assert_no_writes
 printf 'PASS an existing broader custom role is rejected without overwriting it\n'
+
+reset_fixture
+writer_role_name="KeyVaultSync Secret Writer ($fixture_subscription)"
+jq -n --arg id "$fixture_writer" --arg name "$writer_role_name" --arg scope "$fixture_scope" '[
+    {name:$id,roleName:$name,roleType:"CustomRole",assignableScopes:[$scope],
+     permissions:[{actions:[],notActions:[],notDataActions:[],dataActions:[
+        "Microsoft.KeyVault/vaults/secrets/readMetadata/action",
+        "Microsoft.KeyVault/vaults/secrets/getSecret/action",
+        "Microsoft.KeyVault/vaults/secrets/setSecret/action",
+        "Microsoft.KeyVault/vaults/secrets/update/action"
+     ]}]}
+]' >"$fixture_directory/definitions.json"
+export mock_delayed_role_name="$writer_role_name"
+run_script --apply
+assert_json 'length == 6
+    and any(.[]; .scope == env.fixture_target and
+        .roleDefinitionId == (env.fixture_scope + "/providers/Microsoft.Authorization/roleDefinitions/" + env.fixture_writer))' \
+    "$fixture_directory/assignments.json"
+assert_json 'length == 3 and any(.[]; .name == env.fixture_writer and (.roleName | contains("Secret Writer")))' \
+    "$fixture_directory/definitions.json"
+jq -se '[.[] | select(.[0:3] == ["role","definition","create"])] | length == 2' \
+    "$fixture_directory/calls.jsonl" >/dev/null
+grep -q 'REUSE exact custom role:' "$fixture_directory/output.txt"
+printf 'PASS an exact custom role that appears after preflight is reused without duplicate creation\n'
+
+reset_fixture
+jq -n --arg id "$fixture_writer" --arg name "$writer_role_name" --arg scope "$fixture_scope" '[
+    {name:$id,roleName:$name,roleType:"CustomRole",assignableScopes:[$scope],
+     permissions:[{actions:[],notActions:[],notDataActions:[],dataActions:["*"]}]}
+]' >"$fixture_directory/definitions.json"
+export mock_delayed_role_name="$writer_role_name"
+expect_failure --apply
+assert_no_writes
+printf 'PASS a mismatched custom role that appears after preflight is rejected before grants\n'
 
 reset_fixture
 edit_fixture '.[0].tags = {} | .[1].tags["sync-source-keyvault-id"] = .[0].id'

@@ -472,7 +472,7 @@ public sealed class RunnerApplication
                 || item.Status.Contains("FAILED", StringComparison.Ordinal)
                 || item.Status.Contains("UNRESOLVED", StringComparison.Ordinal)
                 || (item.ObjectType == "Authorization"
-                    && item.Status is not ("RBAC_INVENTORY_ONLY" or "ACCESS_POLICY_INTENT_MATCH")))
+                    && item.Status is not ("RBAC_ASSIGNMENT_INTENT_MATCH" or "ACCESS_POLICY_INTENT_MATCH")))
             {
                 return true;
             }

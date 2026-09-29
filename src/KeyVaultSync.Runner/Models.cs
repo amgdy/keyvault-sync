@@ -165,6 +165,10 @@ internal sealed record RoleAssignmentSummary
     public required string RoleDefinitionId { get; init; }
     /// <summary>Gets the optional assignment condition as declared text; the runner does not evaluate it.</summary>
     public string? Condition { get; init; }
+    /// <summary>Gets the condition version declared by ARM, when present.</summary>
+    public string? ConditionVersion { get; init; }
+    /// <summary>Gets the delegated managed-identity resource ID, when present.</summary>
+    public string? DelegatedManagedIdentityResourceId { get; init; }
 }
 
 /// <summary>Authorization declarations for comparison and reporting, not proof of effective source/target access.</summary>
@@ -215,7 +219,7 @@ internal sealed record VaultInventory
 }
 
 /// <summary>A planned action or its replacement execution outcome; action/status strings form a shared reporting contract.</summary>
-/// <remarks>Ready statuses are conditional proposals. Only the guarded executor can decide to mutate or refresh a supported secret baseline.</remarks>
+/// <remarks>Authorization entries remain review-only proposals. Only guarded secret and native-seed executors can apply their supported object types.</remarks>
 internal sealed record PlanItem
 {
     /// <summary>Gets the discriminator: Secret, Key, CertificateGroup, Authorization, or Inventory.</summary>

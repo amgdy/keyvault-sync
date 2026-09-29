@@ -227,6 +227,19 @@ native_restore_role_id='pending-native-restore-role'
 custom_role_id_map='{}'
 custom_role_creates='[]'
 
+custom_role_id_from_definitions() {
+    local definitions="$1"
+    local definition="$2"
+    jq -e --argjson expected "$definition" '
+        length == 1 and .[0].roleType == "CustomRole" and (.[0].permissions | length) == 1
+        and (.[0].assignableScopes | map(ascii_downcase) | sort) == ($expected.AssignableScopes | map(ascii_downcase) | sort)
+        and (.[0].permissions[0].actions // []) == [] and (.[0].permissions[0].notActions // []) == []
+        and (.[0].permissions[0].notDataActions // []) == []
+        and ((.[0].permissions[0].dataActions // []) | sort) == ($expected.DataActions | sort)' <<<"$definitions" >/dev/null \
+        || return 1
+    jq -er --arg pattern "$guid_pattern" '.[0].name | select(test("^" + $pattern + "$"; "i"))' <<<"$definitions"
+}
+
 resolve_custom_role() {
     local output_variable="$1"
     local placeholder="$2"
@@ -250,14 +263,9 @@ resolve_custom_role() {
         return
     fi
 
-    jq -e --argjson expected "$definition" '
-        length == 1 and .[0].roleType == "CustomRole" and (.[0].permissions | length) == 1
-        and (.[0].assignableScopes | map(ascii_downcase) | sort) == ($expected.AssignableScopes | map(ascii_downcase) | sort)
-        and (.[0].permissions[0].actions // []) == [] and (.[0].permissions[0].notActions // []) == []
-        and (.[0].permissions[0].notDataActions // []) == []
-        and ((.[0].permissions[0].dataActions // []) | sort) == ($expected.DataActions | sort)' <<<"$definitions" >/dev/null \
-        || fail "The existing custom role '$name' differs from the required narrow role; it will not be overwritten."
-    role_id=$(jq -er --arg pattern "$guid_pattern" '.[0].name | select(test("^" + $pattern + "$"; "i"))' <<<"$definitions")
+    if ! role_id=$(custom_role_id_from_definitions "$definitions" "$definition"); then
+        fail "The existing custom role '$name' differs from the required narrow role; it will not be overwritten."
+    fi
     printf -v "$output_variable" '%s' "$role_id"
     custom_role_id_map=$(jq -cn --argjson map "$custom_role_id_map" --arg placeholder "$placeholder" --arg roleId "$role_id" \
         '$map + {($placeholder):$roleId}')
@@ -396,9 +404,15 @@ while IFS= read -r role_plan; do
     definition=$(jq -c '.definition' <<<"$role_plan")
     role_name=$(jq -r '.definition.Name' <<<"$role_plan")
     definitions=$(azure role definition list --name "$role_name" --scope "$subscription_scope")
-    [[ $(jq 'length' <<<"$definitions") == 0 ]] || fail "The custom role '$role_name' appeared after preflight; rerun the preview before applying."
-    created_role=$(azure role definition create --role-definition "$definition")
-    created_role_id=$(jq -er --arg pattern "$guid_pattern" '.name | select(test("^" + $pattern + "$"; "i"))' <<<"$created_role")
+    if [[ $(jq 'length' <<<"$definitions") == 0 ]]; then
+        created_role=$(azure role definition create --role-definition "$definition")
+        created_role_id=$(jq -er --arg pattern "$guid_pattern" '.name | select(test("^" + $pattern + "$"; "i"))' <<<"$created_role")
+    else
+        if ! created_role_id=$(custom_role_id_from_definitions "$definitions" "$definition"); then
+            fail "The custom role '$role_name' appeared after preflight with a different or invalid definition; refusing to reuse it."
+        fi
+        printf 'REUSE exact custom role: %s (scope and permissions verified)\n' "$role_name"
+    fi
     custom_role_id_map=$(jq -cn --argjson map "$custom_role_id_map" --arg placeholder "$placeholder" --arg roleId "$created_role_id" \
         '$map + {($placeholder):$roleId}')
 done < <(jq -c '.[]' <<<"$custom_role_creates")

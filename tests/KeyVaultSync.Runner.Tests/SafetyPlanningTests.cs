@@ -298,13 +298,204 @@ public sealed class SafetyPlanningTests
         }
     }
 
+    [Fact]
+    public void Legacy_authorization_plan_puts_mode_change_before_exact_policy_mirror()
+    {
+        var (pair, _, _) = CreatePair();
+        var sourcePolicy = CreateAccessPolicy("tenant-a", "source-principal", "get", "list");
+        var targetPolicy = CreateAccessPolicy("tenant-a", "target-principal", "get");
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: false, accessPolicies: [sourcePolicy]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: true, accessPolicies: [targetPolicy]);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        Assert.Equal(2, authorizationPlan.Length);
+        Assert.Equal("SetTargetAuthorizationModel", authorizationPlan[0].Action);
+        Assert.Equal("PERMISSION_MODEL_MISMATCH", authorizationPlan[0].Status);
+        Assert.Equal("MirrorAccessPolicies", authorizationPlan[1].Action);
+        Assert.Equal("ACCESS_POLICY_INTENT_DIFFERS", authorizationPlan[1].Status);
+        Assert.Contains("1 source-only declarations to add", authorizationPlan[1].Detail!, StringComparison.Ordinal);
+        Assert.Contains("1 target-only declarations to remove", authorizationPlan[1].Detail!, StringComparison.Ordinal);
+        Assert.Contains("No authorization changes are applied", authorizationPlan[1].Detail!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Legacy_access_policy_comparison_normalizes_casing_and_permission_order()
+    {
+        var (pair, _, _) = CreatePair();
+        var sourcePolicy = CreateAccessPolicy("tenant-a", "principal-a", "get", "list");
+        var targetPolicy = new AccessPolicySummary
+        {
+            TenantId = "TENANT-A",
+            ObjectId = "PRINCIPAL-A",
+            Permissions = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Secrets"] = ["LIST", "GET"],
+            },
+        };
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: false, accessPolicies: [sourcePolicy]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: false, accessPolicies: [targetPolicy]);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        var item = Assert.Single(authorizationPlan);
+        Assert.Equal("ACCESS_POLICY_INTENT_MATCH", item.Status);
+    }
+
+    [Fact]
+    public void Rbac_plan_mirrors_only_direct_vault_assignments_and_reports_ancestor_context()
+    {
+        var (pair, _, _) = CreatePair();
+        var sourceRole = CreateRoleAssignment("source-role", pair.Source.Id, "principal-a",
+            "/subscriptions/sub/providers/Microsoft.Authorization/roleDefinitions/role-a");
+        var targetRole = CreateRoleAssignment("target-role", pair.Target.Id, "PRINCIPAL-A",
+            "/SUBSCRIPTIONS/SUB/PROVIDERS/MICROSOFT.AUTHORIZATION/ROLEDEFINITIONS/ROLE-A");
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: true, roleAssignments:
+        [
+            sourceRole,
+            CreateRoleAssignment("source-parent-role", "/subscriptions/sub/resourceGroups/source-rg", "principal-inherited", "role-parent"),
+        ]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: true, roleAssignments:
+        [
+            targetRole,
+            CreateRoleAssignment("target-only-role", pair.Target.Id, "principal-b", "role-b"),
+            CreateRoleAssignment("target-parent-role", "/subscriptions/sub/resourceGroups/target-rg", "principal-inherited", "role-parent"),
+        ]);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        var item = Assert.Single(authorizationPlan);
+        Assert.Equal("MirrorDirectRoleAssignments", item.Action);
+        Assert.Equal("RBAC_ASSIGNMENT_INTENT_DIFFERS", item.Status);
+        Assert.Contains("0 source-only assignments to add", item.Detail!, StringComparison.Ordinal);
+        Assert.Contains("1 target-only assignments to remove", item.Detail!, StringComparison.Ordinal);
+        Assert.Contains("source 1, target 1", item.Detail!, StringComparison.Ordinal);
+        Assert.Contains("remain context only", item.Detail!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Ancestor_rbac_assignments_are_context_only()
+    {
+        var (pair, _, _) = CreatePair();
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: true, roleAssignments:
+        [
+            CreateRoleAssignment("source-parent-role", "/subscriptions/sub/resourceGroups/rg", "principal-a", "role-a"),
+        ]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: true);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        var item = Assert.Single(authorizationPlan);
+        Assert.Equal("RBAC_ASSIGNMENT_INTENT_MATCH", item.Status);
+        Assert.Contains("source 1, target 0", item.Detail!, StringComparison.Ordinal);
+        Assert.Contains("remain context only", item.Detail!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Conditional_rbac_assignments_require_review_even_when_declarations_match()
+    {
+        var (pair, _, _) = CreatePair();
+        var sourceRole = CreateRoleAssignment("source-role", pair.Source.Id, "principal-a", "role-a", "condition", "2.0");
+        var targetRole = CreateRoleAssignment("target-role", pair.Target.Id, "principal-a", "role-a", "condition", "2.0");
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: true, roleAssignments: [sourceRole]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: true, roleAssignments: [targetRole]);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        Assert.Equal("RBAC_ASSIGNMENT_INTENT_MATCH", authorizationPlan[0].Status);
+        Assert.Equal("RBAC_CONDITIONAL_ASSIGNMENTS_REVIEW_REQUIRED", authorizationPlan[1].Status);
+        Assert.True(RunnerApplication.HasUnappliedWork(authorizationPlan));
+    }
+
+    [Fact]
+    public void Rbac_plan_detects_condition_version_differences()
+    {
+        var (pair, _, _) = CreatePair();
+        var sourceRole = CreateRoleAssignment("source-role", pair.Source.Id, "principal-a", "role-a", "condition", "2.0");
+        var targetRole = CreateRoleAssignment("target-role", pair.Target.Id, "principal-a", "role-a", "condition", "1.0");
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: true, roleAssignments: [sourceRole]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: true, roleAssignments: [targetRole]);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        Assert.Equal("RBAC_ASSIGNMENT_INTENT_DIFFERS", authorizationPlan[0].Status);
+        Assert.Equal("RBAC_CONDITIONAL_ASSIGNMENTS_REVIEW_REQUIRED", authorizationPlan[1].Status);
+    }
+
+    [Fact]
+    public void Rbac_plan_detects_delegated_managed_identity_differences()
+    {
+        var (pair, _, _) = CreatePair();
+        var sourceRole = CreateRoleAssignment(
+            "source-role", pair.Source.Id, "principal-a", "role-a",
+            delegatedManagedIdentityResourceId: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/source");
+        var targetRole = CreateRoleAssignment(
+            "target-role", pair.Target.Id, "principal-a", "role-a",
+            delegatedManagedIdentityResourceId: "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/target");
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: true, roleAssignments: [sourceRole]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: true, roleAssignments: [targetRole]);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        var item = Assert.Single(authorizationPlan);
+        Assert.Equal("RBAC_ASSIGNMENT_INTENT_DIFFERS", item.Status);
+    }
+
+    [Fact]
+    public void Incomplete_authorization_inventory_blocks_mode_and_mirror_proposals()
+    {
+        var (pair, _, _) = CreatePair();
+        var source = WithAuthorization(CreateInventory(pair.Source, []), usesRbac: false, warnings: ["role scope unreadable"]);
+        var target = WithAuthorization(CreateInventory(pair.Target, []), usesRbac: true);
+
+        var authorizationPlan = SyncPlanner.CreatePlan(pair, CreateState(pair), source, target, hmacAvailable: true)
+            .Where(item => item.ObjectType == "Authorization")
+            .ToArray();
+
+        var item = Assert.Single(authorizationPlan);
+        Assert.Equal("AUTHORIZATION_INVENTORY_INCOMPLETE", item.Status);
+        Assert.Equal("CompareDeclaredIntent", item.Action);
+    }
+
+    [Fact]
+    public async Task Arm_authorization_inventory_preserves_role_assignment_condition_metadata()
+    {
+        const string sourceVaultId = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/source";
+        using var httpClient = new HttpClient(new AuthorizationInventoryHandler(sourceVaultId));
+        var client = new ArmResourceClient(new TestCredential(), NullLogger<ArmResourceClient>.Instance, httpClient);
+
+        var authorization = await client.GetAuthorizationAsync(sourceVaultId, CancellationToken.None);
+
+        var assignment = Assert.Single(authorization.RoleAssignments);
+        Assert.Equal("@Resource[Microsoft.KeyVault/vaults/secrets:name] StringEquals 'name'", assignment.Condition);
+        Assert.Equal("2.0", assignment.ConditionVersion);
+        Assert.Equal("/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/delegated",
+            assignment.DelegatedManagedIdentityResourceId);
+    }
+
     [Theory]
-    [InlineData("RBAC_INVENTORY_ONLY", false)]
+    [InlineData("RBAC_ASSIGNMENT_INTENT_MATCH", false)]
     [InlineData("ACCESS_POLICY_INTENT_MATCH", false)]
     [InlineData("ACCESS_POLICY_INTENT_DIFFERS", true)]
+    [InlineData("RBAC_ASSIGNMENT_INTENT_DIFFERS", true)]
+    [InlineData("RBAC_CONDITIONAL_ASSIGNMENTS_REVIEW_REQUIRED", true)]
     [InlineData("PERMISSION_MODEL_MISMATCH", true)]
     [InlineData("AUTHORIZATION_INVENTORY_INCOMPLETE", true)]
-    public void Authorization_inventory_only_does_not_count_as_unapplied_work(string status, bool expected)
+    public void Authorization_plan_statuses_report_unapplied_work(string status, bool expected)
     {
         var plan = new[]
         {
@@ -566,6 +757,59 @@ public sealed class SafetyPlanningTests
         return (pair, source, target);
     }
 
+    private static VaultInventory WithAuthorization(
+        VaultInventory inventory,
+        bool usesRbac,
+        IReadOnlyList<AccessPolicySummary>? accessPolicies = null,
+        IReadOnlyList<RoleAssignmentSummary>? roleAssignments = null,
+        IReadOnlyList<string>? warnings = null)
+    {
+        return inventory with
+        {
+            Authorization = new VaultAuthorizationSummary
+            {
+                UsesRbac = usesRbac,
+                AccessPolicies = accessPolicies ?? [],
+                RoleAssignments = roleAssignments ?? [],
+                Warnings = warnings ?? [],
+            },
+        };
+    }
+
+    private static AccessPolicySummary CreateAccessPolicy(string tenantId, string objectId, params string[] secretPermissions)
+    {
+        return new AccessPolicySummary
+        {
+            TenantId = tenantId,
+            ObjectId = objectId,
+            Permissions = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["secrets"] = secretPermissions,
+            },
+        };
+    }
+
+    private static RoleAssignmentSummary CreateRoleAssignment(
+        string id,
+        string scope,
+        string principalId,
+        string roleDefinitionId,
+        string? condition = null,
+        string? conditionVersion = null,
+        string? delegatedManagedIdentityResourceId = null)
+    {
+        return new RoleAssignmentSummary
+        {
+            Id = id,
+            Scope = scope,
+            PrincipalId = principalId,
+            RoleDefinitionId = roleDefinitionId,
+            Condition = condition,
+            ConditionVersion = conditionVersion,
+            DelegatedManagedIdentityResourceId = delegatedManagedIdentityResourceId,
+        };
+    }
+
     private static PairState CreateState(VaultPair pair)
     {
         return new PairState
@@ -690,6 +934,25 @@ public sealed class SafetyPlanningTests
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent(content),
+            });
+        }
+    }
+
+    private sealed class AuthorizationInventoryHandler(string sourceVaultId) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var path = request.RequestUri!.AbsolutePath;
+            var vaultAssignmentsPath = $"{sourceVaultId}/providers/Microsoft.Authorization/roleAssignments";
+            var content = path.Equals(sourceVaultId, StringComparison.OrdinalIgnoreCase)
+                ? """{"properties":{"enableRbacAuthorization":true,"accessPolicies":[]}}"""
+                : path.Equals(vaultAssignmentsPath, StringComparison.OrdinalIgnoreCase)
+                    ? """{"value":[{"id":"assignment","properties":{"scope":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.KeyVault/vaults/source","principalId":"principal","principalType":"ServicePrincipal","roleDefinitionId":"/subscriptions/sub/providers/Microsoft.Authorization/roleDefinitions/role","condition":"@Resource[Microsoft.KeyVault/vaults/secrets:name] StringEquals 'name'","conditionVersion":"2.0","delegatedManagedIdentityResourceId":"/subscriptions/sub/resourceGroups/rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/delegated"}}]}"""
+                    : """{"value":[]}""";
+
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(content, System.Text.Encoding.UTF8, "application/json"),
             });
         }
     }
