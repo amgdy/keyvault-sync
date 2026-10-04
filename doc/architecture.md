@@ -1,50 +1,180 @@
-# KeyVaultSync Architecture Notes
+# KeyVaultSync Architecture
 
-## Current
+## System View
 
-`KeyVaultSync.Runner` is the shared .NET 10 orchestration library used by both the console harness and the isolated timer Function. It inventories existing source/target Key Vaults and supports both `sync-vault-id=<target ARM ID>` on a source and `sync-source-keyvault-id=<source ARM ID>` on a target. The reverse declaration allows multiple targets for one source; duplicate declarations of the same edge are collapsed, while conflicting target ownership and chained/cyclic mappings are rejected. `KeyVaultSyncDisabled=true` on either vault is a pair-level opt-out. The runner scans each enabled pair, plans actions, and persists run history/checkpoints in private Blob containers.
+```mermaid
+flowchart LR
+    Timer["Azure Functions timer"]
+    Runner["RunnerApplication<br/>two-pass orchestration"]
+    Arm["ArmResourceClient<br/>discovery and RBAC inventory"]
+    Scanner["VaultInventoryScanner<br/>value-free object inventory"]
+    Planner["ReplicationPlanner<br/>pure deterministic plan"]
+    Objects["ObjectExecutor<br/>guarded object mutations"]
+    Rbac["RbacExecutor<br/>allowlisted RBAC mutations"]
+    State["BlobStateStore<br/>leases, state, plans, reports"]
+    Azure["Azure Resource Manager"]
+    Source["Source Key Vault"]
+    Target["Target Key Vault"]
 
-An enabled, unpaused mapping automatically opts the pair into supported synchronization. Standalone secret writes require a stable random 256-bit HMAC key supplied through protected Function App or local environment configuration; without it, secret actions are blocked while eligible native seeds are still evaluated. The operator must ensure this runner is the sole writer to target objects being changed. Secret baselines hold a keyed HMAC of the directional pair, secret name, and value, together with a separate digest of managed metadata; pending-write intents contain no plaintext. Before overwriting, the executor requires the current target value HMAC and metadata digest to match the committed baseline. An ambiguous Set Secret outcome remains pending and blocks retries.
+    Timer --> Runner
+    Runner --> Arm --> Azure
+    Runner --> Scanner
+    Scanner --> Source
+    Scanner --> Target
+    Runner --> Planner
+    Runner <--> State
+    Runner --> Objects
+    Objects --> Source
+    Objects --> Target
+    Runner --> Rbac --> Azure
+```
 
-Keys and certificate groups use an automatically evaluated, one-time native backup/restore seed path for eligible mapped pairs. It is restricted to eligible unused target names in the same subscription and region; a certificate and its backing objects are handled as one group. The seed path does not copy later versions or automatically overwrite a changed target. Delete/purge and authorization reconciliation remain plan-only. Authorization planning puts a target-mode change before mirroring the source model's declarations; it compares legacy access policies or direct vault-scoped RBAC assignments and includes target-only removals. It does not apply changes or resolve effective access.
+The arrows show runtime dependencies, not resource ownership. In particular, application infrastructure does not own the participating vaults.
 
-## Target Hosted Model
+## Components
 
-The hosted form is a .NET isolated Azure Function with one subscription-wide Timer Trigger every 10 minutes. It uses one central user-assigned managed identity and Entra-authenticated Application Insights ingestion. Both entry points retain `DefaultAzureCredential`; Bicep supplies the hosted `AZURE_CLIENT_ID`, and local development can use Azure CLI sign-in. The timer does not use Event Grid or a per-vault queue. Live infrastructure and IAM changes remain subject to explicit approval.
+- **KeyVaultSync.Function** is a thin .NET 10 isolated timer host.
+- **RunnerApplication** owns discovery, admission, planning, execution, reporting, and pair coordination.
+- **ArmResourceClient** performs read-only multi-subscription discovery and declared-authorization inventory.
+- **VaultInventoryScanner** produces value-free active and soft-deleted object inventories.
+- **ReplicationPlanner** is deterministic and performs no Azure mutation.
+- **ObjectExecutor** owns guarded secret/certificate creation, reconciliation, and soft deletion.
+- **RbacExecutor** owns supported direct role-assignment creation and deletion.
+- **BlobStateStore** owns pair leases, ETag-guarded state, pending intents, plans, checkpoints, and run reports.
 
-### Why Periodic Inventory Is Authoritative
+There is no Storage Queue. One timer invocation performs the complete workflow directly.
 
-Event Grid is not the synchronization source of truth. Key Vault's documented event catalog includes new-version and expiry notifications, but does not define a secret, key, or certificate deletion event. A consumer driven only by those notifications cannot discover that an object disappeared. The timer therefore lists active and soft-deleted objects on both vaults; only a complete scan may advance the checkpoint or provide deletion evidence. Objects purged before a successful scan cannot be reconstructed from inventory, so purge is not automated.
+## Mapping Graph
 
-Event Grid could be added later as a best-effort prompt to scan sooner, but it would not replace reconciliation. Event Grid delivery is at-least-once and unordered; retries are bounded by the configured delivery policy, and undelivered events require dead-letter handling or can be dropped. Duplicate, delayed, or missing notifications must not change planner state or permit a write without a complete inventory and pair-state checks.
+The runtime lists Key Vaults across all GUIDs in `KEYVAULTSYNC_SUBSCRIPTIONS`, combines the results, and then validates the complete graph. A target declares:
 
-References: [Key Vault Event Grid event types](https://learn.microsoft.com/azure/event-grid/event-schema-key-vault), [Key Vault Event Grid overview](https://learn.microsoft.com/azure/key-vault/general/event-grid-overview), and [Event Grid delivery and retry](https://learn.microsoft.com/azure/event-grid/delivery-and-retry).
+```text
+sync-source-keyvault-id=<source-vault-resource-ID>
+```
 
-Required infrastructure includes the Function App/plan, one shared Function host/deployment/KeyVaultSync state storage account, workspace-based Application Insights/Log Analytics, managed identity, and scoped role assignments. Source and target Key Vaults are external prerequisites and must not be created or deleted by this app's Bicep. The HMAC key is supplied out of band through protected Function App configuration and is not stored in IaC state.
+One target has one source; one source may have multiple targets. Discovery rejects unreadable endpoints, self-maps, chains, cycles, cross-tenant pairs, and pairs where either vault is not Azure RBAC-enabled. `KeyVaultSyncDisabled=true` on either endpoint suppresses the pair.
 
-## Infrastructure Decisions
+The application never creates, replaces, deletes, or purges source or target vaults.
 
-The azd entry point uses pinned Azure Verified Modules for the Function, Flex plan, shared storage account, workspace, Application Insights, user-assigned identity, and resource-group/subscription role assignments. Native child/settings/access declarations retain the application-specific safety contracts. New resources use CAF abbreviations and bounded workload/environment names; explicit name overrides are mandatory when adopting existing state, telemetry, or identity resources. See [deployment.md](deployment.md) for versions, ownership boundaries, naming rules, and migration prerequisites.
+```mermaid
+flowchart LR
+    subgraph SubscriptionA["Configured subscription A"]
+        Source["Source vault"]
+    end
+    subgraph SubscriptionB["Configured subscription B"]
+        Target1["Target vault 1<br/>sync-source-keyvault-id = Source ID"]
+    end
+    subgraph SubscriptionC["Configured subscription C"]
+        Target2["Target vault 2<br/>sync-source-keyvault-id = Source ID"]
+    end
 
-Vault authorization onboarding belongs to separate operator-run Bash/PowerShell tools, not the runtime. Each takes a UAMI and either a source or target vault resource ID, resolving the other vault through the corresponding mapping tag. The default preview covers the supported mapping-driven profile: inventory, guarded secret synchronization, and scoped backup/restore grants for eligible one-time seeds. Vault-level assignments avoid subscription-wide secret write; existing policy vaults retain their authorization model and prior permissions. The runtime planner reports a mode-first exact declaration plan but performs no authorization writes. For RBAC it compares only direct vault-scoped assignments; ancestor-scope assignments remain inventory context, while condition semantics, role-definition contents, group membership, PIM, deny assignments, and management-group inheritance are not resolved.
+    Source -->|authoritative supported objects and RBAC| Target1
+    Source -->|authoritative supported objects and RBAC| Target2
+```
 
-The following assessment applies the [Azure Well-Architected Framework](https://learn.microsoft.com/azure/well-architected/) to this scaffold. It records choices and limits, not a claim of full compliance.
+## Run Lifecycle
 
-| Pillar | Decision and remaining limitation |
-| --- | --- |
-| Security | One UAMI per trusted environment, scoped vault roles, separate IAM operators, disabled Shared Key/local telemetry authentication, and no deployment-time HMAC input. The runtime identity and deployment principal have account-level Blob Data Owner on shared storage; the deployment principal also has resource-group Owner. Restrict identity attachment and deployment authorization because those grants are broad. Subscription Reader and pre-existing broader grants require review. The current scaffold uses publicly reachable storage endpoints because private networking is not provisioned; authorization is required and containers are private. Add an approved private-network design before production where required. |
-| Reliability | Preserve the UAMI and shared storage account across host replacement, retain resource names/data, and preserve protected settings through the explicit merge gate. Sharing host artifacts with state/history reduces resource count but removes storage lifecycle isolation; never treat the account as disposable. Existing split-account deployments require explicit state migration or rebaseline. Deleting/recreating the identity still requires role migration. AVM Blob retention defaults and creation-only infrastructure encryption are not imposed on existing accounts. LRS storage/non-zone-redundant hosting remain lab choices, not regional recovery guarantees. RBAC propagation, partial onboarding/deployment, and recovery still need live validation. |
-| Cost Optimization | Preserve `Standard_LRS`, Flex scale-to-zero with no configured always-ready instances, and a 30-day workspace retention default. The Function module is not allowed to inherit premium-plan or Always On defaults. Review storage/telemetry charges and retention against operational requirements before production. |
-| Operational Excellence | Pin modules, retain existing output contracts, add an identity-ID onboarding output, and generate 11 settings rather than duplicate code defaults. UAMI assignment GUID seeds intentionally differ from old Function-based seeds; old grants need separate reviewed cleanup. Script previews and offline tests do not replace what-if, effective-access, startup, or ingestion checks. Console/worker telemetry ownership remains unchanged. |
-| Performance Efficiency | Explicit .NET 10 isolated runtime, 2048-MB default memory, supported Flex memory choices, and a bounded default scale ceiling of 10. A scale ceiling is not preallocated capacity and does not fence external Key Vault writers. Region/quota checks and representative load tests remain outstanding. |
+KeyVaultSync uses a two-pass run:
 
-Custom VM image maintenance and Kubernetes node tuning are not applicable to this managed Functions host. This choice does not waive application dependency patching or the unresolved data-recovery/network-isolation work. The applicable [Functions IaC guidance](https://learn.microsoft.com/azure/azure-functions/functions-infrastructure-as-code?pivots=flex-consumption-plan) and [CAF naming guidance](https://learn.microsoft.com/azure/cloud-adoption-framework/ready/azure-best-practices/resource-naming) drive these implementation choices.
+1. validate configuration and initialize Blob state;
+2. discover and validate all mappings;
+3. acquire a lease for each admitted pair;
+4. inventory source/target objects and direct supported RBAC;
+5. plan and persist every admitted pair;
+6. if any admitted pair could not plan, perform no mutations;
+7. execute already-persisted plans sequentially;
+8. verify every mutation and atomically update pair state;
+9. persist the durable run report and release all leases.
 
-Authentication deliberately retains the user's requested `DefaultAzureCredential` path in both environments, instead of introducing a production-only credential factory. Its [standard client-ID selector](https://learn.microsoft.com/dotnet/api/azure.identity.defaultazurecredentialoptions.managedidentityclientid) supports the UAMI without custom application options. Microsoft's [.NET authentication best practices](https://learn.microsoft.com/dotnet/azure/sdk/authentication/best-practices) prefer a specific production credential for predictability; retaining the default chain is an explicit tradeoff, not an equivalent exclusivity guarantee. Keep hosted service-principal credentials absent and validate the resolved identity after deployment.
+```mermaid
+flowchart TD
+    Start([Timer invocation]) --> Configure["Validate configuration<br/>initialize Blob containers"]
+    Configure --> Discover["Discover and validate complete mapping graph"]
+    Discover --> PlanPairs["For every admitted pair:<br/>lease, inventory, plan, persist"]
+    PlanPairs --> Planned{Did every admitted pair plan?}
+    Planned -- No --> NoMutation["Persist failed or partial report<br/>perform no mutations"]
+    Planned -- Yes --> Execute["Execute persisted pair plans sequentially"]
+    Execute --> Verify["Verify each Azure mutation<br/>commit state with ETag"]
+    Verify --> Report["Persist durable run report"]
+    NoMutation --> Release["Release pair leases"]
+    Report --> Release
+    Release --> Done([Run complete])
+```
 
-## Deliberate Limits
+Execution order within a pair is:
 
-- The app does not claim authorization equivalence from direct role-assignment counts. Group membership, PIM, deny assignments, and all effective scopes must be resolved before reconciliation.
-- Native key/certificate seeding is a mapping-driven one-time backup/restore operation with same-subscription and same-region checks, durable pending intents, target-name collision checks, and exact post-restore verification. It does not implement rotation; later source versions and target drift require review.
-- Existing target secrets without a committed baseline are conflicts, not adoption candidates.
-- Existing telemetry and state resources are retained while new KeyVaultSync-named resources are validated. Cleanup is a separate approved operation.
+1. vault-scope RBAC creates;
+2. object creates/reconciles;
+3. eligible object-scope RBAC creates;
+4. eligible object-scope RBAC deletes;
+5. object soft deletes;
+6. vault-scope RBAC deletes.
+
+Vault RBAC can converge even when object HMAC material is unavailable. Object-scope RBAC requires its object prerequisite to be verified or eligible for a managed deletion.
+
+## Objects
+
+### Secrets
+
+The executor reads the exact planned source version and writes one new target version. Content type, enabled state, validity dates, and tags are included.
+
+### Certificates
+
+Only exportable PFX certificates are replicated. The exact backing secret supplies the PFX while certificate metadata and the current certificate policy provide the remaining signature/import fields. The certificate's backing secret and key names are suppressed from independent planning. PEM and non-exportable certificate material are blocked explicitly.
+
+The integrity signature for a certificate covers the canonical policy encoding and the DER-encoded X.509 certificate. It deliberately excludes the PKCS#12 container: Key Vault re-encodes PFX payloads non-deterministically, so identical certificates export different bytes from each vault. Signing those bytes would make post-write verification fail for every replicated certificate. Key-pair equivalence is implied by the certificate itself, because Key Vault only returns a certificate whose stored private key matches its public key.
+
+### Keys
+
+Standalone private or symmetric key material cannot generally be exported from Key Vault. A missing target key is reported as requiring independent generation or external import. When a target key with the same name already exists, allowlisted key-scope RBAC can converge, but the key remains blocked because the application cannot verify cryptographic equivalence. Backup/restore is not used as a general cross-subscription replication protocol.
+
+## Object Integrity
+
+The versioned signature contract uses HMAC-SHA256 over length-prefixed canonical fields including versionless object ID, type, name, material, managed properties, and sorted tags. Source and target signatures differ because their IDs differ.
+
+An existing managed target may be overwritten only when its live signature matches the committed target baseline. A missing target may be created. An existing target without a compatible baseline is a conflict and is never adopted automatically.
+
+Before mutation, the executor persists an intent. Target SDK retries are disabled. After one mutation it verifies the exact result before committing the baseline and clearing intent. Ambiguous outcomes retain intent and block automatic retry.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Planned
+    Planned --> Blocked: incomplete inventory, missing HMAC, or conflict
+    Planned --> IntentPersisted: preconditions verified
+    IntentPersisted --> MutationSent: one zero-retry request
+    MutationSent --> Verified: exact read-back matches expected signature
+    MutationSent --> UnresolvedIntent: timeout or uncertain result
+    Verified --> BaselineCommitted
+    BaselineCommitted --> [*]
+    Blocked --> [*]
+    UnresolvedIntent --> [*]: operator recovery required
+```
+
+## Deletion
+
+Deletion means Key Vault soft delete only; purge is never called. A target-only object is eligible only when:
+
+- source and target inventories are complete;
+- a compatible managed baseline proves ownership;
+- the live target signature still matches that baseline;
+- the source object is absent;
+- no pending intent exists;
+- the run's deletion circuit breaker is closed or an exact one-use approval exists.
+
+The current circuit breaker opens at 10 planned object deletions or 25% of managed baselines. Treat these as conservative safety defaults, not proof that a deletion batch is safe.
+
+## RBAC
+
+The planner compares direct allowlisted built-in Key Vault role assignments at vault, secret, and key ARM scopes. Ancestor assignments are context only. Conditions and condition versions are preserved. Custom role definitions are not created. Certificate child-scope RBAC is unavailable in ARM and is reported as degraded.
+
+## State and Concurrency
+
+Pair state stores object baselines, mutation intents, approvals, and checkpoints. Empty compatible state may advance to the current schema; incompatible non-empty baseline or intent state fails closed and requires explicit administrative handling.
+
+Blob leases and ETags coordinate KeyVaultSync runs. Leases are held from planning through execution so state cannot change between passes. They do not fence external Key Vault writers, so the operational single-writer requirement remains.
+
+## Observability and Privacy
+
+Runs emit structured events, W3C activities, metrics, and durable private reports. Secret values, PFX/private-key material, HMAC keys/signatures, credentials, and connection strings must never appear in logs, traces, metrics, or reports.
+
+Persisted private reports may include operational IDs needed for review. Exported telemetry should use stable keyed correlation identifiers rather than raw vault names, object names, ARM IDs, or principal IDs. Full correlation-key sanitization remains an operational hardening requirement.

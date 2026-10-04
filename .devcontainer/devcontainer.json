@@ -1,0 +1,48 @@
+{
+  "name": "KeyVaultSync",
+  "dockerComposeFile": "docker-compose.yml",
+  "service": "dev",
+  "workspaceFolder": "/workspaces/keyvault-sync",
+  "features": {
+    "ghcr.io/devcontainers/features/azure-cli:1": {
+      "installBicep": true
+    },
+    "ghcr.io/azure/azure-dev/azd:latest": {},
+    "ghcr.io/jlaundry/devcontainer-features/azure-functions-core-tools:1": {
+      "version": "4"
+    }
+  },
+  "forwardPorts": [
+    7071
+  ],
+  "portsAttributes": {
+    "7071": {
+      "label": "Azure Functions host",
+      "protocol": "http"
+    },
+    "10000": {
+      "label": "Azurite Blob",
+      "protocol": "http"
+    },
+    "10001": {
+      "label": "Azurite Queue",
+      "protocol": "http"
+    },
+    "10002": {
+      "label": "Azurite Table",
+      "protocol": "http"
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-dotnettools.csdevkit",
+        "ms-azuretools.vscode-azurefunctions",
+        "ms-vscode.azurecli",
+        "ms-azuretools.azure-dev"
+      ]
+    }
+  },
+  "remoteUser": "vscode",
+  "shutdownAction": "stopCompose"
+}

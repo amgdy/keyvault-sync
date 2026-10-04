@@ -40,13 +40,13 @@ jq -n --arg sourceOne "$source_one" --arg sourceTwo "$source_two" --arg disabled
     --arg targetDisabledSource "$source_target_disabled" \
     --arg sourceThree "$source_three" --arg targetOne "$target_one" --arg targetTwo "$target_two" \
     --arg targetThree "$target_three" '[
-      {id:$sourceOne,name:"source-one",tags:{"sync-vault-id":$targetOne}},
-      {id:$sourceTwo,name:"source-two",tags:{"SYNC-VAULT-ID":$targetTwo}},
+      {id:$sourceOne,name:"source-one",tags:{}},
+      {id:$sourceTwo,name:"source-two",tags:{}},
       {id:$disabled,name:"source-disabled",tags:{"sync-vault-id":$targetOne,KeyVaultSyncDisabled:"TRUE"}},
       {id:$targetDisabledSource,name:"source-target-disabled",tags:{"sync-vault-id":($targetTwo + "-disabled")}},
       {id:$sourceThree,name:"source-three",tags:{}},
       {id:$targetOne,name:"target-one",tags:{"sync-source-keyvault-id":$sourceOne}},
-      {id:$targetTwo,name:"target-two",tags:{}},
+      {id:$targetTwo,name:"target-two",tags:{"SYNC-SOURCE-KEYVAULT-ID":$sourceTwo}},
       {id:$targetThree,name:"target-three",tags:{"sync-source-keyvault-id":$sourceThree}},
       {id:($targetTwo + "-disabled"),name:"target-disabled",tags:{KeyVaultSyncDisabled:"true"}}
     ]' >"$fixture_directory/vaults.json"
@@ -64,20 +64,25 @@ printf 'n\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >
 printf 'PASS declining tag confirmation performs no pair previews or writes\n'
 
 : >"$fixture_directory/grants.log"
-printf 'y\nn\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null
-jq -Rsc --arg one "$source_one" --arg two "$source_two" --arg targetThree "$target_three" '
+hook_output=$(printf 'y\nn\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh")
+jq -eRsc --arg targetOne "$target_one" --arg targetTwo "$target_two" --arg targetThree "$target_three" '
   split("\n") | map(select(length > 0))
   | length == 3
     and all(.[]; contains("--identity-id") and (contains("--apply") | not))
-    and any(.[]; contains($one))
-    and any(.[]; contains("--source-vault-id") and contains($one))
-    and any(.[]; contains("--source-vault-id") and contains($two))
+    and any(.[]; contains("--target-vault-id") and contains($targetOne))
+    and any(.[]; contains("--target-vault-id") and contains($targetTwo))
     and any(.[]; contains("--target-vault-id") and contains($targetThree))' "$fixture_directory/grants.log" >/dev/null
-printf 'PASS source and target declarations are previewed, with duplicate pair declarations collapsed\n'
+printf 'PASS every enabled target declaration is previewed\n'
+
+grep -q '^  #  ROLE  *SUBSCRIPTION  *RESOURCE GROUP  *KEY VAULT$' <<<"$hook_output"
+grep -q "^  1  source  $AZURE_SUBSCRIPTION_ID  *vaults  *source-one$" <<<"$hook_output"
+grep -q "^     target  $AZURE_SUBSCRIPTION_ID  *vaults  *target-one$" <<<"$hook_output"
+grep -q "^  2  source  $AZURE_SUBSCRIPTION_ID  *vaults  *source-three$" <<<"$hook_output"
+printf 'PASS discovered mappings are rendered as an aligned source and target table\n'
 
 : >"$fixture_directory/grants.log"
 printf 'y\ny\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null
-jq -Rsc '
+jq -eRsc '
   split("\n") | map(select(length > 0))
   | length == 6
     and all(.[0:3][]; contains("--apply") | not)

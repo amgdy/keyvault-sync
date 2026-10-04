@@ -1,60 +1,58 @@
-# KeyVaultSync Local Development
+# Local Development
 
 ## Prerequisites
 
-- .NET 10 SDK.
-- Azure Functions Core Tools v4 for the isolated worker.
-- Azurite for local Function host storage.
-- An Azure login usable by `DefaultAzureCredential` when scanning Azure resources.
+- .NET 10 SDK
+- Azure Functions Core Tools v4
+- Azure CLI
+- Azurite
+- Bash plus `jq`, and/or PowerShell 7 for operator script tests
 
-The console runner and the timer Function share the same orchestration and safety rules. An enabled, unpaused mapping automatically runs supported operations, so pause the pair with `KeyVaultSyncDisabled=true` on either vault unless synchronization is intended. Standalone secret writes require a stable protected HMAC key; eligible native key/certificate-group seeds are evaluated automatically and require source backup/target restore permissions, but not the HMAC key. Operators must ensure this runner is the sole writer to target objects being changed.
+## Dev Container
+
+The repository includes a feature-based [development container](../.devcontainer/devcontainer.json) with the .NET 10 SDK, the latest Azure CLI and Bicep, the stable Azure Developer CLI, Azure Functions Core Tools v4, PowerShell, and the VS Code extensions used by this project. Open the repository in VS Code and choose **Reopen in Container** when prompted.
+
+Microsoft-maintained Dev Container features provide Azure CLI and Azure Developer CLI; the .NET image already includes PowerShell. Azure Functions Core Tools uses a community feature because Microsoft does not currently publish an equivalent feature. The Compose-based environment runs Microsoft's official Azurite image in the development container's network namespace, so `UseDevelopmentStorage=true` continues to resolve its services on `localhost`, and it exposes the Functions host and Azurite ports. Authenticate inside the container before using Azure-backed local settings:
+
+```sh
+az login
+azd auth login
+```
+
+The container does not include credentials, `local.settings.json`, an HMAC key, or Azure resource configuration. Copy `src/KeyVaultSync.Function/local.settings.example.json` to ignored `src/KeyVaultSync.Function/local.settings.json` and provide approved disposable values privately.
 
 ## Build and Test
 
-From the repository root:
-
 ```sh
-dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj --no-restore
+dotnet restore
 dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj --no-restore
+dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj --no-restore -p:GenerateDocumentationFile=true -warnaserror
+bash tests/grant-keyvault-access.tests.sh
+bash tests/prepare-deployment.tests.sh
+bash tests/postdeploy-keyvault-access.tests.sh
+pwsh -NoProfile -File tests/Grant-KeyVaultAccess.Tests.ps1
+pwsh -NoProfile -File tests/Prepare-Deployment.Tests.ps1
+pwsh -NoProfile -File tests/PostDeploy-KeyVaultAccess.Tests.ps1
+az bicep build --file infra/main.bicep --outfile /tmp/keyvaultsync-main.json
 ```
 
-The focused test project covers planner safety, HMAC validation, pending-write blocking, mapping-driven execution, and one-time native seed recovery. Do not treat passing unit tests as evidence that live Key Vault writes are safe.
+Script tests use mocked Azure CLI behavior and must not make live Azure changes.
 
-## VS Code Launch
+## Local Function Host
 
-The checked-in `.vscode/launch.json` contains two debug entries:
+Authenticate with Azure CLI for a specifically approved tenant, then run the Function host from `src/KeyVaultSync.Function`. In the Dev Container, Azurite starts as a sidecar. In VS Code, **Run and Debug** → **.NET: Attach to KeyVaultSync Function** starts the local host through the pre-launch task, uses the Azure Functions process picker to select the isolated .NET worker, and attaches the debugger. Outside the container, start Azurite separately before launching the debugger.
 
-- **.NET: Launch KeyVaultSync Runner** builds the console project and launches the runner from the workspace. Provide the required subscription and Blob endpoint through the VS Code process environment before starting it. The launch file contains no credentials or HMAC values.
-- **.NET: Attach to KeyVaultSync Function** attaches the debugger to the isolated worker selected by `${command:pickProcess}`. Start the `Azure Functions: Start KeyVaultSync locally` task first, or run `func start --verbose` from `src/KeyVaultSync.Function`, and ensure the ignored `local.settings.json` exists.
+The local identity must have the same least-privilege ARM, Blob, Key Vault, and RBAC permissions needed by the behavior being tested. A passing unit test or successful host startup does not prove live permissions or safe mutation.
 
-Use the VS Code Run and Debug view to select an entry. Keep `local.settings.json`, shell environment values, and any local HMAC key outside tracked files. The Function task uses the same Core Tools/Azurite workflow described below.
+## Sensitive Data
 
-## Console Scan
+Never commit or print:
 
-Set `AZURE_SUBSCRIPTION_ID`, `KEYVAULTSYNC_STORAGE_ACCOUNT_URI`, and the intended container settings in the shell environment. Then run:
+- HMAC keys;
+- secret or certificate values;
+- private keys;
+- connection strings;
+- tokens;
+- tenant/subscription-specific inventories.
 
-```sh
-dotnet run --project src/KeyVaultSync.Runner/KeyVaultSync.Runner.csproj
-```
-
-The console runner requires an explicit subscription and Blob endpoint. It does not use the old lab resource defaults. Before running it, verify whether any enabled mappings and effective permissions permit writes. Secret actions are blocked if `KEYVAULTSYNC_HMAC_KEY` is absent; eligible one-time native seeds do not use that key.
-
-The console runner uses Serilog for structured terminal output and the Azure Monitor OpenTelemetry exporter for App Insights. `KEYVAULTSYNC_LOG_LEVEL` applies to both the console runner and Function worker. Supported minimum levels are `Trace`, `Debug`, `Information`, `Warning`, `Error`, and `Critical`; invalid values and `None` fall back to `Information`. Use `Trace` for per-version/request diagnostics, `Debug` for object/precondition details, and `Information` for the normal run timeline. `Trace` can be high-volume and includes operational names/version IDs, never values or HMACs. When `APPLICATIONINSIGHTS_CONNECTION_STRING` is configured, the runner exports logs, traces, and metrics using `DefaultAzureCredential`. Restore packages from NuGet.org or a trusted organization mirror configured for your environment; the repository does not require a private feed.
-
-## Timer Function
-
-1. Start Azurite and ensure `AzureWebJobsStorage` in local settings is `UseDevelopmentStorage=true`.
-2. Create `local.settings.json` from the example in `src/KeyVaultSync.Function/` without committing it.
-3. Set the subscription, Blob endpoint, Function schedule, and Application Insights settings for the lab. The HMAC placeholder is not a usable key. Keep `KeyVaultSyncDisabled=true` on a mapped pair unless automatic operations are intended.
-4. From `src/KeyVaultSync.Function/`, run:
-
-```sh
-func start --verbose
-```
-
-The timer uses `RunOnStartup=false` and the configured NCRONTAB schedule. A host shutdown cancels the current invocation; verify that an incomplete run does not advance the pair checkpoint.
-The Function worker sends structured `ILogger` records through OpenTelemetry to Azure Monitor, with scopes enabled for run/pair correlation. `KEYVAULTSYNC_LOG_LEVEL` controls the worker minimum level; `host.json` independently controls host/runtime logs. Progress summaries are `Information`, object/precondition details are `Debug`, and per-version/request details are `Trace`.
-
-## Local Secret Handling
-
-Never put a real HMAC key, Application Insights connection string, storage key, token, or secret value in a tracked file. Use protected local environment configuration for a specifically approved mutation test and remove it after the lab run. The HMAC key is required only for standalone secret synchronization; it is not a runtime enable switch and does not gate eligible native seeds.
+Protect ignored `.azure/`, `local.settings.json`, and local report files. Do not run synchronization against non-disposable vaults as a development check.

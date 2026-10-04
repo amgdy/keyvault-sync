@@ -1,124 +1,199 @@
 # KeyVaultSync
 
-KeyVaultSync is a .NET 10 Azure Functions application and console runner for discovering mapped Azure Key Vault pairs, inventorying their contents, and automatically running supported synchronization for enabled pairs.
+KeyVaultSync is a .NET 10 isolated Azure Functions application that replicates supported Azure Key Vault objects and Key Vault-specific Azure RBAC between existing vaults.
 
-The project is intentionally narrower than a full vault replication product. It does not create source or target vaults. It inventories secrets, keys, certificates, and authorization declarations; standalone secrets can be synchronized with guarded writes, and eligible keys or certificate groups can be seeded once through native backup/restore. Native seeds do not rotate later versions. The planner proposes a mode-first exact mirror for legacy access policies or direct vault-scoped RBAC assignments, including target-only removals, but never applies authorization changes. Delete/purge also remain plan-only.
+## Why KeyVaultSync
 
-## Use Cases
+Teams that keep a second Key Vault in another region or subscription normally copy secrets, certificates, and access grants by hand or through ad-hoc scripts. That work drifts, is hard to audit, and risks overwriting a value someone else changed.
 
-One use case is disaster recovery (DR): maintain selected secrets in a target vault so an application can use a separately configured endpoint during a regional incident. Other uses include controlled secret-version synchronization between existing environments. KeyVaultSync does not perform application failover or guarantee an RPO/RTO.
+KeyVaultSync keeps a designated target vault aligned with its source on a timer, carrying both the object and the permissions that make the object usable, and refuses to write whenever it cannot prove the target is still the copy it last made.
 
-## How It Works
+```mermaid
+flowchart LR
+    Source["Source Key Vault<br/>you already own it"]
+    Sync["KeyVaultSync<br/>timer-driven<br/>integrity-guarded"]
+    Target1["Target Key Vault<br/>another subscription or region"]
+    Target2["More target vaults<br/>same source"]
 
-- A timer-triggered Function runs on a configurable schedule; a console runner supports local scans.
-- The runner enumerates Key Vault resources in one subscription. A source can declare one target with `sync-vault-id=<target-vault-resource-ID>`, or each target can declare its source with `sync-source-keyvault-id=<source-vault-resource-ID>`. The reverse tag allows multiple targets per source. If both tags declare the same pair, discovery deduplicates it; conflicting target owners and chained/cyclic mappings are rejected.
-- `KeyVaultSyncDisabled=true` on either member suppresses the pair for that scan.
-- Source and target inventory is read without fetching secret values. A deterministic planner compares observations with persisted pair state.
-- A timer inventory is authoritative for deletion detection: Key Vault Event Grid has no object-deletion event in its documented event catalog. Notifications could later trigger an early scan, but complete active/soft-deleted inventory remains required.
-- An enabled mapping is the runtime opt-in for supported synchronization. Standalone secret writes run only when a valid protected HMAC key is configured and target safety checks pass; without the key, secret plan items are blocked while eligible native seeds are still evaluated.
-- A secret write checks the target's current value HMAC and managed-metadata digest against the committed baseline before writing, stores a durable intent, performs one write without automatic retry, verifies the exact resulting target version, then commits the new baseline.
-- Eligible key and certificate-group seeds are one-time native backup/restore operations into unused target names in the same subscription and region. They are not recurring key/certificate rotation.
-- A Blob lease and ETag protect each pair's state. This coordinates KeyVaultSync runs; it does not fence unrelated writers to Key Vault.
+    Source -->|"secrets, exportable certificates,<br/>Key Vault RBAC"| Sync
+    Sync --> Target1
+    Sync --> Target2
 
-## Safety Boundaries
+    style Sync fill:#e8f0fe,stroke:#1a73e8
+    style Source fill:#f1f3f4,stroke:#5f6368
+    style Target1 fill:#f1f3f4,stroke:#5f6368
+    style Target2 fill:#f1f3f4,stroke:#5f6368
+```
 
-An enabled mapping can cause writes on the next run, so review the pair, permissions, and persisted state before enabling it. Set `KeyVaultSyncDisabled=true` on either vault to pause that pair. For an enabled pair:
+The grey vaults are existing resources that you create and own. KeyVaultSync only reads the source and writes supported objects and role assignments into the target.
 
-- Standalone secret writes require a protected Base64-encoded 256-bit HMAC key. Without it, the runner reports blocked secret work instead of writing.
-- A target secret must be absent from active and soft-deleted inventory, or its current value HMAC and managed metadata must still match the committed baseline. Existing targets without a baseline are never adopted.
-- The operator must ensure this runner is the sole writer to target objects being changed. The runtime has no single-writer acknowledgment switch, and Key Vault writes do not provide a compare-and-set condition.
+What you get:
 
-Eligible native key/certificate seeds are automatically evaluated for an enabled pair and require the pair-scoped source backup/target restore permissions. A seed is allowed only for an eligible same-subscription, same-region item whose target namespaces are unused, including soft-deleted names. Certificate and backing objects are handled as a group. Ambiguous secret writes or native restores remain blocked for review and are never retried automatically. The scanner never fetches secret values during routine inventory.
+- One authoritative source, many opted-in targets, across subscriptions in the same tenant.
+- Objects and their Key Vault-specific RBAC replicated together, so a copied secret is also usable.
+- HMAC-SHA256 integrity checks that skip rather than clobber anything KeyVaultSync did not last write.
+- Soft deletes only, durable write intent, and structured logs for every decision.
+
+## Opting a Vault In
+
+The application does not create, replace, delete, or purge participating vaults. A target vault opts in by declaring its source with:
+
+```text
+sync-source-keyvault-id=<source-vault-resource-ID>
+```
+
+One source may have multiple targets. Source and target may be in different configured subscriptions, but both must be in the same tenant and use Azure RBAC authorization. The retired source-side `sync-vault-id` tag is not used.
+
+## Supported Behavior
+
+- Discovers target-declared mappings across every subscription in `KEYVAULTSYNC_SUBSCRIPTIONS`.
+- Replicates standalone secrets with metadata and tags.
+- Replicates exportable PFX certificates with policy, metadata, and tags.
+- Reports standalone keys as requiring independent target provisioning and non-exportable certificates as requiring reissuance or external import because their private material cannot be exported safely through the Key Vault data plane.
+- Replicates direct assignments of supported built-in Key Vault roles at vault, secret, and key ARM scopes.
+- Soft-deletes managed target objects that were removed from the source when all ownership and integrity checks pass. It never purges.
+- Uses a Blob lease and ETag checks for pair state and durable pending-write intents.
+- Plans every admitted pair before the run performs its first mutation.
+- Emits detailed structured logs and traces. Persisted private reports may contain operational identifiers; exported telemetry must not contain values or cryptographic material.
+
+Access-policy vaults, custom role-definition replication, certificate child-scope RBAC, application failover, key rotation, and private-key replication for standalone keys are not supported.
+
+When a target key with the same name has been independently generated or imported, KeyVaultSync can reconcile its allowlisted key-scope RBAC. It still reports the key as blocked because Azure does not expose private or symmetric material and the application cannot verify that source and target keys are cryptographically equivalent.
+
+## Integrity and Safety
+
+Object mutations use an HMAC-SHA256 signature over the versionless object ID, object type, name, material, managed properties, and sorted tags. The HMAC key is a protected Base64-encoded 256-bit value supplied through `KEYVAULTSYNC_HMAC_KEY`.
+
+For an existing managed target, KeyVaultSync writes only when the current target signature matches the committed target baseline. A missing target can be created. An existing target without a compatible baseline is never adopted automatically. Each mutation:
+
+1. persists intent;
+2. performs one write or soft delete with SDK automatic retries disabled;
+3. reads back and verifies the exact result;
+4. commits the new baseline and clears intent.
+
+Timeouts, cancellation after intent creation, throttling, and uncertain verification leave the intent unresolved for operator review; the operation is not retried automatically. Keep KeyVaultSync as the only writer for managed target objects.
+
+Set `KeyVaultSyncDisabled=true` on either vault to pause a mapping.
 
 ## Requirements
 
 - .NET 10 SDK.
-- Azure Functions Core Tools v4 for local timer execution.
-- Azure CLI sign-in for local Azure access through `DefaultAzureCredential`.
+- Azure Functions Core Tools v4 for local host execution.
+- Azure CLI and Azure Developer CLI for deployment.
 - Azurite for local Functions host storage.
-- An existing source/target vault pair, Blob state storage, and the required scoped permissions.
+- Existing Azure RBAC-enabled source and target vaults.
+- Blob state storage and the required scoped permissions.
 
 ## Local Development
 
-Restore and build using your configured NuGet source, then run tests:
+For a reproducible setup, open the repository in VS Code and choose **Reopen in Container**. The feature-based [development container](.devcontainer/devcontainer.json) provides the .NET 10 SDK, the latest Azure CLI and Bicep, the stable Azure Developer CLI, Azure Functions Core Tools v4, PowerShell, and project VS Code extensions. It runs Microsoft's official Azurite image as a local sidecar; credentials, local settings, and package restore remain your responsibility.
+
+Copy [local.settings.example.json](src/KeyVaultSync.Function/local.settings.example.json) to ignored `local.settings.json` and replace placeholders privately. Never commit credentials, HMAC keys, connection strings, tenant/subscription IDs, object values, or private keys.
 
 ```sh
 dotnet restore
 dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj
 dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj
 bash tests/grant-keyvault-access.tests.sh
-bash tests/preprovision-resource-group-tag.tests.sh
+bash tests/prepare-deployment.tests.sh
 bash tests/postdeploy-keyvault-access.tests.sh
 pwsh -NoProfile -File tests/Grant-KeyVaultAccess.Tests.ps1
-pwsh -NoProfile -File tests/PreProvision-ResourceGroupTag.Tests.ps1
+pwsh -NoProfile -File tests/Prepare-Deployment.Tests.ps1
 pwsh -NoProfile -File tests/PostDeploy-KeyVaultAccess.Tests.ps1
 ```
 
-Sign in and provide the required settings through the shell or ignored local settings. Do not put real credentials, HMAC keys, connection strings, tenant IDs, or subscription-specific configuration in committed files.
+In the Dev Container, use **Run and Debug** → **.NET: Attach to KeyVaultSync Function** to start the local Function host, select its isolated .NET worker, and attach the debugger; the Azurite sidecar is already running. Outside the container, start Azurite before launching the debugger. The repository verification task is available as **Tasks: Run Task** → **KeyVaultSync: Verify repository**.
 
-```sh
-az login
-export AZURE_SUBSCRIPTION_ID="<subscription-id>"
-export KEYVAULTSYNC_STORAGE_ACCOUNT_URI="https://<state-account>.blob.core.windows.net/"
-dotnet run --project src/KeyVaultSync.Runner/KeyVaultSync.Runner.csproj
-```
-
-The Function's local settings template is at [src/KeyVaultSync.Function/local.settings.example.json](src/KeyVaultSync.Function/local.settings.example.json). Copy it to `local.settings.json` for local use and replace placeholders privately; that file is git-ignored. See [local development](doc/local-development.md) and [settings](doc/settings.md) for details.
+See [local development](doc/local-development.md) and [settings](doc/settings.md).
 
 ## Key Vault Access Setup
 
-The operator tools take a UAMI resource ID and either a source vault resource ID or a target vault resource ID. The source form resolves the target from `sync-vault-id`; the target form resolves the source from `sync-source-keyvault-id`. They preview the complete supported pair profile: inventory and secret permissions, source key/certificate backup, and target restore. No grants are written without the explicit onboarding `--apply` or `-Apply` option. This approval applies only to IAM changes; once a mapping and grants are in place, supported runtime synchronization starts automatically.
+The onboarding scripts accept the deployed user-assigned managed identity and a target vault. They read `sync-source-keyvault-id`, validate both vaults, and preview these direct built-in grants:
 
-macOS/Linux:
+| Scope | Role |
+|---|---|
+| Source vault | Key Vault Administrator |
+| Source vault | Key Vault Data Access Administrator |
+| Target vault | Key Vault Administrator |
+| Target vault | Key Vault Data Access Administrator |
+
+The source administrator grant is intentionally broad: it permits the data-plane
+reads and backup operations needed for supported object replication, but it also
+permits source data-plane writes and deletes. The source Data Access Administrator
+grant is not used by the runtime, which writes role assignments only at target
+scope; it is granted so operators can manage source Key Vault role assignments
+with the same identity. No permission is changed unless `--apply` or `-Apply` is
+supplied. Azure does not allow a role to export a non-exportable key or
+certificate private key.
 
 ```sh
 bash scripts/grant-keyvault-access.sh \
   --identity-id "<uami-resource-id>" \
-  --source-vault-id "<source-vault-resource-id>"
+  --target-vault-id "<target-vault-resource-id>"
 ```
 
-Windows PowerShell 7:
+The command above is preview-only. Add `--apply` after reviewing the plan to
+create only the missing assignments:
+
+```sh
+bash scripts/grant-keyvault-access.sh \
+  --identity-id "<uami-resource-id>" \
+  --target-vault-id "<target-vault-resource-id>" \
+  --apply
+```
 
 ```powershell
 .\scripts\Grant-KeyVaultAccess.ps1 `
   -IdentityResourceId "<uami-resource-id>" `
-  -SourceVaultResourceId "<source-vault-resource-id>"
+  -TargetVaultResourceId "<target-vault-resource-id>"
 ```
 
-For a reverse-declared pair, use `--target-vault-id` or `-TargetVaultResourceId` instead; the target must carry `sync-source-keyvault-id=<source-vault-resource-ID>`.
+The PowerShell command is also preview-only. Add `-Apply` to create the missing
+assignments:
 
-Both scripts also run in Azure Cloud Shell. Bash requires `jq`; PowerShell uses built-in JSON parsing. Review the preview and verify the selected source-side or target-side mapping before applying. The operator needs permission to write a legacy access policy or role assignments and, for RBAC vaults, create the narrowly scoped custom roles requested. The Function's UAMI is never granted permission to modify authorization.
+```powershell
+.\scripts\Grant-KeyVaultAccess.ps1 `
+  -IdentityResourceId "<uami-resource-id>" `
+  -TargetVaultResourceId "<target-vault-resource-id>" `
+  -Apply
+```
 
-After `azd deploy` (including the deploy phase of `azd up`), an interactive post-deploy hook explains both mapping tags, discovers pairs declared from either side, deduplicates pairs declared by both tags, and skips pairs whose source or target is marked `KeyVaultSyncDisabled=true`. It previews all pairs and asks again before applying any grant, including native backup/restore permissions. Declining either prompt makes no access change; non-interactive azd runs skip the optional workflow. Rerun it with `azd hooks run postdeploy`.
+The scripts never change mapping tags, access policies, authorization mode, role definitions, or vault objects. Bash requires `jq`; PowerShell uses built-in JSON parsing.
 
-See [identity and RBAC](doc/identity-and-rbac.md) and [deployment](doc/deployment.md) for the full permission matrix and migration guidance.
+Interactive `azd deploy`/`azd up` runs an optional post-deploy hook that discovers target-declared mappings across the configured subscriptions, previews every grant, and asks again before applying. Non-interactive deployments skip this optional workflow. Rerun it with `azd hooks run postdeploy`.
+
+See [identity and RBAC](doc/identity-and-rbac.md).
 
 ## Infrastructure and Deployment
 
-`azure.yaml` and `infra/main.bicep` define the Function, Flex Consumption plan, managed identity, one shared host/deployment/state storage account, telemetry, and infrastructure roles. They do not declare or create Key Vault resources. Review and preview infrastructure changes before deployment:
+[azure.yaml](azure.yaml) and [main.bicep](infra/main.bicep) deploy the Function, Flex Consumption plan, user-assigned managed identity, host/deployment/state storage, telemetry, and infrastructure role assignments. They do not deploy participating Key Vaults.
+
+The deployment grants the runtime identity Reader in every configured discovery subscription. Provisioning therefore requires permission to create those subscription-scoped role assignments.
 
 ```sh
 azd auth login
-azd env new <environment> --subscription <subscription-id> --location <region>
-azd provision --preview --no-prompt
+azd env new <environment> --subscription <deployment-subscription-id> --location <region>
+azd provision --preview
+azd up
 ```
 
-The deployment resource group and managed-resource tag sets receive no optional tag by default. An interactive `preprovision` hook asks whether to add one optional deployment tag and, when accepted, requires its key and value. The selection is stored in the active azd environment. The template preserves other tags and applies the optional tag to the resource group and tagged resources it manages.
+The shared deployment-preparation hook runs before both provisioning and package deployment. `azd` defers HMAC initialization to this hook instead of collecting the secure Bicep parameter first. For a new environment it prompts to generate a 256-bit HMAC key or supply an existing Base64 key. Valid saved keys are reused and never rotated automatically. An invalid saved value can be interactively replaced only after the replacement passes validation. The ignored `.azure/<environment>/.env` contains sensitive plaintext configuration and must be protected.
 
-The current sample has public storage endpoints and no private endpoint/VNet configuration. Shared Key is disabled and data-plane access requires Entra authorization, but public endpoint reachability is still a network exposure. Do not treat these templates as production network isolation; adapt them to your organization's approved private-network design and policies. They intentionally contain no organization-specific policy exemptions.
+State Blob versioning and 14-day soft-delete retention are enabled. Public networking remains the default. Optional private mode can create a minimal dedicated VNet or attach to existing enterprise subnets, DNS zones, and Azure Monitor Private Link Scope resources. It privatizes Function storage and monitoring, integrates the Function with the selected subnet, and can create private endpoints for an explicitly approved vault list. See [networking](doc/networking.md).
 
-## Project Status and Documentation
-
-The tested implementation supports discovery, value-free inventory, planning, Blob-backed pair state, mapping-driven guarded secret synchronization when HMAC is configured, and eligible one-time native key/certificate-group seeds. Authorization reconciliation, delete/purge, automatic failover, and HMAC key rotation/rebaseline tooling are not implemented. Live Azure behavior must be validated in a disposable environment; unit and mocked CLI tests do not prove effective permissions or safe mutation.
+## Documentation
 
 - [Architecture](doc/architecture.md)
 - [Code flow](doc/code-flow.md)
 - [Configuration](doc/settings.md)
 - [Deployment](doc/deployment.md)
+- [Networking](doc/networking.md)
 - [Identity and RBAC](doc/identity-and-rbac.md)
 - [Observability](doc/observability.md)
 - [Troubleshooting](doc/troubleshooting.md)
 - [Coding guide](doc/coding-guide.md)
+
+Unit tests, mocked script tests, builds, and Bicep compilation do not prove live Azure permissions, telemetry ingestion, or mutation safety. Validate live behavior only in an explicitly approved disposable scope.
 
 ## License
 

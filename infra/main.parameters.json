@@ -8,6 +8,12 @@
     "location": {
       "value": "${AZURE_LOCATION}"
     },
+    "keyVaultSyncSubscriptions": {
+      "value": "${KEYVAULTSYNC_SUBSCRIPTIONS=}"
+    },
+    "keyVaultSyncHmacKey": {
+      "value": "${KEYVAULTSYNC_HMAC_KEY=}"
+    },
     "preserveExistingAppSettings": {
       "value": false
     },
@@ -16,6 +22,66 @@
     },
     "optionalResourceGroupTagValue": {
       "value": "${KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE=}"
+    },
+    "networkMode": {
+      "value": "${KEYVAULTSYNC_NETWORK_MODE=public}"
+    },
+    "networkSource": {
+      "value": "${KEYVAULTSYNC_NETWORK_SOURCE=managed}"
+    },
+    "managedVirtualNetworkName": {
+      "value": "${KEYVAULTSYNC_MANAGED_VNET_NAME=}"
+    },
+    "managedVirtualNetworkAddressPrefix": {
+      "value": "${KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX=10.42.0.0/24}"
+    },
+    "managedFunctionIntegrationSubnetName": {
+      "value": "${KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME=snet-functions}"
+    },
+    "managedFunctionIntegrationSubnetPrefix": {
+      "value": "${KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX=10.42.0.0/27}"
+    },
+    "managedPrivateEndpointSubnetName": {
+      "value": "${KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME=snet-private-endpoints}"
+    },
+    "managedPrivateEndpointSubnetPrefix": {
+      "value": "${KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX=10.42.0.32/27}"
+    },
+    "existingFunctionIntegrationSubnetResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID=}"
+    },
+    "existingPrivateEndpointSubnetResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID=}"
+    },
+    "existingBlobPrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingQueuePrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingTablePrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingKeyVaultPrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_KEYVAULT_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingMonitorPrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingOmsPrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingOdsPrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingAgentServicePrivateDnsZoneResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID=}"
+    },
+    "existingAzureMonitorPrivateLinkScopeResourceId": {
+      "value": "${KEYVAULTSYNC_EXISTING_AMPLS_ID=}"
+    },
+    "privateKeyVaultResourceIds": {
+      "value": "${KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS=}"
     }
   }
 }

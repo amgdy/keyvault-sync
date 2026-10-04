@@ -22,12 +22,12 @@ Copy-Item (Join-Path $repositoryRoot 'scripts/PostDeploy-KeyVaultAccess.ps1') $f
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string] $IdentityResourceId,
-    [string] $SourceVaultResourceId,
+    [string] $TargetVaultResourceId,
     [switch] $Apply
 )
 @{
     identity = $IdentityResourceId
-    source = $SourceVaultResourceId
+    target = $TargetVaultResourceId
     apply = $Apply.IsPresent
 } | ConvertTo-Json -Compress | Add-Content -LiteralPath $env:KEYVAULTSYNC_TEST_GRANT_LOG
 if ($env:KEYVAULTSYNC_TEST_PREVIEW_FAILURE -eq 'true' -and -not $Apply) {
@@ -41,8 +41,8 @@ $sourceTwo = "/subscriptions/$subscriptionId/resourceGroups/vaults/providers/Mic
 $targetOne = "/subscriptions/$subscriptionId/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/target-one"
 $targetTwo = "/subscriptions/$subscriptionId/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/target-two"
 $global:KeyVaultSyncTestVaults = @(
-    [pscustomobject]@{ id = $sourceOne; name = 'source-one'; tags = [pscustomobject]@{ 'sync-vault-id' = $targetOne } }
-    [pscustomobject]@{ id = $sourceTwo; name = 'source-two'; tags = [pscustomobject]@{ 'SYNC-VAULT-ID' = $targetTwo } }
+    [pscustomobject]@{ id = $sourceOne; name = 'source-one'; tags = [pscustomobject]@{} }
+    [pscustomobject]@{ id = $sourceTwo; name = 'source-two'; tags = [pscustomobject]@{} }
     [pscustomobject]@{
         id = "/subscriptions/$subscriptionId/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/source-disabled"
         name = 'source-disabled'
@@ -53,8 +53,8 @@ $global:KeyVaultSyncTestVaults = @(
         name = 'source-target-disabled'
         tags = [pscustomobject]@{ 'sync-vault-id' = "$targetTwo-disabled" }
     }
-    [pscustomobject]@{ id = $targetOne; name = 'target-one'; tags = [pscustomobject]@{} }
-    [pscustomobject]@{ id = $targetTwo; name = 'target-two'; tags = [pscustomobject]@{} }
+    [pscustomobject]@{ id = $targetOne; name = 'target-one'; tags = [pscustomobject]@{ 'sync-source-keyvault-id' = $sourceOne } }
+    [pscustomobject]@{ id = $targetTwo; name = 'target-two'; tags = [pscustomobject]@{ 'SYNC-SOURCE-KEYVAULT-ID' = $sourceTwo } }
     [pscustomobject]@{ id = "$targetTwo-disabled"; name = 'target-disabled'; tags = [pscustomobject]@{ KeyVaultSyncDisabled = 'true' } }
 )
 $global:KeyVaultSyncTestAnswers = [System.Collections.Generic.Queue[string]]::new()
@@ -107,10 +107,15 @@ try {
     Set-Content -LiteralPath $script:grantLog -Value ''
     $hookOutput = Invoke-Hook -Answers @('y', 'n') | Out-String
     $calls = @(Get-Content $script:grantLog | Where-Object { $_ } | ForEach-Object { ConvertFrom-Json $_ })
-    Assert-True ($calls.Count -eq 2) "both enabled tagged sources should be previewed; captured $($calls.Count): $($calls | ConvertTo-Json -Compress); output: $hookOutput"
+    Assert-True ($calls.Count -eq 2) "both enabled tagged targets should be previewed; captured $($calls.Count): $($calls | ConvertTo-Json -Compress); output: $hookOutput"
     Assert-True (@($calls | Where-Object apply).Count -eq 0) 'declining apply must perform no apply calls'
-    Assert-True ((@($calls.source | Sort-Object) -join ',') -eq (@($sourceOne, $sourceTwo | Sort-Object) -join ',')) 'the enabled source set should match'
-    Write-Host 'PASS PowerShell previews every enabled tagged source before a declined apply'
+    Assert-True ((@($calls.target | Sort-Object) -join ',') -eq (@($targetOne, $targetTwo | Sort-Object) -join ',')) 'the enabled target set should match'
+    Write-Host 'PASS PowerShell previews every enabled tagged target before a declined apply'
+
+    Assert-True ($hookOutput -match '#\s+Role\s+Subscription\s+Resource Group\s+Key Vault') "the discovery table header should be rendered; output: $hookOutput"
+    Assert-True ($hookOutput -match "1\s+source\s+$subscriptionId\s+vaults\s+source-one") "pair 1 should show the source coordinates; output: $hookOutput"
+    Assert-True ($hookOutput -match "target\s+$subscriptionId\s+vaults\s+target-one") "pair 1 should show the target coordinates; output: $hookOutput"
+    Write-Host 'PASS PowerShell renders discovered mappings as an aligned source and target table'
 
     Set-Content -LiteralPath $script:grantLog -Value ''
     Invoke-Hook -Answers @('y', 'y') | Out-Null

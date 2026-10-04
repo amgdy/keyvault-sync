@@ -35,7 +35,15 @@ param managedIdentityName string = ''
 @description('Timer schedule in NCRONTAB format. RunOnStartup remains disabled in code.')
 param timerSchedule string = '0 */10 * * * *'
 
-@description('Preserve existing Function App application settings during later provisioning. Enable this after adding an out-of-band HMAC key.')
+@description('Comma-separated Azure subscription IDs scanned as one complete Key Vault mapping graph.')
+@minLength(36)
+param keyVaultSyncSubscriptions string
+
+@description('Base64-encoded 32-byte HMAC key validated by the azd deployment-preparation hook.')
+@secure()
+param keyVaultSyncHmacKey string
+
+@description('Preserve existing Function App application settings not managed by this template during later provisioning.')
 param preserveExistingAppSettings bool = false
 
 @description('Optional tag name to add to the deployment resource group and all tagged resources managed by this template. Leave both optional tag parameters empty to make no optional tag change.')
@@ -62,6 +70,75 @@ param maximumInstanceCount int = 10
 ])
 param instanceMemoryMB int = 2048
 
+@allowed([
+  'public'
+  'private'
+])
+@description('Network posture for KeyVaultSync-managed resources. Public preserves service endpoints; private enables VNet integration and private endpoints.')
+param networkMode string = 'public'
+
+@allowed([
+  'managed'
+  'existing'
+])
+@description('Private network ownership model. Managed creates a dedicated VNet/DNS/AMPLS; existing attaches to supplied enterprise resources.')
+param networkSource string = 'managed'
+
+@description('Optional managed VNet name. Empty generates a CAF-style name.')
+@maxLength(64)
+param managedVirtualNetworkName string = ''
+
+@description('Address prefix for the managed VNet.')
+param managedVirtualNetworkAddressPrefix string = '10.42.0.0/24'
+
+@description('Name of the managed Flex Consumption integration subnet.')
+param managedFunctionIntegrationSubnetName string = 'snet-functions'
+
+@description('Address prefix for the managed Flex Consumption integration subnet. Use /27 or larger.')
+param managedFunctionIntegrationSubnetPrefix string = '10.42.0.0/27'
+
+@description('Name of the managed private endpoint subnet.')
+param managedPrivateEndpointSubnetName string = 'snet-private-endpoints'
+
+@description('Address prefix for the managed private endpoint subnet.')
+param managedPrivateEndpointSubnetPrefix string = '10.42.0.32/27'
+
+@description('Existing Flex Consumption integration subnet resource ID. Required for private/existing mode.')
+param existingFunctionIntegrationSubnetResourceId string = ''
+
+@description('Existing private endpoint subnet resource ID. Required for private/existing mode and must differ from the integration subnet.')
+param existingPrivateEndpointSubnetResourceId string = ''
+
+@description('Existing Storage Blob private DNS zone resource ID. Required for private/existing mode.')
+param existingBlobPrivateDnsZoneResourceId string = ''
+
+@description('Existing Storage Queue private DNS zone resource ID. Required for private/existing mode.')
+param existingQueuePrivateDnsZoneResourceId string = ''
+
+@description('Existing Storage Table private DNS zone resource ID. Required for private/existing mode.')
+param existingTablePrivateDnsZoneResourceId string = ''
+
+@description('Existing Key Vault private DNS zone resource ID. Required for private/existing mode.')
+param existingKeyVaultPrivateDnsZoneResourceId string = ''
+
+@description('Existing Azure Monitor private DNS zone resource ID. Required for private/existing mode.')
+param existingMonitorPrivateDnsZoneResourceId string = ''
+
+@description('Existing Log Analytics OMS private DNS zone resource ID. Required for private/existing mode.')
+param existingOmsPrivateDnsZoneResourceId string = ''
+
+@description('Existing Log Analytics ODS private DNS zone resource ID. Required for private/existing mode.')
+param existingOdsPrivateDnsZoneResourceId string = ''
+
+@description('Existing Azure Automation agent-service private DNS zone resource ID. Required for private/existing mode.')
+param existingAgentServicePrivateDnsZoneResourceId string = ''
+
+@description('Existing Azure Monitor Private Link Scope resource ID. Required for private/existing mode.')
+param existingAzureMonitorPrivateLinkScopeResourceId string = ''
+
+@description('Comma- or semicolon-separated existing source and target Key Vault resource IDs for which private endpoints are created in private mode.')
+param privateKeyVaultResourceIds string = ''
+
 // CAF uses type/workload/environment components. Filter before truncation so arbitrary azd
 // environment labels cannot introduce invalid storage/DNS characters. The full label seeds uniqueness.
 var lowerEnvironmentName = toLower(environmentName)
@@ -78,7 +155,15 @@ var resolvedFunctionStorageName = empty(functionStorageAccountName) ? 'stkvsfn${
 var resolvedLogAnalyticsName = empty(logAnalyticsWorkspaceName) ? 'log-keyvaultsync-${environmentToken}-${nameSuffix}' : logAnalyticsWorkspaceName
 var resolvedApplicationInsightsName = empty(applicationInsightsName) ? 'appi-keyvaultsync-${environmentToken}-${nameSuffix}' : applicationInsightsName
 var resolvedManagedIdentityName = empty(managedIdentityName) ? 'id-keyvaultsync-${environmentToken}-${nameSuffix}' : managedIdentityName
+var resolvedManagedVirtualNetworkName = empty(managedVirtualNetworkName) ? 'vnet-keyvaultsync-${environmentToken}-${nameSuffix}' : managedVirtualNetworkName
 var runtimeIdentityResourceId = resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', resolvedManagedIdentityName)
+var discoverySubscriptionIds = filter(
+  map(split(replace(keyVaultSyncSubscriptions, ';', ','), ','), subscriptionId => trim(subscriptionId)),
+  subscriptionId => !empty(subscriptionId))
+var isPrivateNetwork = networkMode == 'private'
+var privateKeyVaultIds = filter(
+  map(split(replace(privateKeyVaultResourceIds, ';', ','), ','), keyVaultResourceId => trim(keyVaultResourceId)),
+  keyVaultResourceId => !empty(keyVaultResourceId))
 
 var baseResourceTags = {
   workload: 'KeyVaultSync'
@@ -107,9 +192,13 @@ resource optionalResourceGroupTag 'Microsoft.Resources/tags@2025-04-01' = if (ap
   }
 }
 
+// Storage Blob Data Owner
 var storageBlobDataOwnerRoleDefinitionId = 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b'
+// Monitoring Metrics Publisher
 var monitoringMetricsPublisherRoleDefinitionId = '3913510d-42f4-4e42-8a64-420c390055eb'
+// Reader
 var readerRoleDefinitionId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+// Owner
 var ownerRoleDefinitionId = '8e3af657-a8ff-443c-a75c-2fe8c4bcb635'
 var deploymentPrincipalId = deployer().objectId
 
@@ -128,7 +217,7 @@ module runtimeIdentity 'br/public:avm/res/managed-identity/user-assigned-identit
 }
 
 // One account owns replaceable host/package artifacts and durable KeyVaultSync state/history.
-// Do not consume AVM key/connection-string outputs. An explicit Allow firewall preserves reachability.
+// Do not consume AVM key/connection-string outputs. Private mode permits only private endpoints.
 module functionStorage 'br/public:avm/res/storage/storage-account:0.33.1' = {
   params: {
     name: resolvedFunctionStorageName
@@ -141,14 +230,18 @@ module functionStorage 'br/public:avm/res/storage/storage-account:0.33.1' = {
     allowBlobPublicAccess: false
     minimumTlsVersion: 'TLS1_2'
     supportsHttpsTrafficOnly: true
-    publicNetworkAccess: 'Enabled'
+    publicNetworkAccess: isPrivateNetwork ? 'Disabled' : 'Enabled'
     networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Allow'
+      bypass: isPrivateNetwork ? 'None' : 'AzureServices'
+      defaultAction: isPrivateNetwork ? 'Deny' : 'Allow'
     }
     // This creation-only feature was absent from the original accounts; do not force-enable it on adoption.
     requireInfrastructureEncryption: false
     blobServices: {
+      deleteRetentionPolicyEnabled: true
+      deleteRetentionPolicyDays: 14
+      deleteRetentionPolicyAllowPermanentDelete: false
+      isVersioningEnabled: true
       containers: [
         {
           name: 'function-releases'
@@ -209,8 +302,8 @@ module applicationInsights 'br/public:avm/res/insights/component:0.8.0' = {
     flowType: 'Bluefield'
     ingestionMode: 'LogAnalytics'
     retentionInDays: 90
-    publicNetworkAccessForIngestion: 'Enabled'
-    publicNetworkAccessForQuery: 'Enabled'
+    publicNetworkAccessForIngestion: isPrivateNetwork ? 'Disabled' : 'Enabled'
+    publicNetworkAccessForQuery: isPrivateNetwork ? 'Disabled' : 'Enabled'
     workspaceResourceId: logAnalytics.outputs.resourceId
     enableTelemetry: false
   }
@@ -241,6 +334,37 @@ module functionPlan 'br/public:avm/res/web/serverfarm:0.7.0' = {
   ]
 }
 
+module privateNetworking './modules/private-networking.bicep' = if (isPrivateNetwork) {
+  name: 'private-networking'
+  params: {
+    location: location
+    networkSource: networkSource
+    nameToken: take(nameSuffix, 8)
+    tags: resourceTags
+    managedVirtualNetworkName: resolvedManagedVirtualNetworkName
+    managedVirtualNetworkAddressPrefix: managedVirtualNetworkAddressPrefix
+    managedFunctionIntegrationSubnetName: managedFunctionIntegrationSubnetName
+    managedFunctionIntegrationSubnetPrefix: managedFunctionIntegrationSubnetPrefix
+    managedPrivateEndpointSubnetName: managedPrivateEndpointSubnetName
+    managedPrivateEndpointSubnetPrefix: managedPrivateEndpointSubnetPrefix
+    existingFunctionIntegrationSubnetResourceId: existingFunctionIntegrationSubnetResourceId
+    existingPrivateEndpointSubnetResourceId: existingPrivateEndpointSubnetResourceId
+    existingBlobPrivateDnsZoneResourceId: existingBlobPrivateDnsZoneResourceId
+    existingQueuePrivateDnsZoneResourceId: existingQueuePrivateDnsZoneResourceId
+    existingTablePrivateDnsZoneResourceId: existingTablePrivateDnsZoneResourceId
+    existingKeyVaultPrivateDnsZoneResourceId: existingKeyVaultPrivateDnsZoneResourceId
+    existingMonitorPrivateDnsZoneResourceId: existingMonitorPrivateDnsZoneResourceId
+    existingOmsPrivateDnsZoneResourceId: existingOmsPrivateDnsZoneResourceId
+    existingOdsPrivateDnsZoneResourceId: existingOdsPrivateDnsZoneResourceId
+    existingAgentServicePrivateDnsZoneResourceId: existingAgentServicePrivateDnsZoneResourceId
+    existingAzureMonitorPrivateLinkScopeResourceId: existingAzureMonitorPrivateLinkScopeResourceId
+    storageAccountResourceId: functionStorageScope.id
+    logAnalyticsWorkspaceResourceId: logAnalytics.outputs.resourceId
+    applicationInsightsResourceId: applicationInsightsScope.id
+    keyVaultResourceIds: privateKeyVaultIds
+  }
+}
+
 // Flex owns runtime selection. Remove legacy connection selectors as well so an exact connection
 // string cannot override the identity-based host connection, or conflict with its client ID.
 var retiredFunctionAppSettingNames = [
@@ -252,10 +376,14 @@ var retiredFunctionAppSettingNames = [
   'KEYVAULTSYNC_APPLY_SECRETS'
   'KEYVAULTSYNC_SEED_MISSING_KEYS_AND_CERTIFICATES'
   'KEYVAULTSYNC_SINGLE_WRITER_MODE'
+  'AZURE_SUBSCRIPTION_ID'
+  'KEYVAULTSYNC_RESOURCE_GROUP'
+  'KEYVAULTSYNC_PAIR_TAG'
+  'KEYVAULTSYNC_REBASELINE'
 ]
 
-// Emit hosted selectors and infrastructure endpoints only. Enabled mappings opt pairs into supported
-// synchronization; the runner owns ordinary defaults (tag, containers, key-version label, log level).
+// Enabled mappings opt pairs into supported synchronization; the runner owns ordinary defaults
+// (tag, containers, key-version label, log level).
 var desiredFunctionAppSettings = {
   AZURE_CLIENT_ID: runtimeIdentity.outputs.clientId
   AzureWebJobsStorage__accountName: functionStorage.outputs.name
@@ -263,13 +391,15 @@ var desiredFunctionAppSettings = {
   AzureWebJobsStorage__clientId: runtimeIdentity.outputs.clientId
   APPLICATIONINSIGHTS_CONNECTION_STRING: applicationInsights.outputs.connectionString
   APPLICATIONINSIGHTS_AUTHENTICATION_STRING: 'ClientId=${runtimeIdentity.outputs.clientId};Authorization=AAD'
-  AZURE_SUBSCRIPTION_ID: subscription().subscriptionId
+  KEYVAULTSYNC_SUBSCRIPTIONS: keyVaultSyncSubscriptions
   KEYVAULTSYNC_STORAGE_ACCOUNT_URI: functionStorage.outputs.serviceEndpoints.blob
+  KEYVAULTSYNC_HMAC_KEY: keyVaultSyncHmacKey
+  KEYVAULTSYNC_PRINCIPAL_ID: runtimeIdentity.outputs.principalId
   KEYVAULTSYNC_TIMER_SCHEDULE: timerSchedule
 }
 
-// The standalone user-assigned identity is the only runtime principal. Settings remain in the
-// guarded child resource below so redeployment can preserve an out-of-band HMAC key.
+// The standalone user-assigned identity is the only runtime principal. The guarded child
+// resource owns template settings and can preserve other existing settings on later deployments.
 module functionApp 'br/public:avm/res/web/site:0.24.0' = {
   params: {
     name: resolvedFunctionAppName
@@ -285,6 +415,8 @@ module functionApp 'br/public:avm/res/web/site:0.24.0' = {
       ]
     }
     keyVaultAccessIdentityResourceId: runtimeIdentity.outputs.resourceId
+    virtualNetworkSubnetResourceId: isPrivateNetwork ? privateNetworking!.outputs.functionIntegrationSubnetResourceId : null
+    publicNetworkAccess: isPrivateNetwork ? 'Disabled' : 'Enabled'
     httpsOnly: true
     clientAffinityEnabled: false
     clientAffinityProxyEnabled: false
@@ -336,7 +468,7 @@ module functionApp 'br/public:avm/res/web/site:0.24.0' = {
   dependsOn: [
     functionStorageBlobOwner
     applicationInsightsMetricsPublisher
-    subscriptionReader
+    subscriptionReaders
   ]
 }
 
@@ -404,17 +536,17 @@ module deploymentPrincipalOwner 'br/public:avm/res/authorization/role-assignment
   }
 }
 
-module subscriptionReader 'br/public:avm/res/authorization/role-assignment/sub-scope:0.1.1' = {
-  name: 'subscription-reader'
-  scope: subscription()
+module subscriptionReaders 'br/public:avm/res/authorization/role-assignment/sub-scope:0.1.1' = [for discoverySubscriptionId in discoverySubscriptionIds: {
+  name: 'subscription-reader-${take(uniqueString(discoverySubscriptionId), 8)}'
+  scope: subscription(discoverySubscriptionId)
   params: {
-    name: guid(subscription().id, runtimeIdentity.outputs.principalId, readerRoleDefinitionId)
+    name: guid(discoverySubscriptionId, runtimeIdentity.outputs.principalId, readerRoleDefinitionId)
     principalId: runtimeIdentity.outputs.principalId
     roleDefinitionIdOrName: readerRoleDefinitionId
     principalType: 'ServicePrincipal'
     enableTelemetry: false
   }
-}
+}]
 
 resource applicationInsightsMetricsPublisher 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(applicationInsightsScope.id, runtimeIdentityResourceId, monitoringMetricsPublisherRoleDefinitionId)
@@ -440,3 +572,7 @@ output KEYVAULTSYNC_STORAGE_ACCOUNT_URI string = functionStorage.outputs.service
 
 @description('Non-secret central identity resource ID for the separate, approval-gated vault-access script. Not a runtime setting.')
 output KEYVAULTSYNC_IDENTITY_RESOURCE_ID string = runtimeIdentity.outputs.resourceId
+@description('Configured networking posture.')
+output KEYVAULTSYNC_NETWORK_MODE string = networkMode
+@description('Flex integration subnet resource ID in private mode; empty in public mode.')
+output KEYVAULTSYNC_FUNCTION_INTEGRATION_SUBNET_ID string = isPrivateNetwork ? privateNetworking!.outputs.functionIntegrationSubnetResourceId : ''

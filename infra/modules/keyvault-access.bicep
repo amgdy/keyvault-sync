@@ -12,7 +12,9 @@ param useRbacAuthorization bool
 @description('Allow secret value reads for approved mutation verification. Keep false for read-only inventory.')
 param allowSecretValueRead bool = false
 
+// Key Vault Reader
 var keyVaultReaderRoleDefinitionId = '21090545-7ca7-4776-b22c-e363652d74d2'
+// Key Vault Secrets User
 var keyVaultSecretsUserRoleDefinitionId = '4633458b-17de-408a-b874-0445c86b69e6'
 
 resource vault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {

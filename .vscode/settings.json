@@ -1,0 +1,4 @@
+{
+  "azureFunctions.projectRuntime": "~4",
+  "azureFunctions.projectSubpath": "src/KeyVaultSync.Function"
+}

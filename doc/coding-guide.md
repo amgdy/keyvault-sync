@@ -4,15 +4,16 @@
 
 - `Azure/ArmResourceClient.cs` owns subscription discovery and authorization inventory.
 - `Azure/VaultInventoryScanner.cs` owns read-only data-plane inventory.
-- `Sync/SyncPlanner.cs` is pure planning logic; it must not mutate Azure resources.
-- `Sync/SecretSyncExecutor.cs` owns guarded secret synchronization.
-- `Security/SecretHmacService.cs` owns HMAC computation and key zeroing.
+- `Sync/ReplicationPlanner.cs` is pure planning logic; it must not mutate Azure resources.
+- `Sync/ObjectExecutor.cs` owns guarded secret/certificate synchronization and soft deletion.
+- `Sync/RbacExecutor.cs` owns supported direct Key Vault RBAC reconciliation.
+- `Security/ObjectSignatureService.cs` owns object HMAC computation and key zeroing.
 - `State/BlobStateStore.cs` owns run records, pair state, leases, ETags, and checkpoint persistence.
 - `Telemetry.cs` owns service identity, log/export providers, instruments, and custom activity sources.
 
 ## Change Rules
 
-- For supported runtime operations, an enabled, unpaused pair mapping is the opt-in; do not add separate runtime apply or seed switches. Keep onboarding IAM writes separately gated. Every mutation still needs a plan item, preconditions, post-write verification, and a persisted intent/commit record.
+- For supported runtime operations, an enabled, unpaused pair mapping is the opt-in; do not add separate runtime apply switches. Keep onboarding IAM writes separately gated. Every mutation still needs a plan item, preconditions, post-write verification, and a persisted intent/commit record.
 - Do not infer ownership from equal names, equal secret values, equal access-policy counts, timestamps, or matching public certificate fingerprints alone.
 - Re-read target state immediately before a write. When the service has no compare-and-set condition, preserve the operational single-writer requirement and never retry an ambiguous write.
 - Do not advance complete-scan or deletion evidence after partial inventory, lease loss, or failed state persistence.
@@ -29,10 +30,10 @@ Run the focused safety suite after changes to planner/state/HMAC logic:
 dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj
 ```
 
-Build the console runner:
+Build the Function host and runner library:
 
 ```sh
-dotnet build src/KeyVaultSync.Runner/KeyVaultSync.Runner.csproj
+dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj
 ```
 
-For a live inventory-only lab scan, ensure the pair is not enabled for automatic operations (for example, keep `KeyVaultSyncDisabled=true` on either vault), then provide `AZURE_SUBSCRIPTION_ID`, `KEYVAULTSYNC_STORAGE_ACCOUNT_URI`, and `APPLICATIONINSIGHTS_CONNECTION_STRING` through environment settings. Never place real credentials in a committed settings file.
+For local Function startup, copy `src/KeyVaultSync.Function/local.settings.example.json` to the ignored `local.settings.json` file and provide `KEYVAULTSYNC_SUBSCRIPTIONS`, `KEYVAULTSYNC_STORAGE_ACCOUNT_URI`, and `APPLICATIONINSIGHTS_CONNECTION_STRING` privately. Do not run synchronization as a configuration test. Use mocked tests for discovery and mutation behavior, and never place real credentials in a committed settings file.

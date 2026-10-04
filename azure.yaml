@@ -5,23 +5,25 @@ hooks:
   preprovision:
     posix:
       shell: sh
-      run: ./scripts/preprovision-resource-group-tag.sh
+      run: bash ./scripts/prepare-deployment.sh provision
       interactive: true
     windows:
       shell: pwsh
-      run: ./scripts/PreProvision-ResourceGroupTag.ps1
+      run: ./scripts/Prepare-Deployment.ps1 provision
       interactive: true
   predeploy:
     posix:
       shell: sh
-      run: ./scripts/verify-deployment-storage.sh
+      run: bash ./scripts/prepare-deployment.sh deploy
+      interactive: true
     windows:
       shell: pwsh
-      run: ./scripts/Verify-DeploymentStorage.ps1
+      run: ./scripts/Prepare-Deployment.ps1 deploy
+      interactive: true
   postdeploy:
     posix:
       shell: sh
-      run: ./scripts/postdeploy-keyvault-access.sh
+      run: bash ./scripts/postdeploy-keyvault-access.sh
       interactive: true
     windows:
       shell: pwsh

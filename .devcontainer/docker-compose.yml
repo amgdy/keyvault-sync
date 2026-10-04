@@ -1,0 +1,21 @@
+services:
+  dev:
+    image: mcr.microsoft.com/devcontainers/dotnet:2-10.0-noble
+    command: sleep infinity
+    volumes:
+      - ..:/workspaces/keyvault-sync:cached
+    ports:
+      - "10000:10000"
+      - "10001:10001"
+      - "10002:10002"
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    network_mode: service:dev
+    depends_on:
+      - dev
+    volumes:
+      - azurite-data:/data
+
+volumes:
+  azurite-data:

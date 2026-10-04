@@ -27,10 +27,14 @@ internal sealed record VaultResource
     public required string Id { get; init; }
     /// <summary>Gets the vault's resource name, also used in diagnostics and the public-cloud endpoint.</summary>
     public required string Name { get; init; }
-    /// <summary>Gets the ARM region string used by diagnostics and conservative native-restore planning.</summary>
+    /// <summary>Gets the ARM region string used by diagnostics and reporting.</summary>
     public required string Location { get; init; }
     /// <summary>Gets the containing resource-group name extracted from the ARM ID.</summary>
     public required string ResourceGroup { get; init; }
+    /// <summary>Gets the vault tenant declared by ARM when available.</summary>
+    public string? TenantId { get; init; }
+    /// <summary>Gets whether ARM explicitly reports Azure RBAC authorization; null means the listing omitted the property.</summary>
+    public bool? UsesRbacAuthorization { get; init; }
     /// <summary>Gets observed ARM tags, including the target mapping and pair-pause control.</summary>
     public required Dictionary<string, string> Tags { get; init; }
 }
@@ -40,7 +44,7 @@ internal sealed record VaultResource
 /// <param name="Target">Existing destination vault; equal names or values alone do not establish object ownership.</param>
 internal sealed record VaultPair(VaultResource Source, VaultResource Target)
 {
-    /// <summary>Gets the directional identity used for state addressing and HMAC domain binding.</summary>
+    /// <summary>Gets the directional identity used for state addressing and run correlation.</summary>
     /// <remarks>Changing either endpoint changes the logical pair. Do not rename this identity as a cosmetic change.</remarks>
     public string PairId => $"{Source.Id}=>{Target.Id}";
 }
@@ -114,6 +118,11 @@ internal sealed record KeySummary
     public string? PublicFingerprintSha256 { get; init; }
     /// <summary>Gets sorted declared key operations, not proof that any particular identity can perform them.</summary>
     public IReadOnlyList<string> KeyOperations { get; init; } = [];
+    public bool? Enabled { get; init; }
+    public DateTimeOffset? NotBefore { get; init; }
+    public DateTimeOffset? ExpiresOn { get; init; }
+    public IReadOnlyDictionary<string, string> Tags { get; init; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     /// <summary>Gets the observed CurrentVersion alias without reading the service.</summary>
     public string? LatestVersion => CurrentVersion;
 }
@@ -133,6 +142,13 @@ internal sealed record CertificateSummary
     public string? SecretId { get; init; }
     /// <summary>Gets the backing key identifier, or null when metadata could not establish the relationship.</summary>
     public string? KeyId { get; init; }
+    /// <summary>Gets whether the current certificate policy permits private-key export through its backing secret.</summary>
+    public bool? Exportable { get; init; }
+    public bool? Enabled { get; init; }
+    public DateTimeOffset? NotBefore { get; init; }
+    public DateTimeOffset? ExpiresOn { get; init; }
+    public IReadOnlyDictionary<string, string> Tags { get; init; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     /// <summary>Gets the observed CurrentVersion alias, which may be empty.</summary>
     public string? LatestVersion => CurrentVersion;
 }
@@ -169,6 +185,23 @@ internal sealed record RoleAssignmentSummary
     public string? ConditionVersion { get; init; }
     /// <summary>Gets the delegated managed-identity resource ID, when present.</summary>
     public string? DelegatedManagedIdentityResourceId { get; init; }
+
+    /// <summary>Gets the scope category used to prevent ancestor assignments from being mirrored.</summary>
+    public string ScopeKind => GetScopeKind(Scope);
+
+    private static string GetScopeKind(string scope)
+    {
+        var normalized = scope.TrimEnd('/');
+        if (normalized.Contains("/providers/Microsoft.KeyVault/vaults/", StringComparison.OrdinalIgnoreCase))
+        {
+            var segments = normalized.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            return segments.Length > 8 ? "Object" : "Vault";
+        }
+
+        return normalized.Contains("/resourceGroups/", StringComparison.OrdinalIgnoreCase)
+            ? "ResourceGroup"
+            : "Subscription";
+    }
 }
 
 /// <summary>Authorization declarations for comparison and reporting, not proof of effective source/target access.</summary>
@@ -178,7 +211,7 @@ internal sealed record VaultAuthorizationSummary
     public required bool UsesRbac { get; init; }
     /// <summary>Gets the vault's declared access policies, even if RBAC is the selected model.</summary>
     public required IReadOnlyList<AccessPolicySummary> AccessPolicies { get; init; }
-    /// <summary>Gets role assignments returned from the queried vault/resource-group/subscription scopes.</summary>
+    /// <summary>Gets the vault-scope and object-scope role assignments eligible for replication.</summary>
     public required IReadOnlyList<RoleAssignmentSummary> RoleAssignments { get; init; }
     /// <summary>Gets scope-read failures that make authorization inventory incomplete.</summary>
     public required IReadOnlyList<string> Warnings { get; init; }
@@ -219,7 +252,7 @@ internal sealed record VaultInventory
 }
 
 /// <summary>A planned action or its replacement execution outcome; action/status strings form a shared reporting contract.</summary>
-/// <remarks>Authorization entries remain review-only proposals. Only guarded secret and native-seed executors can apply their supported object types.</remarks>
+/// <remarks>Authorization entries identify exact vault- or object-scope role assignments and are applied by the RBAC executor when the run safety gates permit mutation.</remarks>
 internal sealed record PlanItem
 {
     /// <summary>Gets the discriminator: Secret, Key, CertificateGroup, Authorization, or Inventory.</summary>
@@ -236,6 +269,20 @@ internal sealed record PlanItem
     public string? TargetVersion { get; init; }
     /// <summary>Gets operator-facing reasoning without secret values or fingerprint contents.</summary>
     public string? Detail { get; init; }
+    /// <summary>Gets the target ARM scope for an authorization action.</summary>
+    public string? TargetScope { get; init; }
+    /// <summary>Gets the deterministic or existing target assignment ID for an authorization action.</summary>
+    public string? AssignmentId { get; init; }
+    /// <summary>Gets the principal copied by an authorization action.</summary>
+    public string? PrincipalId { get; init; }
+    /// <summary>Gets the role definition copied by an authorization action.</summary>
+    public string? RoleDefinitionId { get; init; }
+    /// <summary>Gets the principal type preserved by an authorization action.</summary>
+    public string? PrincipalType { get; init; }
+    /// <summary>Gets the condition preserved verbatim by an authorization action.</summary>
+    public string? Condition { get; init; }
+    /// <summary>Gets the condition version preserved verbatim by an authorization action.</summary>
+    public string? ConditionVersion { get; init; }
 }
 
 /// <summary>A mutable progress report for one attempted pair within a run-history document.</summary>
@@ -269,8 +316,8 @@ internal sealed record RunRecord
 {
     /// <summary>Gets the UTC timestamp-plus-random-ID correlation key and run-blob filename component.</summary>
     public required string RunId { get; init; }
-    /// <summary>Gets the source-discovery subscription for the cycle.</summary>
-    public required string SubscriptionId { get; init; }
+    /// <summary>Gets the configured discovery subscriptions for the cycle.</summary>
+    public required IReadOnlyList<string> SubscriptionIds { get; init; }
     /// <summary>Gets the UTC start after state/HMAC initialization has succeeded.</summary>
     public required DateTimeOffset StartedAt { get; init; }
     /// <summary>Gets or sets the UTC finish time; null is retained if the process stops before finalization.</summary>
@@ -351,7 +398,7 @@ internal sealed record SecretWriteIntent
 internal sealed record PairState
 {
     /// <summary>The writer's state schema version; changing it requires an explicit compatibility/migration decision.</summary>
-    public const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 6;
     /// <summary>Gets or sets the persisted schema marker validated when the Blob state is loaded.</summary>
     public int SchemaVersion { get; set; } = CurrentSchemaVersion;
     /// <summary>Gets the directional identity whose hash addresses this state blob.</summary>
@@ -364,21 +411,85 @@ internal sealed record PairState
     public DateTimeOffset? LastCompleteScanAt { get; set; }
     /// <summary>Gets or sets the run associated with LastCompleteScanAt, null before any such checkpoint.</summary>
     public string? LastCompleteRunId { get; set; }
-    /// <summary>Gets per-secret committed verification baselines; existing targets without one are not automatically adopted.</summary>
+    /// <summary>Gets superseded per-secret baselines retained only to detect incompatible persisted state.</summary>
     public Dictionary<string, SecretBaseline> SecretBaselines { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets unresolved value-write or metadata-update intents that block further writes to the corresponding names.</summary>
+    /// <summary>Gets superseded per-secret intents retained only to detect incompatible persisted state.</summary>
     public Dictionary<string, SecretWriteIntent> PendingSecretWrites { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets committed one-time key-seed outcomes; these never authorize overwriting or rotating a target.</summary>
+    /// <summary>Gets superseded key-seed records retained only to detect incompatible persisted state.</summary>
     public Dictionary<string, NativeSeedBaseline> KeySeedBaselines { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets committed one-time certificate-group seed outcomes.</summary>
+    /// <summary>Gets superseded certificate-seed records retained only to detect incompatible persisted state.</summary>
     public Dictionary<string, NativeSeedBaseline> CertificateGroupSeedBaselines { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets key restore attempts whose outcome must be resolved before another attempt.</summary>
+    /// <summary>Gets superseded key intents retained only to detect incompatible persisted state.</summary>
     public Dictionary<string, NativeSeedIntent> PendingKeySeeds { get; init; } = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets certificate-group restore attempts whose outcome must be resolved before another attempt.</summary>
+    /// <summary>Gets superseded certificate intents retained only to detect incompatible persisted state.</summary>
     public Dictionary<string, NativeSeedIntent> PendingCertificateGroupSeeds { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Gets current-format baselines for objects verified by the active executor.</summary>
+    public Dictionary<string, ObjectBaseline> ObjectBaselines { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Gets unresolved intents for unified object mutations.</summary>
+    public Dictionary<string, ObjectMutationIntent> PendingObjectMutations { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Gets an optional one-use approval for one exact bulk deletion plan.</summary>
+    public DeletionPlanApproval? DeletionApproval { get; set; }
 }
 
-/// <summary>A committed record for a verified, one-time native seed; it never grants overwrite authority.</summary>
+/// <summary>A versionless object integrity baseline committed after target verification.</summary>
+internal sealed record ObjectBaseline
+{
+    /// <summary>Gets the signature-domain version required to interpret both signatures.</summary>
+    public string DomainVersion { get; init; } = "unknown";
+    /// <summary>Gets the supported object type.</summary>
+    public required string ObjectType { get; init; }
+    /// <summary>Gets the versionless target object URI signed into the target baseline.</summary>
+    public required string ObjectId { get; init; }
+    /// <summary>Gets the exact source version used for the verified write.</summary>
+    public required string SourceVersion { get; init; }
+    /// <summary>Gets the exact target version read back after mutation.</summary>
+    public required string TargetVersion { get; init; }
+    /// <summary>Gets the source object signature; never emit it in logs or telemetry.</summary>
+    public required string SourceSignature { get; init; }
+    /// <summary>Gets the target object signature; never emit it in logs or telemetry.</summary>
+    public required string TargetSignature { get; init; }
+    /// <summary>Gets the operator-managed HMAC key-version label.</summary>
+    public required string HmacKeyVersion { get; init; }
+    /// <summary>Gets when the exact target version was last verified.</summary>
+    public required DateTimeOffset VerifiedAt { get; init; }
+}
+
+/// <summary>Durable intent that blocks retry after an ambiguous object mutation.</summary>
+internal sealed record ObjectMutationIntent
+{
+    /// <summary>Gets the run that crossed or prepared to cross the mutation boundary.</summary>
+    public required string RunId { get; init; }
+    /// <summary>Gets the supported object type.</summary>
+    public required string ObjectType { get; init; }
+    /// <summary>Gets the versionless target object URI.</summary>
+    public required string ObjectId { get; init; }
+    /// <summary>Gets the planned create, reconcile, or delete action.</summary>
+    public required string Action { get; init; }
+    /// <summary>Gets the exact source version pinned before the mutation.</summary>
+    public required string SourceVersion { get; init; }
+    /// <summary>Gets the expected source signature; never emit it in logs or telemetry.</summary>
+    public required string ExpectedSourceSignature { get; init; }
+    /// <summary>Gets the expected post-mutation target signature.</summary>
+    public required string ExpectedTargetSignature { get; init; }
+    /// <summary>Gets the target head observed before mutation, or null when it was absent.</summary>
+    public string? TargetVersionBefore { get; init; }
+    /// <summary>Gets when the intent was durably saved, not when Azure accepted the operation.</summary>
+    public required DateTimeOffset CreatedAt { get; init; }
+}
+
+/// <summary>One-use, expiring authorization for one canonical bulk deletion plan.</summary>
+internal sealed record DeletionPlanApproval
+{
+    /// <summary>Gets the canonical delete-plan hash that was approved.</summary>
+    public required string PlanHash { get; init; }
+    /// <summary>Gets the UTC time after which the approval cannot be used.</summary>
+    public required DateTimeOffset ExpiresAt { get; init; }
+    /// <summary>Gets when the approval was created.</summary>
+    public required DateTimeOffset CreatedAt { get; init; }
+}
+
+/// <summary>A superseded native-seed record retained only for incompatible-state detection.</summary>
 internal sealed record NativeSeedBaseline
 {
     /// <summary>Gets the pinned source head version included in the native backup.</summary>
@@ -399,8 +510,8 @@ internal sealed record NativeSeedBaseline
     public required DateTimeOffset VerifiedAt { get; init; }
 }
 
-/// <summary>Records a native restore that must be investigated before another restore is allowed.</summary>
-/// <remarks>The encrypted backup payload is never stored in pair state.</remarks>
+/// <summary>A superseded native-restore intent retained only for incompatible-state detection.</summary>
+/// <remarks>The active runner does not perform native backup/restore. Encrypted payloads were never stored in pair state.</remarks>
 internal sealed record NativeSeedIntent
 {
     /// <summary>Gets the run that prepared this restore attempt.</summary>

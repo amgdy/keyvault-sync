@@ -66,9 +66,36 @@ internal sealed class VaultInventoryScanner(TokenCredential credential, ArmResou
                 () => ListDeletedKeysAsync(vault.Name, keyClient, warnings, cancellationToken), result => result.Count);
             var deletedCertificateNames = await TraceStageAsync("keyvault.inventory.deleted-certificates", vault.Name,
                 () => ListDeletedCertificatesAsync(vault.Name, certificateClient, warnings, cancellationToken), result => result.Count);
-            var authorization = await TraceStageAsync("keyvault.inventory.authorization", vault.Name,
+            var vaultAuthorization = await TraceStageAsync("keyvault.inventory.authorization", vault.Name,
                 () => arm.GetAuthorizationAsync(vault.Id, cancellationToken),
                 result => result.AccessPolicies.Count + result.RoleAssignments.Count);
+            var objectAssignments = new List<RoleAssignmentSummary>();
+            var authorizationWarnings = vaultAuthorization.Warnings.ToList();
+            foreach (var scope in secrets.Select(secret => $"{vault.Id}/secrets/{Uri.EscapeDataString(secret.Name)}")
+                         .Concat(keys.Select(key => $"{vault.Id}/keys/{Uri.EscapeDataString(key.Name)}")))
+            {
+                try
+                {
+                    objectAssignments.AddRange(await arm.ListDirectRoleAssignmentsAsync(scope, cancellationToken));
+                }
+                catch (Exception exception)
+                {
+                    authorizationWarnings.Add(
+                        $"Object role-assignment inventory is incomplete: {exception.GetType().Name}.");
+                    logger.LogWarning(exception,
+                        "Object role-assignment inventory is incomplete for one {VaultName} child scope.",
+                        vault.Name);
+                }
+            }
+
+            var authorization = vaultAuthorization with
+            {
+                // Object-scope queries repeat the vault-scope rows their scope inherits from.
+                RoleAssignments = vaultAuthorization.RoleAssignments.Concat(objectAssignments)
+                    .DistinctBy(assignment => assignment.Id, StringComparer.OrdinalIgnoreCase)
+                    .ToArray(),
+                Warnings = authorizationWarnings,
+            };
             warnings.AddRange(authorization.Warnings);
 
             activity?.SetTag("inventory.secret_count", secrets.Count);
@@ -278,6 +305,10 @@ internal sealed class VaultInventoryScanner(TokenCredential credential, ArmResou
                 KeyType = currentKey.Value.Key.KeyType.ToString(),
                 PublicFingerprintSha256 = KeyVaultPublicFingerprint.Compute(currentKey.Value.Key),
                 KeyOperations = operations,
+                Enabled = currentKey.Value.Properties.Enabled,
+                NotBefore = currentKey.Value.Properties.NotBefore,
+                ExpiresOn = currentKey.Value.Properties.ExpiresOn,
+                Tags = new Dictionary<string, string>(currentKey.Value.Properties.Tags, StringComparer.OrdinalIgnoreCase),
             });
             logger.LogDebug("Key inventory metadata completed. {KeyVaultName}; {KeyName}; key type {KeyType}; {VersionCount} versions; current version {CurrentVersion}; {OperationCount} operations.",
                 vaultName, key.Name, currentKey.Value.Key.KeyType, versions.Count, currentVersion, operations.Length);
@@ -322,6 +353,12 @@ internal sealed class VaultInventoryScanner(TokenCredential credential, ArmResou
             string? thumbprint = null;
             string? secretId = null;
             string? keyId = null;
+            bool? exportable = null;
+            bool? enabled = certificate.Enabled;
+            DateTimeOffset? notBefore = certificate.NotBefore;
+            DateTimeOffset? expiresOn = certificate.ExpiresOn;
+            IReadOnlyDictionary<string, string> tags =
+                new Dictionary<string, string>(certificate.Tags, StringComparer.OrdinalIgnoreCase);
             var currentVersion = certificate.Version ?? string.Empty;
             try
             {
@@ -336,6 +373,11 @@ internal sealed class VaultInventoryScanner(TokenCredential credential, ArmResou
 
                 secretId = current.Value.SecretId?.ToString();
                 keyId = current.Value.KeyId?.ToString();
+                exportable = current.Value.Policy?.Exportable;
+                enabled = current.Value.Properties.Enabled;
+                notBefore = current.Value.Properties.NotBefore;
+                expiresOn = current.Value.Properties.ExpiresOn;
+                tags = new Dictionary<string, string>(current.Value.Properties.Tags, StringComparer.OrdinalIgnoreCase);
             }
             catch (RequestFailedException exception)
             {
@@ -360,6 +402,11 @@ internal sealed class VaultInventoryScanner(TokenCredential credential, ArmResou
                 ThumbprintSha256 = thumbprint,
                 SecretId = secretId,
                 KeyId = keyId,
+                Exportable = exportable,
+                Enabled = enabled,
+                NotBefore = notBefore,
+                ExpiresOn = expiresOn,
+                Tags = tags,
             });
             logger.LogDebug("Certificate inventory metadata completed. {KeyVaultName}; {CertificateName}; {VersionCount} versions; current version {CurrentVersion}; backing secret present {HasBackingSecret}; backing key present {HasBackingKey}.",
                 vaultName, certificate.Name, versions.Count, currentVersion, secretId is not null, keyId is not null);

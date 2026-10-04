@@ -164,10 +164,20 @@ internal sealed class BlobStateStore
 
             if (state.SchemaVersion < PairState.CurrentSchemaVersion)
             {
-                // Only the state marker is advanced here. Missing baseline domain versions retain
-                // their "unknown" defaults, so planner/executor checks still require manual review.
+                if (state.SecretBaselines.Count > 0
+                    || state.PendingSecretWrites.Count > 0
+                    || state.KeySeedBaselines.Count > 0
+                    || state.CertificateGroupSeedBaselines.Count > 0
+                    || state.PendingKeySeeds.Count > 0
+                    || state.PendingCertificateGroupSeeds.Count > 0)
+                {
+                    throw new InvalidDataException(
+                        $"Pair state schema {state.SchemaVersion} contains superseded synchronization state and requires explicit administrative state recovery or intent resolution.");
+                }
+
                 state.SchemaVersion = PairState.CurrentSchemaVersion;
-                _logger.LogWarning("Upgraded pair-state schema for {PairId}; legacy HMAC baselines without a domain version remain blocked until reviewed.", pair.PairId);
+                _logger.LogInformation("Advanced empty pair-state schema for {PairId} to version {SchemaVersion}.",
+                    pair.PairId, PairState.CurrentSchemaVersion);
             }
 
             if (!state.SourceVaultId.Equals(pair.Source.Id, StringComparison.OrdinalIgnoreCase)
@@ -179,11 +189,11 @@ internal sealed class BlobStateStore
             activity?.SetStatus(ActivityStatusCode.Ok);
             leaseTimer.Stop();
             activity?.SetTag("pair_state.schema_version", state.SchemaVersion);
-            activity?.SetTag("pair_state.baseline_count", state.SecretBaselines.Count);
-            activity?.SetTag("pair_state.pending_write_count", state.PendingSecretWrites.Count);
+            activity?.SetTag("pair_state.baseline_count", state.ObjectBaselines.Count);
+            activity?.SetTag("pair_state.pending_write_count", state.PendingObjectMutations.Count);
             _logger.LogInformation(PairLeaseAcquisitionEventId,
-                "Pair state lease acquired. {PairId}; state schema {SchemaVersion}; {BaselineCount} secret baselines; {PendingWriteCount} pending writes; waited {DurationMs} ms.",
-                pair.PairId, state.SchemaVersion, state.SecretBaselines.Count, state.PendingSecretWrites.Count, leaseTimer.Elapsed.TotalMilliseconds);
+                "Pair state lease acquired. {PairId}; state schema {SchemaVersion}; {BaselineCount} object baselines; {PendingWriteCount} pending mutations; waited {DurationMs} ms.",
+                pair.PairId, state.SchemaVersion, state.ObjectBaselines.Count, state.PendingObjectMutations.Count, leaseTimer.Elapsed.TotalMilliseconds);
             return new PairLease(blob, leaseClient, lease.LeaseId, download.Value.Details.ETag, state,
                 _loggerFactory.CreateLogger<PairLease>());
         }
@@ -313,11 +323,11 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
             _etag = response.Value.ETag;
             activity?.SetStatus(ActivityStatusCode.Ok);
             activity?.SetTag("pair_state.schema_version", State.SchemaVersion);
-            activity?.SetTag("pair_state.baseline_count", State.SecretBaselines.Count);
-            activity?.SetTag("pair_state.pending_write_count", State.PendingSecretWrites.Count);
+            activity?.SetTag("pair_state.baseline_count", State.ObjectBaselines.Count);
+            activity?.SetTag("pair_state.pending_write_count", State.PendingObjectMutations.Count);
             _logger.LogInformation(PairStatePersistedEventId,
-                "Pair state persisted. {PairId}; last complete run {LastCompleteRunId}; {BaselineCount} secret baselines; {PendingWriteCount} pending writes.",
-                State.PairId, State.LastCompleteRunId, State.SecretBaselines.Count, State.PendingSecretWrites.Count);
+                "Pair state persisted. {PairId}; last complete run {LastCompleteRunId}; {BaselineCount} object baselines; {PendingWriteCount} pending mutations.",
+                State.PairId, State.LastCompleteRunId, State.ObjectBaselines.Count, State.PendingObjectMutations.Count);
         }
         catch (Exception exception)
         {

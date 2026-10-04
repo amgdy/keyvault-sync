@@ -12,11 +12,11 @@ namespace KeyVaultSync.Runner;
 
 /// <summary>Coordinates one discovery, inventory, planning, and mapping-driven synchronization cycle.</summary>
 /// <remarks>
-/// <para>Both hosts use this implementation. It owns no scheduling loop and creates neither source nor
+/// <para>The isolated Function host uses this implementation. It owns no scheduling loop and creates neither source nor
 /// target Key Vaults. Azure clients are reused across calls; pair state is protected by cooperative Blob leases.</para>
-/// <para>An enabled source/target mapping opts that pair into supported synchronization. Standalone-secret writes
-/// retain HMAC and intent checks; eligible native key/certificate-group seeds remain one-time operations.
-/// Authorization changes and deletion remain plan-only.</para>
+/// <para>An enabled target-declared mapping opts that pair into supported synchronization. Supported object writes
+/// and soft deletes retain versioned HMAC and intent checks. Direct allowlisted Key Vault RBAC is reconciled at vault,
+/// secret, and key scope; unsupported key material and certificate child-scope authorization remain explicit reports.</para>
 /// </remarks>
 public sealed class RunnerApplication
 {
@@ -33,8 +33,8 @@ public sealed class RunnerApplication
     private readonly ILogger<RunnerApplication> _logger;
     private readonly ArmResourceClient _arm;
     private readonly VaultInventoryScanner _scanner;
-    private readonly SecretSyncExecutor _secretExecutor;
-    private readonly NativeSeedExecutor _nativeSeedExecutor;
+    private readonly ObjectExecutor _objectExecutor;
+    private readonly RbacExecutor _rbacExecutor;
     private readonly BlobStateStore _stateStore;
 
     /// <summary>Creates the hosted runner with an environment-only configuration snapshot.</summary>
@@ -47,7 +47,7 @@ public sealed class RunnerApplication
     {
     }
 
-    /// <summary>Creates the console/test runner from already resolved options and shared host dependencies.</summary>
+    /// <summary>Creates the test runner from already resolved options and shared host dependencies.</summary>
     /// <param name="options">Options normally produced by <see cref="RunnerOptions.Parse"/>; no additional parsing occurs here.</param>
     /// <param name="credential">Credential used by the clients; construction does not verify Azure permissions.</param>
     /// <param name="loggerFactory">Factory that routes child service logs through the host's providers.</param>
@@ -59,14 +59,17 @@ public sealed class RunnerApplication
         _logger = loggerFactory.CreateLogger<RunnerApplication>();
         _arm = new ArmResourceClient(credential, loggerFactory.CreateLogger<ArmResourceClient>());
         _scanner = new VaultInventoryScanner(credential, _arm, loggerFactory.CreateLogger<VaultInventoryScanner>());
-        _secretExecutor = new SecretSyncExecutor(credential, loggerFactory.CreateLogger<SecretSyncExecutor>());
-        _nativeSeedExecutor = new NativeSeedExecutor(
-            new NativeSeedVaultClientFactory(credential),
-            loggerFactory.CreateLogger<NativeSeedExecutor>());
+        _objectExecutor = new ObjectExecutor(
+            new ObjectReplicationVaultClientFactory(credential),
+            loggerFactory.CreateLogger<ObjectExecutor>());
+        _rbacExecutor = new RbacExecutor(
+            new ArmRbacClient(credential),
+            options.SyncPrincipalId,
+            loggerFactory.CreateLogger<RbacExecutor>());
         var blobService = new BlobServiceClient(options.StorageAccountUri, credential, new BlobClientOptions());
         _stateStore = new BlobStateStore(blobService, options, loggerFactory);
-        _logger.LogInformation("Runner application configured for subscription {SubscriptionId}, storage host {StorageHost}, and state container {StateContainer}.",
-            options.SubscriptionId, options.StorageAccountUri.Host, options.StateContainer);
+        _logger.LogInformation("Runner application configured for {SubscriptionCount} subscriptions, storage host {StorageHost}, and state container {StateContainer}.",
+            options.SubscriptionIds.Count, options.StorageAccountUri.Host, options.StateContainer);
     }
 
     /// <summary>Executes one cycle and persists its discovery, pair reports, plans, and final aggregate outcome.</summary>
@@ -76,7 +79,8 @@ public sealed class RunnerApplication
     /// <exception cref="InvalidOperationException">Protected HMAC configuration is malformed.</exception>
     /// <remarks>
     /// <para>State/HMAC initialization occurs before the run record is created and can throw directly.
-    /// Pair failures normally allow later pairs to proceed; failure to persist history can escalate to a run failure.
+    /// Every admitted pair must finish planning before mutation begins. Pair execution failures normally allow later
+    /// already-planned pairs to proceed; failure to persist history can escalate to a run failure.
     /// Final history persistence is outside the run catch block and can itself throw.</para>
     /// <para>Complete means each admitted pair finished with no unapplied work, not that every planned resource type
     /// was synchronized. Inspect pair statuses and plan items, not just the presence of a persisted run record.</para>
@@ -86,7 +90,7 @@ public sealed class RunnerApplication
         // These prerequisites are outside the recorded cycle. If they fail, the host receives the
         // exception directly; no synthetic run ID, completion metric, or durable run record exists yet.
         _logger.LogDebug("RunOnce entered; loading optional HMAC configuration.");
-        using var hmac = SecretHmacService.Load(_options);
+        using var hmac = ObjectSignatureService.Load(_options);
         _logger.LogDebug("HMAC configuration loaded. Available: {HmacConfigured}; key version: {HmacKeyVersion}.",
             hmac is not null, hmac?.KeyVersion);
         _logger.LogDebug("Initializing state containers.");
@@ -95,7 +99,7 @@ public sealed class RunnerApplication
         var run = new RunRecord
         {
             RunId = $"{cycleStarted.ToUniversalTime().ToString("yyyyMMdd'T'HHmmssfffffff'Z'", CultureInfo.InvariantCulture)}-{Guid.NewGuid():N}",
-            SubscriptionId = _options.SubscriptionId,
+            SubscriptionIds = _options.SubscriptionIds,
             StartedAt = cycleStarted,
             Mode = "AutomaticSync",
             Status = "Running",
@@ -104,16 +108,16 @@ public sealed class RunnerApplication
         var runTimer = Stopwatch.StartNew();
         runActivity?.SetTag("sync.run_id", run.RunId);
         runActivity?.SetTag("sync.mode", run.Mode);
-        runActivity?.SetTag("azure.subscription_id", run.SubscriptionId);
+        runActivity?.SetTag("azure.subscription_count", run.SubscriptionIds.Count);
         RunnerTelemetry.RunsStarted.Add(1, new KeyValuePair<string, object?>("sync.mode", run.Mode));
         using var runScope = _logger.BeginScope(new Dictionary<string, object?>
         {
             ["RunId"] = run.RunId,
-            ["SubscriptionId"] = run.SubscriptionId,
+            ["SubscriptionCount"] = run.SubscriptionIds.Count,
             ["Mode"] = run.Mode,
         });
-        _logger.LogInformation("Run {RunId} started in mapping-driven synchronization mode {Mode} for subscription {SubscriptionId}.",
-            run.RunId, run.Mode, run.SubscriptionId);
+        _logger.LogInformation("Run {RunId} started in mapping-driven synchronization mode {Mode} across {SubscriptionCount} subscriptions.",
+            run.RunId, run.Mode, run.SubscriptionIds.Count);
 
         try
         {
@@ -121,8 +125,8 @@ public sealed class RunnerApplication
             // unfinished attempt. Later writes replace this same run blob with accumulated progress.
             await _stateStore.WriteRunRecordAsync(run, cancellationToken);
             _logger.LogInformation(DiscoveryStartedEventId,
-                "Starting subscription Key Vault discovery. {PairTag}; resource group filter: {ResourceGroupFilter}.",
-                _options.PairTag, _options.ResourceGroup);
+                "Starting complete Key Vault discovery across {SubscriptionCount} configured subscriptions using target-side {MappingTag}.",
+                _options.SubscriptionIds.Count, KeyVaultSyncResourceTags.SyncSourceKeyVaultId);
             using var discoveryActivity = RunnerTelemetry.ActivitySource.StartActivity("sync.discover-vault-pairs");
             var discovery = await _arm.DiscoverPairsAsync(_options, cancellationToken);
             discoveryActivity?.SetTag("vault.discovered_count", discovery.DiscoveredVaultCount);
@@ -148,8 +152,10 @@ public sealed class RunnerApplication
                     discovery.DisabledPairCount, discovery.UnmappedVaultNames.Count);
             }
 
-            // Pairs are deliberately processed sequentially. Each owns a separate state lease;
-            // another process may handle other pairs, but should not share this pair concurrently.
+            // Acquire and retain each pair lease through both passes. This prevents state changes
+            // between the persisted plan and execution while guaranteeing that every admitted pair
+            // finishes planning before any Key Vault or RBAC mutation begins.
+            var preparedPairs = new List<PreparedPair>();
             for (var pairIndex = 0; pairIndex < discovery.Pairs.Count; pairIndex++)
             {
                 var pair = discovery.Pairs[pairIndex];
@@ -182,10 +188,11 @@ public sealed class RunnerApplication
                 run.Pairs.Add(pairRun);
                 await _stateStore.WriteRunRecordAsync(run, cancellationToken);
 
+                PairLease? pairLease = null;
                 try
                 {
                     _logger.LogInformation(PairProgressEventId, "Acquiring the pair state lease.");
-                    await using var pairLease = await _stateStore.TryAcquirePairLeaseAsync(pair, cancellationToken);
+                    pairLease = await _stateStore.TryAcquirePairLeaseAsync(pair, cancellationToken);
                     if (pairLease is null)
                     {
                         // Lock contention is a recorded skip, not permission to scan/apply without
@@ -211,82 +218,14 @@ public sealed class RunnerApplication
                         pairRun.Source.Secrets.Count, pairRun.Source.Keys.Count, pairRun.Source.Certificates.Count,
                         pairRun.Target.Secrets.Count, pairRun.Target.Keys.Count, pairRun.Target.Certificates.Count);
                     _logger.LogInformation(PlanningProgressEventId, "Creating the synchronization plan from inventory and committed pair state.");
-                    pairRun.Plan.AddRange(SyncPlanner.CreatePlan(pair, pairLease.State, pairRun.Source, pairRun.Target, hmac is not null));
-                    // The planner does not read secret values or mutate Azure. With a configured HMAC
-                    // key, supported secret actions enter the executor, which rechecks live preconditions.
-                    if (hmac is not null)
-                    {
-                        var eligibleSecretCount = pairRun.Plan.Count(item => item.ObjectType == "Secret"
-                            && (item.Action is "SetSecret" or "UpdateSecretProperties" or "VerifySecretBaseline")
-                            && (item.Status is "READY_FOR_APPLY_IF_NAME_STAYS_EMPTY"
-                                or "VERIFY_TARGET_HMAC_THEN_APPLY"
-                                or "VERIFY_TARGET_HMAC_THEN_APPLY_METADATA"
-                                or "VERIFY_TARGET_HMAC"));
-                        _logger.LogInformation(SecretSyncProgressEventId,
-                            "Secret synchronization started for pair {PairNumber} of {PairCount}; {EligibleSecretCount} plan items are eligible.",
-                            pairIndex + 1, discovery.Pairs.Count, eligibleSecretCount);
-                        var secretResults = await _secretExecutor.ApplyAsync(
-                            pair,
-                            pairLease,
-                            run.RunId,
-                            pairRun.Plan,
-                            pairRun.Source,
-                            pairRun.Target,
-                            hmac,
-                            cancellationToken);
-                        foreach (var result in secretResults)
-                        {
-                            // Replace the proposal for this secret with its actual execution outcome;
-                            // unrelated plan-only object types remain visible in the report.
-                            var planIndex = pairRun.Plan.FindIndex(item => item.ObjectType == result.ObjectType
-                                && item.Name.Equals(result.Name, StringComparison.OrdinalIgnoreCase));
-                            if (planIndex >= 0)
-                            {
-                                pairRun.Plan[planIndex] = result;
-                            }
-                        }
-                        _logger.LogInformation(SecretSyncProgressEventId,
-                            "Secret synchronization finished for pair {PairNumber} of {PairCount}; {ResultCount} outcomes recorded.",
-                            pairIndex + 1, discovery.Pairs.Count, secretResults.Count);
-                    }
-                    else
-                    {
-                        var blockedSecretCount = pairRun.Plan.Count(item =>
-                            item.ObjectType == "Secret" && item.Status == "BLOCKED_HMAC_KEY_NOT_CONFIGURED");
-                        if (blockedSecretCount > 0)
-                        {
-                            _logger.LogWarning(
-                                "Automatic secret synchronization is blocked for pair {PairNumber} of {PairCount}; {BlockedSecretCount} plan items require KEYVAULTSYNC_HMAC_KEY. Eligible one-time key/certificate seeds are evaluated separately.",
-                                pairIndex + 1, discovery.Pairs.Count, blockedSecretCount);
-                        }
-                    }
-
-                    var eligibleSeedCount = pairRun.Plan.Count(item =>
-                        (item.ObjectType == "Key" && item.Action == "NativeRestore" && item.Status == "ELIGIBLE_ONE_TIME_SEED_IF_TARGET_STAYS_EMPTY")
-                        || (item.ObjectType == "CertificateGroup" && item.Action == "NativeRestore" && item.Status == "ELIGIBLE_ONE_TIME_SEED_IF_TARGET_GROUP_STAYS_EMPTY"));
-                    _logger.LogInformation(PairProgressEventId,
-                        "One-time native seed phase started for pair {PairNumber} of {PairCount}; {EligibleSeedCount} plan items are eligible.",
-                        pairIndex + 1, discovery.Pairs.Count, eligibleSeedCount);
-                    var seedResults = await _nativeSeedExecutor.ApplyAsync(
+                    pairRun.Plan.AddRange(ReplicationPlanner.CreatePlan(
                         pair,
-                        pairLease,
-                        run.RunId,
-                        pairRun.Plan,
+                        pairLease.State,
                         pairRun.Source,
-                        cancellationToken);
-                    foreach (var result in seedResults)
-                    {
-                        var planIndex = pairRun.Plan.FindIndex(item => item.ObjectType == result.ObjectType
-                            && item.Name.Equals(result.Name, StringComparison.OrdinalIgnoreCase));
-                        if (planIndex >= 0)
-                        {
-                            pairRun.Plan[planIndex] = result;
-                        }
-                    }
-
-                    _logger.LogInformation(PairProgressEventId,
-                        "One-time native seed phase finished for pair {PairNumber} of {PairCount}; {ResultCount} outcomes recorded.",
-                        pairIndex + 1, discovery.Pairs.Count, seedResults.Count);
+                        pairRun.Target,
+                        hmac is not null,
+                        _options.SyncPrincipalId,
+                        DateTimeOffset.UtcNow));
 
                     var blockedPlanItems = pairRun.Plan.Count(item => item.Status.StartsWith("BLOCKED", StringComparison.Ordinal)
                         || item.Status.StartsWith("CONFLICT", StringComparison.Ordinal));
@@ -302,9 +241,6 @@ public sealed class RunnerApplication
                         _logger.LogInformation("Pair plan created. {PlanItemCount} items; no blocked or conflicting items.", pairRun.Plan.Count);
                     }
 
-                    // This checkpoint describes warning-free inventory, not successful mutation.
-                    // A blocked plan can coexist with it. SaveState also enforces the lease and ETag;
-                    // changing the in-memory timestamp alone does not make the checkpoint durable.
                     var complete = pairRun.Source.Warnings.Count == 0 && pairRun.Target.Warnings.Count == 0;
                     if (complete)
                     {
@@ -312,8 +248,7 @@ public sealed class RunnerApplication
                         pairLease.State.LastCompleteRunId = run.RunId;
                         _logger.LogInformation(PairProgressEventId, "Saving the complete-scan checkpoint for this pair.");
                         await pairLease.SaveStateAsync(cancellationToken);
-                        var hasUnappliedWork = HasUnappliedWork(pairRun.Plan);
-                        pairRun.Status = hasUnappliedWork ? "SyncCompletedWithUnappliedWork" : "SyncCompleted";
+                        pairRun.Status = "Planned";
                     }
                     else
                     {
@@ -323,6 +258,8 @@ public sealed class RunnerApplication
 
                     pairRun.CompletedAt = DateTimeOffset.UtcNow;
                     await _stateStore.WriteRunRecordAsync(run, cancellationToken);
+                    preparedPairs.Add(new PreparedPair(pairIndex, pair, pairRun, pairLease, pairTimer));
+                    pairLease = null;
                 }
                 catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
                 {
@@ -347,33 +284,58 @@ public sealed class RunnerApplication
                 }
                 finally
                 {
-                    pairTimer.Stop();
-                    pairActivity?.SetTag("sync.status", pairRun.Status);
-                    // The explicit sync.status is the business outcome.
-                    if (pairRun.Status == "SyncCompleted")
+                    if (pairLease is not null)
                     {
-                        pairActivity?.SetStatus(ActivityStatusCode.Ok);
+                        await pairLease.DisposeAsync();
                     }
-                    else if (pairRun.Status != "SkippedPairAlreadyLocked")
+
+                    if (pairRun.Status != "Planned")
+                    {
+                        pairTimer.Stop();
+                    }
+
+                    pairActivity?.SetTag("sync.status", pairRun.Status);
+                    if (pairRun.Status is not "Planned" and not "SkippedPairAlreadyLocked")
                     {
                         pairActivity?.SetStatus(ActivityStatusCode.Error, pairRun.Status);
                     }
 
-                    RunnerTelemetry.PairsProcessed.Add(1, new KeyValuePair<string, object?>("sync.status", pairRun.Status));
-                    RunnerTelemetry.PairDuration.Record(pairTimer.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("sync.status", pairRun.Status));
-                    var pairMessage = "Pair {PairId} completed with status {Status} in {DurationMs} ms.";
-                    if (pairRun.Status == "Failed")
+                    if (pairRun.Status != "Planned")
                     {
-                        _logger.LogError(pairMessage, pair.PairId, pairRun.Status, pairTimer.Elapsed.TotalMilliseconds);
+                        RecordPairCompletion(pairRun, pairTimer);
                     }
-                    else if (pairRun.Status is "PartialInventory" or "SyncCompletedWithUnappliedWork")
+                }
+            }
+
+            try
+            {
+                if (preparedPairs.Count != discovery.Pairs.Count)
+                {
+                    foreach (var prepared in preparedPairs)
                     {
-                        _logger.LogWarning(pairMessage, pair.PairId, pairRun.Status, pairTimer.Elapsed.TotalMilliseconds);
+                        prepared.Report.Status = "ExecutionBlockedPlanningIncomplete";
+                        prepared.Report.Errors.Add("At least one admitted pair did not finish planning; no mutations were attempted.");
+                        prepared.Report.CompletedAt = DateTimeOffset.UtcNow;
+                        prepared.Timer.Stop();
+                        RecordPairCompletion(prepared.Report, prepared.Timer);
                     }
-                    else
+
+                    await _stateStore.WriteRunRecordAsync(run, cancellationToken);
+                }
+                else
+                {
+                    foreach (var prepared in preparedPairs)
                     {
-                        _logger.LogInformation(pairMessage, pair.PairId, pairRun.Status, pairTimer.Elapsed.TotalMilliseconds);
+                        await ExecutePreparedPairAsync(prepared, run.RunId, hmac, discovery.Pairs.Count, cancellationToken);
+                        await _stateStore.WriteRunRecordAsync(run, cancellationToken);
                     }
+                }
+            }
+            finally
+            {
+                foreach (var prepared in preparedPairs.AsEnumerable().Reverse())
+                {
+                    await prepared.Lease.DisposeAsync();
                 }
             }
 
@@ -451,6 +413,216 @@ public sealed class RunnerApplication
         return new RunnerExecutionResult(run.RunId, run.Status);
     }
 
+    private async Task ExecutePreparedPairAsync(
+        PreparedPair prepared,
+        string runId,
+        ObjectSignatureService? signatures,
+        int pairCount,
+        CancellationToken cancellationToken)
+    {
+        var pair = prepared.Pair;
+        var report = prepared.Report;
+        using var pairScope = _logger.BeginScope(new Dictionary<string, object?>
+        {
+            ["PairId"] = pair.PairId,
+            ["SourceVaultName"] = pair.Source.Name,
+            ["TargetVaultName"] = pair.Target.Name,
+            ["PairNumber"] = prepared.PairIndex + 1,
+            ["PairCount"] = pairCount,
+        });
+        using var activity = RunnerTelemetry.ActivitySource.StartActivity("sync.execute-pair");
+        activity?.SetTag("sync.pair_id", pair.PairId);
+        activity?.SetTag("sync.pair_index", prepared.PairIndex + 1);
+        activity?.SetTag("sync.pair_count", pairCount);
+
+        try
+        {
+            report.Status = "Executing";
+            report.CompletedAt = null;
+            prepared.Lease.EnsureLeaseHeld();
+
+            await ApplyRbacPhaseAsync(report.Plan, item =>
+                item.Action == "CreateRoleAssignment" && !IsObjectScope(item.TargetScope),
+                cancellationToken);
+
+            if (signatures is not null)
+            {
+                await ApplyObjectPhaseAsync(
+                    pair,
+                    prepared.Lease,
+                    runId,
+                    report.Plan,
+                    signatures,
+                    item => item.Action is "CreateObject" or "ReconcileObject",
+                    cancellationToken);
+            }
+
+            BlockDependentObjectRbac(report.Plan, signatures is not null);
+            await ApplyRbacPhaseAsync(report.Plan, item =>
+                item.Action == "CreateRoleAssignment" && IsObjectScope(item.TargetScope),
+                cancellationToken);
+            await ApplyRbacPhaseAsync(report.Plan, item =>
+                item.Action == "DeleteRoleAssignment" && IsObjectScope(item.TargetScope),
+                cancellationToken);
+
+            if (signatures is not null)
+            {
+                await ApplyObjectPhaseAsync(
+                    pair,
+                    prepared.Lease,
+                    runId,
+                    report.Plan,
+                    signatures,
+                    item => item.Action == "DeleteObject",
+                    cancellationToken);
+            }
+
+            await ApplyRbacPhaseAsync(report.Plan, item =>
+                item.Action == "DeleteRoleAssignment" && !IsObjectScope(item.TargetScope),
+                cancellationToken);
+
+            report.Status = HasUnappliedWork(report.Plan) ? "SyncCompletedWithUnappliedWork" : "SyncCompleted";
+            report.CompletedAt = DateTimeOffset.UtcNow;
+            activity?.SetStatus(report.Status == "SyncCompleted" ? ActivityStatusCode.Ok : ActivityStatusCode.Error, report.Status);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            report.Status = "Cancelled";
+            report.CompletedAt = DateTimeOffset.UtcNow;
+            report.Errors.Add("Function host requested cancellation.");
+            throw;
+        }
+        catch (Exception exception)
+        {
+            report.Status = "Failed";
+            report.CompletedAt = DateTimeOffset.UtcNow;
+            report.Errors.Add(SafeError(exception));
+            RunnerTelemetry.RecordException(activity, exception);
+            activity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
+            _logger.LogError(exception, "Pair execution failed for {PairId}.", pair.PairId);
+        }
+        finally
+        {
+            prepared.Timer.Stop();
+            RecordPairCompletion(report, prepared.Timer);
+        }
+    }
+
+    private void RecordPairCompletion(PairScanReport report, Stopwatch timer)
+    {
+        RunnerTelemetry.PairsProcessed.Add(1, new KeyValuePair<string, object?>("sync.status", report.Status));
+        RunnerTelemetry.PairDuration.Record(timer.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("sync.status", report.Status));
+        const string message = "Pair {PairId} completed with status {Status} in {DurationMs} ms.";
+        if (report.Status == "Failed")
+        {
+            _logger.LogError(message, report.PairId, report.Status, timer.Elapsed.TotalMilliseconds);
+        }
+        else if (report.Status is "PartialInventory" or "SyncCompletedWithUnappliedWork" or "ExecutionBlockedPlanningIncomplete")
+        {
+            _logger.LogWarning(message, report.PairId, report.Status, timer.Elapsed.TotalMilliseconds);
+        }
+        else
+        {
+            _logger.LogInformation(message, report.PairId, report.Status, timer.Elapsed.TotalMilliseconds);
+        }
+    }
+
+    private async Task ApplyObjectPhaseAsync(
+        VaultPair pair,
+        IPairStateLease pairLease,
+        string runId,
+        List<PlanItem> plan,
+        ObjectSignatureService signatures,
+        Func<PlanItem, bool> predicate,
+        CancellationToken cancellationToken)
+    {
+        var selected = plan.Where(predicate).ToArray();
+        var results = await _objectExecutor.ApplyAsync(
+            pair,
+            pairLease,
+            runId,
+            selected,
+            signatures,
+            cancellationToken);
+        ReplaceResults(plan, results);
+    }
+
+    private async Task ApplyRbacPhaseAsync(
+        List<PlanItem> plan,
+        Func<PlanItem, bool> predicate,
+        CancellationToken cancellationToken)
+    {
+        var selected = plan.Where(predicate).ToArray();
+        var results = await _rbacExecutor.ApplyAsync(selected, cancellationToken);
+        ReplaceResults(plan, results);
+    }
+
+    private static void ReplaceResults(List<PlanItem> plan, IReadOnlyList<PlanItem> results)
+    {
+        foreach (var result in results)
+        {
+            var index = plan.FindIndex(item => IsSamePlanIdentity(item, result));
+            if (index >= 0)
+            {
+                plan[index] = result;
+            }
+        }
+    }
+
+    internal static bool IsSamePlanIdentity(PlanItem left, PlanItem right) =>
+        left.ObjectType == right.ObjectType
+        && left.Name.Equals(right.Name, StringComparison.OrdinalIgnoreCase)
+        && left.Action == right.Action
+        && string.Equals(left.TargetScope, right.TargetScope, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(left.AssignmentId, right.AssignmentId, StringComparison.OrdinalIgnoreCase);
+
+    internal static void BlockDependentObjectRbac(List<PlanItem> plan, bool objectMutationEnabled)
+    {
+        for (var index = 0; index < plan.Count; index++)
+        {
+            var item = plan[index];
+            if (item.ObjectType != "Authorization"
+                || item.Action is not ("CreateRoleAssignment" or "DeleteRoleAssignment")
+                || string.IsNullOrWhiteSpace(item.TargetScope))
+            {
+                continue;
+            }
+
+            var segments = item.TargetScope.Split('/', StringSplitOptions.RemoveEmptyEntries);
+            if (segments.Length < 2
+                || (!segments[^2].Equals("secrets", StringComparison.OrdinalIgnoreCase)
+                    && !segments[^2].Equals("keys", StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            var objectType = segments[^2].Equals("secrets", StringComparison.OrdinalIgnoreCase) ? "Secret" : "Key";
+            var objectName = Uri.UnescapeDataString(segments[^1]);
+            var objectPlan = plan.FirstOrDefault(candidate =>
+                candidate.ObjectType == objectType
+                && candidate.Name.Equals(objectName, StringComparison.OrdinalIgnoreCase));
+            var dependencySatisfied = objectPlan is not null
+                && (objectPlan.Status is "OBJECT_REPLICATED_AND_VERIFIED" or "IN_SYNC_SIGNATURE_VERIFIED"
+                    or "BLOCKED_KEY_MATERIAL_EQUIVALENCE_UNVERIFIABLE"
+                    || (item.Action == "DeleteRoleAssignment"
+                        && objectMutationEnabled
+                        && objectPlan.Action == "DeleteObject"));
+            if (!dependencySatisfied)
+            {
+                plan[index] = item with
+                {
+                    Action = "None",
+                    Status = "BLOCKED_DEPENDENCY_FAILED",
+                    Detail = "The object prerequisite did not complete successfully.",
+                };
+            }
+        }
+    }
+
+    private static bool IsObjectScope(string? scope) =>
+        scope?.Contains("/secrets/", StringComparison.OrdinalIgnoreCase) == true
+        || scope?.Contains("/keys/", StringComparison.OrdinalIgnoreCase) == true;
+
     /// <summary>Reduces Azure request failures to HTTP/code metadata for persisted reports.</summary>
     /// <remarks>
     /// Other exception messages are retained verbatim. This is not general-purpose sanitization,
@@ -472,26 +644,27 @@ public sealed class RunnerApplication
                 || item.Status.Contains("FAILED", StringComparison.Ordinal)
                 || item.Status.Contains("UNRESOLVED", StringComparison.Ordinal)
                 || (item.ObjectType == "Authorization"
-                    && item.Status is not ("RBAC_ASSIGNMENT_INTENT_MATCH" or "ACCESS_POLICY_INTENT_MATCH")))
+                    && item.Status is not ("RBAC_ASSIGNMENT_IN_SYNC"
+                        or "RBAC_CREATED_AND_VERIFIED"
+                        or "RBAC_DELETED_AND_VERIFIED"
+                        or "RBAC_ALREADY_ABSENT"
+                        or "SKIPPED_SYNC_IDENTITY_SELF_ASSIGNMENT"
+                        or "RBAC_ASSIGNMENT_INTENT_MATCH"
+                        or "ACCESS_POLICY_INTENT_MATCH")))
             {
                 return true;
-            }
-
-            if (item.ObjectType is "Key" or "CertificateGroup")
-            {
-                if (item.Status is not ("MANAGED_WITH_CERTIFICATE_GROUP"
-                        or "IN_SYNC_ONE_TIME_SEED"
-                        or "SOURCE_ADVANCED_ONE_TIME_SEED_UNCHANGED"
-                        or "NATIVE_KEY_SEEDED_AND_VERIFIED"
-                        or "NATIVE_CERTIFICATE_GROUP_SEEDED_AND_VERIFIED"))
-                {
-                    return true;
-                }
             }
         }
 
         return false;
     }
+
+    private sealed record PreparedPair(
+        int PairIndex,
+        VaultPair Pair,
+        PairScanReport Report,
+        PairLease Lease,
+        Stopwatch Timer);
 }
 
 /// <summary>The host-facing identity and aggregate outcome of a cycle whose report was returned by the runner.</summary>

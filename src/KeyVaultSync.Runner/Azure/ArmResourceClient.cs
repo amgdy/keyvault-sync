@@ -26,66 +26,39 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private readonly HttpClient _httpClient = httpClient ?? new();
 
-    /// <summary>Finds tagged source vaults, resolves targets, and records enabled, paused, and invalid pair decisions.</summary>
-    /// <param name="options">Subscription, optional source resource-group filter, and target-resource-ID tag name.</param>
-    /// <param name="cancellationToken">Cancellation passed to ARM enumeration and target lookups.</param>
-    /// <returns>Subscription-wide discovery counts and the accepted pairs, disabled observations, and mapping issues.</returns>
+    /// <summary>Finds target-tagged vaults across the complete configured subscription set and validates their source relationships.</summary>
+    /// <param name="options">Configured discovery subscriptions and runtime settings.</param>
+    /// <param name="cancellationToken">Cancellation passed to ARM enumeration and source lookups.</param>
+    /// <returns>Cross-subscription discovery counts and the accepted pairs, disabled observations, and mapping issues.</returns>
     /// <remarks>
-    /// <para>The resource-group filter selects sources only; mapped targets can be elsewhere and are fetched
-    /// individually when absent from the subscription listing. Source pause tags short-circuit source-side mapping validation.</para>
-    /// <para>Mappings can be declared by the configured source-side target-ID tag or by
-    /// <see cref="KeyVaultSyncResourceTags.SyncSourceKeyVaultId"/> on a target. Duplicate declarations of the
-    /// same edge are collapsed; one source may have several targets, while target ownership conflicts and chains are rejected.</para>
-    /// <para>Pause tags are a discovery-time observation, not an in-flight kill switch. Subscription-list errors
-    /// propagate, while individual target-lookup exceptions (including cancellation there) become mapping issues.</para>
+    /// <para>Only <see cref="KeyVaultSyncResourceTags.SyncSourceKeyVaultId"/> on a target declares a mapping.
+    /// Sources absent from the configured inventory are resolved directly, but they do not make the configured scan complete
+    /// for any other vaults in that external subscription.</para>
+    /// <para>Every configured subscription listing must succeed. Pair members must use Azure RBAC, declare the same tenant,
+    /// and not participate in a self-reference, chain, or cycle. Pause tags are discovery-time observations, not an in-flight kill switch.</para>
     /// </remarks>
     public async Task<DiscoveryResult> DiscoverPairsAsync(RunnerOptions options, CancellationToken cancellationToken)
     {
         using var activity = RunnerTelemetry.ActivitySource.StartActivity("arm.discover-key-vault-pairs");
         var timer = Stopwatch.StartNew();
-        logger.LogInformation("Listing subscription Key Vault resources for {SubscriptionId} using source tag {PairTagName} and target tag {SourceKeyVaultIdTagName}.",
-            options.SubscriptionId, options.PairTag, KeyVaultSyncResourceTags.SyncSourceKeyVaultId);
-        var allVaults = await ListKeyVaultResourcesAsync(options.SubscriptionId, cancellationToken);
-        foreach (var vault in allVaults)
+        logger.LogInformation("Listing Key Vault resources across {SubscriptionCount} subscriptions using target tag {SourceKeyVaultIdTagName}.",
+            options.SubscriptionIds.Count, KeyVaultSyncResourceTags.SyncSourceKeyVaultId);
+        var allVaults = new List<VaultResource>();
+        foreach (var subscriptionId in options.SubscriptionIds)
         {
-            LogDiscoveredVault(vault, options.PairTag);
+            allVaults.AddRange(await ListKeyVaultResourcesAsync(subscriptionId, cancellationToken));
         }
 
-        // List the entire subscription first for diagnostics and target reuse. Only source vaults
-        // are resource-group filtered; discovery counts therefore remain subscription-wide.
+        foreach (var vault in allVaults)
+        {
+            LogDiscoveredVault(vault);
+        }
+
         var byId = allVaults.ToDictionary(vault => NormalizeId(vault.Id), StringComparer.OrdinalIgnoreCase);
         var issues = new List<string>();
         var declarations = new List<PairDeclaration>();
         var disabledPairCount = 0;
         var disabledVaultNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var source in allVaults)
-        {
-            var targetId = GetTag(source, options.PairTag);
-            if (!string.IsNullOrWhiteSpace(targetId)
-                && IsSourceInRequestedGroup(source, options.ResourceGroup))
-            {
-                if (KeyVaultSyncResourceTags.IsSyncDisabled(source))
-                {
-                    disabledPairCount++;
-                    disabledVaultNames.Add(source.Name);
-                    LogPairDecision(source, null, targetId, syncEnabled: false, "SourceDisabled");
-                    logger.LogInformation("Skipping Key Vault pair for source {SourceVault} because ARM tag {TagName}=true is set.",
-                        source.Name, KeyVaultSyncResourceTags.SyncDisabled);
-                    continue;
-                }
-
-                var normalizedTargetId = targetId.Trim();
-                if (!TryValidateKeyVaultResourceId(normalizedTargetId, out var targetError))
-                {
-                    issues.Add($"Invalid {options.PairTag} on {source.Id}: {targetError}");
-                    LogPairDecision(source, null, normalizedTargetId, syncEnabled: false, "InvalidSyncId", isMappingIssue: true);
-                    continue;
-                }
-
-                declarations.Add(new PairDeclaration(source, normalizedTargetId));
-            }
-        }
-
         foreach (var target in allVaults)
         {
             var sourceId = GetTag(target, KeyVaultSyncResourceTags.SyncSourceKeyVaultId);
@@ -98,57 +71,84 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
             if (!TryValidateKeyVaultResourceId(normalizedSourceId, out var sourceError))
             {
                 issues.Add($"Invalid {KeyVaultSyncResourceTags.SyncSourceKeyVaultId} on target {target.Id}: {sourceError}");
+                LogPairDecision(new VaultResource
+                {
+                    Id = normalizedSourceId,
+                    Name = string.Empty,
+                    Location = string.Empty,
+                    ResourceGroup = string.Empty,
+                    Tags = [],
+                }, target, target.Id, syncEnabled: false, "InvalidSourceId", isMappingIssue: true);
+                continue;
+            }
+
+            VaultResource hydratedTarget;
+            try
+            {
+                hydratedTarget = await EnsureEligibilityMetadataAsync(target, cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                issues.Add($"Target {target.Id} could not be read for eligibility validation: {SafeError(exception)}");
+                LogPairDecision(new VaultResource
+                {
+                    Id = normalizedSourceId,
+                    Name = string.Empty,
+                    Location = string.Empty,
+                    ResourceGroup = string.Empty,
+                    Tags = [],
+                }, target, target.Id, syncEnabled: false, "TargetUnreadable", isMappingIssue: true);
                 continue;
             }
 
             if (!byId.TryGetValue(NormalizeId(normalizedSourceId), out var source))
             {
-                issues.Add($"Source {normalizedSourceId} declared by target {target.Id} was not found in the subscription Key Vault inventory.");
-                continue;
+                try
+                {
+                    source = await GetKeyVaultResourceAsync(normalizedSourceId, cancellationToken);
+                    byId[NormalizeId(source.Id)] = source;
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+                {
+                    issues.Add($"Source {normalizedSourceId} declared by target {target.Id} could not be read: {SafeError(exception)}");
+                    LogPairDecision(new VaultResource
+                    {
+                        Id = normalizedSourceId,
+                        Name = string.Empty,
+                        Location = string.Empty,
+                        ResourceGroup = string.Empty,
+                        Tags = [],
+                    }, target, target.Id, syncEnabled: false, "SourceUnreadable", isMappingIssue: true);
+                    continue;
+                }
             }
 
-            if (!IsSourceInRequestedGroup(source, options.ResourceGroup))
+            try
             {
+                source = await EnsureEligibilityMetadataAsync(source, cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                issues.Add($"Source {normalizedSourceId} declared by target {target.Id} could not be read for eligibility validation: {SafeError(exception)}");
+                LogPairDecision(source, hydratedTarget, target.Id, syncEnabled: false, "SourceUnreadable", isMappingIssue: true);
                 continue;
             }
 
-            declarations.Add(new PairDeclaration(source, target.Id));
+            declarations.Add(new PairDeclaration(source, hydratedTarget));
         }
 
-        // A source-side tag and the corresponding target-side tag declare the same edge. Collapse
-        // those duplicates before checking ownership so either declaration style can be migrated
-        // without creating an artificial conflict.
         var distinctDeclarations = declarations
             .GroupBy(declaration => declaration, PairDeclarationComparer.Instance)
             .Select(group => group.First())
             .OrderBy(declaration => NormalizeId(declaration.Source.Id), StringComparer.OrdinalIgnoreCase)
-            .ThenBy(declaration => NormalizeId(declaration.TargetId), StringComparer.OrdinalIgnoreCase)
+            .ThenBy(declaration => NormalizeId(declaration.Target.Id), StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        var declarationsByTarget = distinctDeclarations
-            .GroupBy(declaration => NormalizeId(declaration.TargetId), StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        var conflictingTargets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var group in declarationsByTarget)
-        {
-            var owners = group
-                .Select(declaration => NormalizeId(declaration.Source.Id))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            if (owners.Length <= 1)
-            {
-                continue;
-            }
-
-            conflictingTargets.Add(group.Key);
-            var targetId = group.First().TargetId;
-            issues.Add($"Target {targetId} is declared by multiple distinct sources; every mapping to that target was skipped.");
-        }
 
         var sourceIds = distinctDeclarations
             .Select(declaration => NormalizeId(declaration.Source.Id))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var targetIds = distinctDeclarations
-            .Select(declaration => NormalizeId(declaration.TargetId))
+            .Select(declaration => NormalizeId(declaration.Target.Id))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var chainedVaultIds = sourceIds
             .Where(targetIds.Contains)
@@ -162,7 +162,8 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         foreach (var declaration in distinctDeclarations)
         {
             var source = declaration.Source;
-            var targetId = declaration.TargetId;
+            var target = declaration.Target;
+            var targetId = target.Id;
             var normalizedSourceId = NormalizeId(source.Id);
             var normalizedTargetId = NormalizeId(targetId);
 
@@ -173,53 +174,24 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
                 continue;
             }
 
-            if (conflictingTargets.Contains(normalizedTargetId))
-            {
-                LogPairDecision(source, null, targetId, syncEnabled: false, "ConflictingTargetOwner", isMappingIssue: true);
-                continue;
-            }
-
             if (chainedVaultIds.Contains(normalizedSourceId) || chainedVaultIds.Contains(normalizedTargetId))
             {
-                LogPairDecision(source, null, targetId, syncEnabled: false, "ChainedOrCyclicMapping", isMappingIssue: true);
+                LogPairDecision(source, target, targetId, syncEnabled: false, "ChainedOrCyclicMapping", isMappingIssue: true);
                 continue;
             }
 
-            VaultResource target;
-            if (!byId.TryGetValue(normalizedTargetId, out target!))
+            if (!string.Equals(source.TenantId, target.TenantId, StringComparison.OrdinalIgnoreCase)
+                || string.IsNullOrWhiteSpace(source.TenantId))
             {
-                try
-                {
-                    target = await GetKeyVaultResourceAsync(targetId, cancellationToken);
-                }
-                catch (Exception exception)
-                {
-                    issues.Add($"Target {targetId} for source {source.Id} could not be read: {SafeError(exception)}");
-                    LogPairDecision(source, null, targetId, syncEnabled: false, "TargetUnreadable", isMappingIssue: true);
-                    continue;
-                }
-            }
-
-            if (!TryValidateKeyVaultResourceId(target.Id, out _) || !normalizedTargetId.Equals(NormalizeId(target.Id), StringComparison.OrdinalIgnoreCase))
-            {
-                issues.Add($"Target {targetId} did not resolve to the declared Microsoft.KeyVault/vaults resource.");
-                LogPairDecision(source, target, targetId, syncEnabled: false, "InvalidTargetType", isMappingIssue: true);
+                issues.Add($"Pair {source.Id} to {target.Id} is not eligible because both vaults must declare the same tenant.");
+                LogPairDecision(source, target, targetId, syncEnabled: false, "CrossTenantOrUnknownTenant", isMappingIssue: true);
                 continue;
             }
 
-            if (!string.IsNullOrWhiteSpace(GetTag(target, options.PairTag)))
+            if (source.UsesRbacAuthorization != true || target.UsesRbacAuthorization != true)
             {
-                issues.Add($"Target {target.Id} is also tagged as a source; chained mappings are unsupported.");
-                LogPairDecision(source, target, targetId, syncEnabled: false, "TargetIsAlsoSource", isMappingIssue: true);
-                continue;
-            }
-
-            var targetSourceId = GetTag(target, KeyVaultSyncResourceTags.SyncSourceKeyVaultId);
-            if (!string.IsNullOrWhiteSpace(targetSourceId)
-                && !NormalizeId(targetSourceId).Equals(normalizedSourceId, StringComparison.OrdinalIgnoreCase))
-            {
-                issues.Add($"Target {target.Id} declares a different source in {KeyVaultSyncResourceTags.SyncSourceKeyVaultId}; pair was skipped.");
-                LogPairDecision(source, target, targetId, syncEnabled: false, "ConflictingTargetSource", isMappingIssue: true);
+                issues.Add($"Pair {source.Id} to {target.Id} is unsupported because both vaults must use Azure RBAC authorization.");
+                LogPairDecision(source, target, targetId, syncEnabled: false, "UnsupportedAuthorizationModel", isMappingIssue: true);
                 continue;
             }
 
@@ -247,14 +219,11 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
             LogPairDecision(source, target, targetId, syncEnabled: true, "Enabled");
         }
 
-        // "Unmapped" is relative to the selected source set: neither a source candidate nor a
-        // referenced target. Sources outside the requested resource group remain out of scope.
         var referencedIds = distinctDeclarations
-            .SelectMany(declaration => new[] { NormalizeId(declaration.Source.Id), NormalizeId(declaration.TargetId) })
+            .SelectMany(declaration => new[] { NormalizeId(declaration.Source.Id), NormalizeId(declaration.Target.Id) })
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var untagged = allVaults
-            .Where(vault => !IsSourceInRequestedGroup(vault, options.ResourceGroup)
-                || string.IsNullOrWhiteSpace(GetTag(vault, options.PairTag)))
+            .Where(vault => string.IsNullOrWhiteSpace(GetTag(vault, KeyVaultSyncResourceTags.SyncSourceKeyVaultId)))
             .Where(vault => !referencedIds.Contains(NormalizeId(vault.Id)))
             .Select(vault => vault.Name)
             .Order(StringComparer.OrdinalIgnoreCase)
@@ -268,7 +237,7 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         activity?.SetTag("stage.duration_ms", timer.Elapsed.TotalMilliseconds);
         activity?.SetStatus(issues.Count == 0 ? ActivityStatusCode.Ok : ActivityStatusCode.Error,
             issues.Count == 0 ? null : "Mapping issues detected");
-        logger.LogInformation("Subscription discovery found {VaultCount} vaults, {PairCount} enabled pairs, {DisabledPairCount} disabled pairs, and {IssueCount} mapping issues.",
+        logger.LogInformation("Cross-subscription discovery found {VaultCount} vaults, {PairCount} enabled pairs, {DisabledPairCount} disabled pairs, and {IssueCount} mapping issues.",
             allVaults.Count, pairs.Count, disabledPairCount, issues.Count);
 
         return new DiscoveryResult
@@ -282,18 +251,10 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         };
     }
 
-    private static bool IsSourceInRequestedGroup(VaultResource source, string? resourceGroup)
-    {
-        return resourceGroup is null || source.ResourceGroup.Equals(resourceGroup, StringComparison.OrdinalIgnoreCase);
-    }
-
     /// <summary>Emits event 1100 and a discovery activity for every listed vault, including unmapped and paused vaults.</summary>
     /// <remarks>Tag-presence fields mean a nonblank value exists, not that the mapping is valid or enabled.</remarks>
-    private void LogDiscoveredVault(VaultResource vault, string pairTagName)
+    private void LogDiscoveredVault(VaultResource vault)
     {
-        var rawSyncId = GetTag(vault, pairTagName);
-        var hasSyncId = !string.IsNullOrWhiteSpace(rawSyncId);
-        var syncId = hasSyncId ? rawSyncId!.Trim() : null;
         var rawSourceId = GetTag(vault, KeyVaultSyncResourceTags.SyncSourceKeyVaultId);
         var hasSourceId = !string.IsNullOrWhiteSpace(rawSourceId);
         var sourceId = hasSourceId ? rawSourceId!.Trim() : null;
@@ -303,9 +264,6 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         activity?.SetTag("azure.resource.id", vault.Id);
         activity?.SetTag("azure.resource.group", vault.ResourceGroup);
         activity?.SetTag("cloud.region", vault.Location);
-        activity?.SetTag("sync.pair_tag", pairTagName);
-        activity?.SetTag("sync.has_id", hasSyncId);
-        activity?.SetTag("sync.id", syncId);
         activity?.SetTag("sync.has_source_id", hasSourceId);
         activity?.SetTag("sync.source_id", sourceId);
         activity?.SetTag("sync.disabled", syncDisabled);
@@ -313,8 +271,8 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
 
         logger.LogInformation(
             KeyVaultDiscoveredEventId,
-            "Discovered Key Vault {KeyVaultName} in resource group {ResourceGroup} at {Region}. Source tag {PairTagName} is present: {HasSyncId}; target ID: {SyncId}; target source tag {SourceKeyVaultIdTagName} is present: {HasSourceId}; source ID: {SourceId}; sync disabled: {SyncDisabled}.",
-            vault.Name, vault.ResourceGroup, vault.Location, pairTagName, hasSyncId, syncId,
+            "Discovered Key Vault {KeyVaultName} in resource group {ResourceGroup} at {Region}. Target source tag {SourceKeyVaultIdTagName} is present: {HasSourceId}; source ID: {SourceId}; sync disabled: {SyncDisabled}.",
+            vault.Name, vault.ResourceGroup, vault.Location,
             KeyVaultSyncResourceTags.SyncSourceKeyVaultId, hasSourceId, sourceId, syncDisabled);
     }
 
@@ -400,19 +358,19 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
 
         var roleAssignments = new List<RoleAssignmentSummary>();
         var warnings = new List<string>();
-        // An unreadable ancestor must not be mistaken for "no assignments". Keep the observations
-        // from other scopes, but carry an explicit incompleteness warning into the vault inventory.
-        foreach (var scope in GetRoleScopes(vaultId))
+        // The ARM atScope() filter already returns the vault's inherited resource-group, subscription, and
+        // tenant-root assignments, so querying those ancestor scopes separately would only repeat rows that
+        // ListDirectRoleAssignmentsAsync discards. An unreadable scope must not be mistaken for "no
+        // assignments", so a read failure carries an explicit incompleteness warning into the vault inventory.
+        try
         {
-            try
-            {
-                roleAssignments.AddRange(await ListDirectRoleAssignmentsAsync(scope, cancellationToken));
-            }
-            catch (Exception exception)
-            {
-                warnings.Add($"Role-assignment inventory is incomplete at {scope}: {SafeError(exception)}");
-                logger.LogWarning(exception, "Role-assignment inventory is incomplete at {Scope}.", scope);
-            }
+            roleAssignments.AddRange((await ListDirectRoleAssignmentsAsync(vaultId, cancellationToken))
+                .DistinctBy(assignment => assignment.Id, StringComparer.OrdinalIgnoreCase));
+        }
+        catch (Exception exception)
+        {
+            warnings.Add($"Role-assignment inventory is incomplete at {vaultId}: {SafeError(exception)}");
+            logger.LogWarning(exception, "Role-assignment inventory is incomplete at {Scope}.", vaultId);
         }
 
         activity?.SetTag("authorization.rbac_enabled", usesRbac);
@@ -468,16 +426,28 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         return vaults;
     }
 
-    /// <summary>Reads a mapped target not already available from subscription discovery using the Key Vault ARM API.</summary>
+    /// <summary>Reads a mapped vault not already available from subscription discovery using the Key Vault ARM API.</summary>
     private async Task<VaultResource> GetKeyVaultResourceAsync(string resourceId, CancellationToken cancellationToken)
     {
         using var document = await GetJsonAsync($"{resourceId}?api-version=2023-07-01", cancellationToken);
         return ParseVaultResource(document.RootElement);
     }
 
-    /// <summary>Follows role-assignment pages using the ARM atScope filter and preserves returned conditions and principals.</summary>
-    /// <remarks>Does not expand role definitions or evaluate condition expressions; GetAuthorizationAsync aggregates the scopes.</remarks>
-    private async Task<IReadOnlyList<RoleAssignmentSummary>> ListDirectRoleAssignmentsAsync(string scope, CancellationToken cancellationToken)
+    /// <summary>Directly reads a vault when the generic resource listing omits tenant or authorization metadata.</summary>
+    private async Task<VaultResource> EnsureEligibilityMetadataAsync(VaultResource vault, CancellationToken cancellationToken)
+    {
+        return !string.IsNullOrWhiteSpace(vault.TenantId) && vault.UsesRbacAuthorization.HasValue
+            ? vault
+            : await GetKeyVaultResourceAsync(vault.Id, cancellationToken);
+    }
+
+    /// <summary>Lists the vault-scope and object-scope role assignments visible from an ARM scope.</summary>
+    /// <remarks>
+    /// Does not expand role definitions or evaluate condition expressions. The ARM atScope filter also returns the
+    /// scope's inherited resource-group, subscription, and tenant-root assignments. Those ancestor grants are never
+    /// replicable and are discarded here, so no caller inventories tenant-wide principal grants.
+    /// </remarks>
+    internal async Task<IReadOnlyList<RoleAssignmentSummary>> ListDirectRoleAssignmentsAsync(string scope, CancellationToken cancellationToken)
     {
         var query = Uri.EscapeDataString("atScope()");
         var requestUri = $"https://management.azure.com{scope}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&$filter={query}";
@@ -494,7 +464,7 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
                 foreach (var assignment in values.EnumerateArray())
                 {
                     var properties = assignment.TryGetProperty("properties", out var value) ? value : default;
-                    assignments.Add(new RoleAssignmentSummary
+                    var summary = new RoleAssignmentSummary
                     {
                         Id = GetString(assignment, "id") ?? string.Empty,
                         Scope = GetString(properties, "scope") ?? scope,
@@ -504,40 +474,21 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
                         Condition = GetString(properties, "condition"),
                         ConditionVersion = GetString(properties, "conditionVersion"),
                         DelegatedManagedIdentityResourceId = GetString(properties, "delegatedManagedIdentityResourceId"),
-                    });
+                    };
+                    if (summary.ScopeKind is "Vault" or "Object")
+                    {
+                        assignments.Add(summary);
+                    }
                 }
             }
 
             logger.LogInformation(RoleAssignmentPageCompletedEventId,
-                "ARM role-assignment page completed. {Scope}; page {PageNumber}; {PageAssignmentCount} assignments on page; {TotalAssignmentCount} total assignments.",
+                "ARM role-assignment page completed. {Scope}; page {PageNumber}; {PageAssignmentCount} assignments on page; {TotalAssignmentCount} retained assignments.",
                 scope, pageNumber, pageAssignmentCount, assignments.Count);
             requestUri = GetString(document.RootElement, "nextLink") ?? string.Empty;
         }
 
         return assignments;
-    }
-
-    /// <summary>Yields the vault, containing resource group, and subscription scopes from a conventional Key Vault resource ID.</summary>
-    /// <remarks>No tenant/management-group lookup is attempted; malformed IDs can produce only the scopes derivable from them.</remarks>
-    private static IEnumerable<string> GetRoleScopes(string vaultId)
-    {
-        yield return vaultId;
-        var resourceGroupMarker = "/providers/Microsoft.KeyVault/vaults/";
-        var markerIndex = vaultId.IndexOf(resourceGroupMarker, StringComparison.OrdinalIgnoreCase);
-        if (markerIndex < 0)
-        {
-            yield break;
-        }
-
-        var resourceGroupScope = vaultId[..markerIndex];
-        yield return resourceGroupScope;
-
-        var subscriptionMarker = "/resourceGroups/";
-        var groupIndex = resourceGroupScope.IndexOf(subscriptionMarker, StringComparison.OrdinalIgnoreCase);
-        if (groupIndex > 0)
-        {
-            yield return resourceGroupScope[..groupIndex];
-        }
     }
 
     /// <summary>Performs an authenticated ARM GET with at most three attempts for selected transient read failures.</summary>
@@ -661,12 +612,28 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
             resourceGroup = id[(groupIndex + groupMarker.Length)..providerIndex];
         }
 
+        var properties = resource.TryGetProperty("properties", out var propertiesElement)
+            && propertiesElement.ValueKind == JsonValueKind.Object
+                ? propertiesElement
+                : default;
+        bool? usesRbacAuthorization = properties.ValueKind == JsonValueKind.Object
+            && properties.TryGetProperty("enableRbacAuthorization", out var rbacElement)
+            ? rbacElement.ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => null,
+            }
+            : null;
+
         return new VaultResource
         {
             Id = id,
             Name = name,
             Location = GetString(resource, "location") ?? string.Empty,
             ResourceGroup = resourceGroup,
+            TenantId = GetString(properties, "tenantId"),
+            UsesRbacAuthorization = usesRbacAuthorization,
             Tags = tags,
         };
     }
@@ -690,7 +657,7 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
     /// <summary>Removes surrounding whitespace and trailing slashes; callers supply case-insensitive comparison.</summary>
     private static string NormalizeId(string resourceId) => resourceId.Trim().TrimEnd('/');
 
-    private sealed record PairDeclaration(VaultResource Source, string TargetId);
+    private sealed record PairDeclaration(VaultResource Source, VaultResource Target);
 
     private sealed class PairDeclarationComparer : IEqualityComparer<PairDeclaration>
     {
@@ -701,14 +668,14 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
             return left is not null
                 && right is not null
                 && NormalizeId(left.Source.Id).Equals(NormalizeId(right.Source.Id), StringComparison.OrdinalIgnoreCase)
-                && NormalizeId(left.TargetId).Equals(NormalizeId(right.TargetId), StringComparison.OrdinalIgnoreCase);
+                && NormalizeId(left.Target.Id).Equals(NormalizeId(right.Target.Id), StringComparison.OrdinalIgnoreCase);
         }
 
         public int GetHashCode(PairDeclaration declaration)
         {
             return HashCode.Combine(
                 StringComparer.OrdinalIgnoreCase.GetHashCode(NormalizeId(declaration.Source.Id)),
-                StringComparer.OrdinalIgnoreCase.GetHashCode(NormalizeId(declaration.TargetId)));
+                StringComparer.OrdinalIgnoreCase.GetHashCode(NormalizeId(declaration.Target.Id)));
         }
     }
 

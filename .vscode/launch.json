@@ -2,22 +2,11 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": ".NET: Launch KeyVaultSync Runner",
-      "type": "coreclr",
-      "request": "launch",
-      "program": "${workspaceFolder}/src/KeyVaultSync.Runner/bin/Debug/net10.0/KeyVaultSync.Runner.dll",
-      "cwd": "${workspaceFolder}",
-      "args": [],
-      "preLaunchTask": "build: KeyVaultSync Runner",
-      "console": "internalConsole",
-      "stopAtEntry": false,
-      "justMyCode": true
-    },
-    {
       "name": ".NET: Attach to KeyVaultSync Function",
       "type": "coreclr",
       "request": "attach",
-      "processId": "${command:pickProcess}",
+      "processId": "${command:azureFunctions.pickProcess}",
+      "preLaunchTask": "func: host start",
       "justMyCode": true
     }
   ]
