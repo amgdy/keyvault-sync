@@ -91,7 +91,8 @@ chmod +x "$fixture_directory/bin/az"
 export fixture_directory
 export PATH="$fixture_directory/bin:$PATH"
 export AZURE_ENV_NAME='test'
-export KEYVAULTSYNC_NETWORK_MODE='public'
+export AZURE_RESOURCE_GROUP='existing-resource-group'
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
 unset KEYVAULTSYNC_HMAC_KEY
 export MOCK_AZD_HMAC_KEY="$test_hmac_key"
 export MOCK_AZD_SUBSCRIPTIONS='11111111-1111-1111-1111-111111111111'
@@ -173,36 +174,165 @@ unset AZD_NON_INTERACTIVE
 printf 'PASS non-interactive mode preserves configuration without prompting\n'
 
 : >"$fixture_directory/azd-calls.jsonl"
-unset KEYVAULTSYNC_NETWORK_MODE
-private_vault_ids='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/example/providers/Microsoft.KeyVault/vaults/source,/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/example/providers/Microsoft.KeyVault/vaults/target'
-printf 'r\nm\n%s\nn\n' "$private_vault_ids" | bash "$hook" provision >/dev/null
+unset AZURE_RESOURCE_GROUP KEYVAULTSYNC_REGION_CODE
+printf 'SWC\n\n' | bash "$hook" provision >"$fixture_directory/generated-resource-group.out"
 jq -se '
-  length == 3
-  and .[0] == ["env","set","KEYVAULTSYNC_NETWORK_MODE","private","--environment","test"]
-  and .[1] == ["env","set","KEYVAULTSYNC_NETWORK_SOURCE","managed","--environment","test"]
-  and .[2][0:3] == ["env","set","KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS"]' \
+  length == 2
+  and .[0] == ["env","set","KEYVAULTSYNC_REGION_CODE","swc","--environment","test"]
+  and .[1] == ["env","set","AZURE_RESOURCE_GROUP","rg-keyvaultsync-swc-test","--environment","test"]' \
   "$fixture_directory/azd-calls.jsonl" >/dev/null
-export KEYVAULTSYNC_NETWORK_MODE='public'
-printf 'PASS interactive networking selection persists private managed mode and approved vault endpoints\n'
+grep -F 'Configured new deployment resource group rg-keyvaultsync-swc-test.' \
+  "$fixture_directory/generated-resource-group.out" >/dev/null
+export AZURE_RESOURCE_GROUP='existing-resource-group'
+printf 'PASS missing resource-group configuration generates and persists a CAF-style name\n'
 
 : >"$fixture_directory/azd-calls.jsonl"
+unset AZURE_RESOURCE_GROUP KEYVAULTSYNC_REGION_CODE
+if printf 'sw\n' | bash "$hook" provision >"$fixture_directory/invalid-region-code.out" 2>&1; then
+    printf 'Expected an invalid region abbreviation to fail.\n' >&2
+    exit 1
+fi
+grep -F 'KEYVAULTSYNC_REGION_CODE must contain exactly three ASCII letters' \
+  "$fixture_directory/invalid-region-code.out" >/dev/null
+[[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
+export AZURE_RESOURCE_GROUP='existing-resource-group'
+printf 'PASS invalid region abbreviations fail before resource-group configuration is persisted\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+unset AZURE_RESOURCE_GROUP KEYVAULTSYNC_REGION_CODE
+export AZD_NON_INTERACTIVE=true
+if bash "$hook" provision >"$fixture_directory/missing-region-code.out" 2>&1; then
+    printf 'Expected a missing non-interactive region abbreviation to fail.\n' >&2
+    exit 1
+fi
+grep -F 'KEYVAULTSYNC_REGION_CODE is required when AZURE_RESOURCE_GROUP is not configured' \
+  "$fixture_directory/missing-region-code.out" >/dev/null
+[[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
+unset AZD_NON_INTERACTIVE
+export AZURE_RESOURCE_GROUP='existing-resource-group'
+printf 'PASS non-interactive resource-group generation requires an explicit region abbreviation\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+unset AZURE_RESOURCE_GROUP
+export KEYVAULTSYNC_REGION_CODE='EUN'
+export AZD_NON_INTERACTIVE=true
+bash "$hook" provision >"$fixture_directory/noninteractive-resource-group.out"
+jq -se '
+  length == 2
+  and .[0] == ["env","set","KEYVAULTSYNC_REGION_CODE","eun","--environment","test"]
+  and .[1] == ["env","set","AZURE_RESOURCE_GROUP","rg-keyvaultsync-eun-test","--environment","test"]' \
+  "$fixture_directory/azd-calls.jsonl" >/dev/null
+unset AZD_NON_INTERACTIVE KEYVAULTSYNC_REGION_CODE
+export AZURE_RESOURCE_GROUP='existing-resource-group'
+printf 'PASS non-interactive resource-group generation accepts and normalizes a supplied region abbreviation\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+unset KEYVAULTSYNC_NETWORK_PROFILE
+printf '\n\n' | bash "$hook" provision >/dev/null
+jq -se '
+  length == 1
+  and .[0] == ["env","set","KEYVAULTSYNC_NETWORK_PROFILE","public","--environment","test"]' \
+  "$fixture_directory/azd-calls.jsonl" >/dev/null
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
+printf 'PASS interactive networking selection defaults to public and persists the choice\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+unset KEYVAULTSYNC_NETWORK_PROFILE
 export KEYVAULTSYNC_NETWORK_MODE='private'
 export KEYVAULTSYNC_NETWORK_SOURCE='managed'
 export AZD_NON_INTERACTIVE=true
-if bash "$hook" provision >"$fixture_directory/missing-private-vaults.out" 2>&1; then
-    printf 'Expected managed private networking without vault IDs to fail.\n' >&2
-    exit 1
-fi
-grep -F 'KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS is required' \
-    "$fixture_directory/missing-private-vaults.out" >/dev/null
-[[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
-unset AZD_NON_INTERACTIVE KEYVAULTSYNC_NETWORK_SOURCE
-export KEYVAULTSYNC_NETWORK_MODE='public'
-printf 'PASS managed private networking requires an explicit vault endpoint list\n'
+bash "$hook" provision >/dev/null
+jq -se '
+  length == 1
+  and .[0] == ["env","set","KEYVAULTSYNC_NETWORK_PROFILE","private-managed","--environment","test"]' \
+  "$fixture_directory/azd-calls.jsonl" >/dev/null
+unset AZD_NON_INTERACTIVE KEYVAULTSYNC_NETWORK_MODE KEYVAULTSYNC_NETWORK_SOURCE
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
+printf 'PASS retired network mode and source migrate to one managed-private profile\n'
 
 : >"$fixture_directory/azd-calls.jsonl"
-export KEYVAULTSYNC_NETWORK_MODE='private'
-export KEYVAULTSYNC_NETWORK_SOURCE='existing'
+export KEYVAULTSYNC_NETWORK_PROFILE='unsupported'
+if bash "$hook" provision >"$fixture_directory/invalid-network-profile.log" 2>&1; then
+    printf 'FAIL unsupported networking profile should fail\n' >&2
+    exit 1
+fi
+grep -q 'KEYVAULTSYNC_NETWORK_PROFILE must be public, private-managed, or private-existing' "$fixture_directory/invalid-network-profile.log"
+[[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
+printf 'PASS unsupported networking profile fails before persisting configuration\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+unset KEYVAULTSYNC_NETWORK_PROFILE
+printf '2\n\n\n' | bash "$hook" provision >/dev/null
+jq -se '
+  length == 6
+  and .[0] == ["env","set","KEYVAULTSYNC_NETWORK_PROFILE","private-managed","--environment","test"]
+  and .[1] == ["env","set","KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX","10.42.0.0/24","--environment","test"]
+  and .[2] == ["env","set","KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME","snet-functions","--environment","test"]
+  and .[3] == ["env","set","KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX","10.42.0.0/27","--environment","test"]
+  and .[4] == ["env","set","KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME","snet-private-endpoints","--environment","test"]
+  and .[5] == ["env","set","KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX","10.42.0.32/27","--environment","test"]
+  and (map(.[2]) | index("KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS")) == null' \
+  "$fixture_directory/azd-calls.jsonl" >/dev/null
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
+printf 'PASS interactive private managed selection persists topology defaults without requesting vault endpoints\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+unset KEYVAULTSYNC_NETWORK_PROFILE
+printf '2\n2\n10.80.0.0/23\nsnet-runtime\n10.80.0.0/26\nsnet-endpoints\n10.80.0.64/27\n\n' \
+  | bash "$hook" provision >/dev/null
+jq -se '
+  length == 6
+  and .[1] == ["env","set","KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX","10.80.0.0/23","--environment","test"]
+  and .[2] == ["env","set","KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME","snet-runtime","--environment","test"]
+  and .[3] == ["env","set","KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX","10.80.0.0/26","--environment","test"]
+  and .[4] == ["env","set","KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME","snet-endpoints","--environment","test"]
+  and .[5] == ["env","set","KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX","10.80.0.64/27","--environment","test"]' \
+  "$fixture_directory/azd-calls.jsonl" >/dev/null
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
+printf 'PASS interactive private managed selection persists custom VNet and subnet values\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+unset KEYVAULTSYNC_NETWORK_PROFILE
+existing_function_subnet='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/shared/subnets/functions'
+existing_endpoint_subnet='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/shared/subnets/endpoints'
+existing_blob_zone='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net'
+existing_queue_zone='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.queue.core.windows.net'
+existing_table_zone='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.table.core.windows.net'
+existing_monitor_zone='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.monitor.azure.com'
+existing_oms_zone='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.oms.opinsights.azure.com'
+existing_ods_zone='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.ods.opinsights.azure.com'
+existing_agentsvc_zone='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.agentsvc.azure-automation.net'
+existing_ampls='/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/monitor/providers/Microsoft.Insights/privateLinkScopes/shared'
+printf '3\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n\n' \
+  "$existing_function_subnet" "$existing_endpoint_subnet" "$existing_blob_zone" \
+  "$existing_queue_zone" "$existing_table_zone" \
+  "$existing_monitor_zone" "$existing_oms_zone" "$existing_ods_zone" \
+  "$existing_agentsvc_zone" "$existing_ampls" | bash "$hook" provision >/dev/null
+jq -se '
+  length == 11
+  and .[0] == ["env","set","KEYVAULTSYNC_NETWORK_PROFILE","private-existing","--environment","test"]
+  and .[1][2] == "KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID"
+  and .[2][2] == "KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID"
+  and .[10][2] == "KEYVAULTSYNC_EXISTING_AMPLS_ID"
+  and (map(.[2]) | index("KEYVAULTSYNC_EXISTING_KEYVAULT_PRIVATE_DNS_ZONE_ID")) == null' \
+  "$fixture_directory/azd-calls.jsonl" >/dev/null
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
+printf 'PASS interactive private existing selection prompts for and persists every required network value\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+export KEYVAULTSYNC_NETWORK_PROFILE='private-managed'
+export AZD_NON_INTERACTIVE=true
+bash "$hook" provision >"$fixture_directory/managed-private.out" 2>&1
+jq -se '
+  length == 0' \
+    "$fixture_directory/azd-calls.jsonl" >/dev/null
+unset AZD_NON_INTERACTIVE
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
+printf 'PASS managed private networking succeeds without any customer vault resource IDs\n'
+
+: >"$fixture_directory/azd-calls.jsonl"
+export KEYVAULTSYNC_NETWORK_PROFILE='private-existing'
 export AZD_NON_INTERACTIVE=true
 if bash "$hook" provision >"$fixture_directory/incomplete-network.out" 2>&1; then
     printf 'Expected incomplete existing-network configuration to fail.\n' >&2
@@ -211,8 +341,8 @@ fi
 grep -F 'KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID is required' \
     "$fixture_directory/incomplete-network.out" >/dev/null
 [[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
-unset AZD_NON_INTERACTIVE KEYVAULTSYNC_NETWORK_SOURCE
-export KEYVAULTSYNC_NETWORK_MODE='public'
+unset AZD_NON_INTERACTIVE
+export KEYVAULTSYNC_NETWORK_PROFILE='public'
 printf 'PASS incomplete existing-network configuration fails before Bicep\n'
 
 : >"$fixture_directory/azd-calls.jsonl"
@@ -231,12 +361,12 @@ printf 'PASS incomplete non-interactive tag configuration fails before Bicep\n'
 
 : >"$fixture_directory/azd-calls.jsonl"
 unset KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE || true
-printf 'n\n' | bash "$hook" provision >/dev/null
+printf '\n' | bash "$hook" provision >/dev/null
 [[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
 printf 'PASS declining the optional tag performs no environment writes\n'
 
 : >"$fixture_directory/azd-calls.jsonl"
-printf 'y\nComplianceClass\nReviewed\n\n' | bash "$hook" provision >/dev/null
+printf '2\nComplianceClass\nReviewed\n\n' | bash "$hook" provision >/dev/null
 jq -se '
   length == 2
   and .[0] == ["env","set","KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME","ComplianceClass","--environment","test"]
@@ -297,7 +427,7 @@ unset AZD_NON_INTERACTIVE KEYVAULTSYNC_HMAC_KEY
 printf 'PASS protected non-interactive HMAC input is persisted without being printed\n'
 
 : >"$fixture_directory/azd-calls.jsonl"
-printf 'g\nn\n' | bash "$hook" provision >"$fixture_directory/generated-hmac.out"
+printf '\n\n' | bash "$hook" provision >"$fixture_directory/generated-hmac.out"
 jq -se --arg key "$generated_hmac_key" '
   length == 1
   and .[0] == ["env","set","KEYVAULTSYNC_HMAC_KEY",$key,"--environment","test"]' \
@@ -318,7 +448,7 @@ printf 'PASS quoted saved HMAC key is normalized without rotation\n'
 
 export MOCK_AZD_HMAC_KEY='invalid-saved-value'
 : >"$fixture_directory/azd-calls.jsonl"
-printf 'g\nn\n' | bash "$hook" provision >"$fixture_directory/repaired-hmac.out"
+printf '\n\n' | bash "$hook" provision >"$fixture_directory/repaired-hmac.out"
 jq -se --arg key "$generated_hmac_key" '
   length == 1
   and .[0] == ["env","set","KEYVAULTSYNC_HMAC_KEY",$key,"--environment","test"]' \
@@ -342,7 +472,7 @@ printf 'PASS conflicting HMAC keys fail without changing the saved key\n'
 
 unset MOCK_AZD_HMAC_KEY
 : >"$fixture_directory/azd-calls.jsonl"
-printf 's\n%s\nn\n' "$test_hmac_key" | bash "$hook" provision >"$fixture_directory/supplied-hmac.out"
+printf '%s\n\n' "$test_hmac_key" | bash "$hook" provision >"$fixture_directory/supplied-hmac.out"
 jq -se --arg key "$test_hmac_key" '
   length == 1
   and .[0] == ["env","set","KEYVAULTSYNC_HMAC_KEY",$key,"--environment","test"]' \
@@ -352,7 +482,7 @@ printf 'PASS supplied HMAC key is validated, saved, and not printed\n'
 
 unset MOCK_AZD_HMAC_KEY
 : >"$fixture_directory/azd-calls.jsonl"
-if printf 's\ninvalid\n' | bash "$hook" provision >"$fixture_directory/invalid-hmac.out" 2>&1; then
+if printf 'invalid\n' | bash "$hook" provision >"$fixture_directory/invalid-hmac.out" 2>&1; then
     printf 'Expected invalid HMAC input to fail.\n' >&2
     exit 1
 fi
@@ -369,13 +499,13 @@ MOCK_PUBLIC_NETWORK_ACCESS='Enabled' bash "$hook" deploy >"$fixture_directory/de
 grep -F 'Verified deployment storage example' "$fixture_directory/deploy-enabled.out" >/dev/null
 printf 'PASS direct deploy revalidates the HMAC key and accessible deployment storage\n'
 
-KEYVAULTSYNC_NETWORK_MODE='private' MOCK_PUBLIC_NETWORK_ACCESS='Disabled' \
+KEYVAULTSYNC_NETWORK_PROFILE='private-managed' MOCK_PUBLIC_NETWORK_ACCESS='Disabled' \
     bash "$hook" deploy >"$fixture_directory/deploy-private.out"
 grep -F 'Verified private deployment storage example through the Blob data plane' \
     "$fixture_directory/deploy-private.out" >/dev/null
 printf 'PASS private deploy verifies Blob data-plane connectivity\n'
 
-if KEYVAULTSYNC_NETWORK_MODE='private' MOCK_PUBLIC_NETWORK_ACCESS='Disabled' \
+if KEYVAULTSYNC_NETWORK_PROFILE='private-managed' MOCK_PUBLIC_NETWORK_ACCESS='Disabled' \
     MOCK_STORAGE_DATA_PLANE_REACHABLE='false' \
     bash "$hook" deploy >"$fixture_directory/deploy-private-unreachable.out" 2>&1; then
     printf 'Expected unreachable private deployment storage to fail.\n' >&2

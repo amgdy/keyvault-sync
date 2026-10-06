@@ -42,6 +42,9 @@ function global:Read-Host {
     }
     $answer = $global:KeyVaultSyncTagTestAnswers.Dequeue()
     if ($AsSecureString) {
+        if ([string]::IsNullOrEmpty($answer)) {
+            return [System.Security.SecureString]::new()
+        }
         return ConvertTo-SecureString $answer -AsPlainText -Force
     }
     return $answer
@@ -75,7 +78,8 @@ function Invoke-Hook {
 
 try {
     $env:AZURE_ENV_NAME = 'test'
-    $env:KEYVAULTSYNC_NETWORK_MODE = 'public'
+    $env:AZURE_RESOURCE_GROUP = 'existing-resource-group'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
     Remove-Item Env:KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_HMAC_KEY -ErrorAction SilentlyContinue
@@ -151,19 +155,35 @@ try {
     Remove-Item Env:AZD_NON_INTERACTIVE
     Write-Host 'PASS PowerShell non-interactive mode preserves configuration without prompting'
 
-    Remove-Item Env:KEYVAULTSYNC_NETWORK_MODE
-    $privateVaultIds = '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/example/providers/Microsoft.KeyVault/vaults/source,/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/example/providers/Microsoft.KeyVault/vaults/target'
-    Invoke-Hook -Answers @('r', 'm', $privateVaultIds, 'n')
-    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 3) 'private managed selection should persist mode, source, and vault endpoint IDs'
-    Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_NETWORK_MODE|private|--environment|test') 'private mode should be persisted'
-    Assert-True (($global:KeyVaultSyncTagTestCalls[1] -join '|') -eq 'env|set|KEYVAULTSYNC_NETWORK_SOURCE|managed|--environment|test') 'managed network source should be persisted'
-    Assert-True (($global:KeyVaultSyncTagTestCalls[2] -join '|') -eq "env|set|KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS|$privateVaultIds|--environment|test") 'approved vault IDs should be persisted'
-    $env:KEYVAULTSYNC_NETWORK_MODE = 'public'
-    Write-Host 'PASS PowerShell interactive networking selection persists private managed mode and approved vault endpoints'
+    Remove-Item Env:AZURE_RESOURCE_GROUP
+    Remove-Item Env:KEYVAULTSYNC_REGION_CODE -ErrorAction SilentlyContinue
+    $null = $global:KeyVaultSyncPersistedTags.Remove('AZURE_RESOURCE_GROUP')
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_REGION_CODE')
+    Invoke-Hook -Answers @('SWC', '')
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 2) 'resource-group generation should persist the region abbreviation and resource-group name'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_REGION_CODE|swc|--environment|test') 'the normalized region abbreviation should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[1] -join '|') -eq 'env|set|AZURE_RESOURCE_GROUP|rg-keyvaultsync-swc-test|--environment|test') 'the CAF-style resource-group name should be persisted'
+    $env:AZURE_RESOURCE_GROUP = 'existing-resource-group'
+    Write-Host 'PASS PowerShell missing resource-group configuration generates and persists a CAF-style name'
 
-    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS')
-    $env:KEYVAULTSYNC_NETWORK_MODE = 'private'
-    $env:KEYVAULTSYNC_NETWORK_SOURCE = 'managed'
+    Remove-Item Env:AZURE_RESOURCE_GROUP
+    $null = $global:KeyVaultSyncPersistedTags.Remove('AZURE_RESOURCE_GROUP')
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_REGION_CODE')
+    $message = ''
+    try {
+        Invoke-Hook -Answers @('sw')
+    }
+    catch {
+        $message = $_.Exception.Message
+    }
+    Assert-True ($message.Contains('KEYVAULTSYNC_REGION_CODE must contain exactly three ASCII letters')) 'invalid region abbreviations should fail validation'
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'invalid region abbreviations must not persist resource-group configuration'
+    $env:AZURE_RESOURCE_GROUP = 'existing-resource-group'
+    Write-Host 'PASS PowerShell invalid region abbreviations fail before resource-group configuration is persisted'
+
+    Remove-Item Env:AZURE_RESOURCE_GROUP
+    $null = $global:KeyVaultSyncPersistedTags.Remove('AZURE_RESOURCE_GROUP')
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_REGION_CODE')
     $env:AZD_NON_INTERACTIVE = 'true'
     $message = ''
     try {
@@ -172,15 +192,171 @@ try {
     catch {
         $message = $_.Exception.Message
     }
-    Assert-True ($message.Contains('KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS is required')) 'managed private networking should require explicit vault endpoint IDs'
-    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'missing private vault IDs must not persist values'
+    Assert-True ($message.Contains('KEYVAULTSYNC_REGION_CODE is required when AZURE_RESOURCE_GROUP is not configured')) 'non-interactive resource-group generation should require a region abbreviation'
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'missing non-interactive region abbreviation must not persist resource-group configuration'
     Remove-Item Env:AZD_NON_INTERACTIVE
-    Remove-Item Env:KEYVAULTSYNC_NETWORK_SOURCE
-    $env:KEYVAULTSYNC_NETWORK_MODE = 'public'
-    Write-Host 'PASS PowerShell managed private networking requires an explicit vault endpoint list'
+    $env:AZURE_RESOURCE_GROUP = 'existing-resource-group'
+    Write-Host 'PASS PowerShell non-interactive resource-group generation requires an explicit region abbreviation'
 
+    Remove-Item Env:AZURE_RESOURCE_GROUP
+    $null = $global:KeyVaultSyncPersistedTags.Remove('AZURE_RESOURCE_GROUP')
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_REGION_CODE')
+    $env:KEYVAULTSYNC_REGION_CODE = 'EUN'
+    $env:AZD_NON_INTERACTIVE = 'true'
+    Invoke-Hook -Answers @()
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 2) 'a supplied region abbreviation should generate resource-group configuration'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_REGION_CODE|eun|--environment|test') 'the supplied region abbreviation should be normalized and persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[1] -join '|') -eq 'env|set|AZURE_RESOURCE_GROUP|rg-keyvaultsync-eun-test|--environment|test') 'the supplied region abbreviation should produce the CAF-style resource-group name'
+    Remove-Item Env:AZD_NON_INTERACTIVE
+    Remove-Item Env:KEYVAULTSYNC_REGION_CODE
+    $env:AZURE_RESOURCE_GROUP = 'existing-resource-group'
+    Write-Host 'PASS PowerShell non-interactive resource-group generation accepts and normalizes a supplied region abbreviation'
+
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_PROFILE -ErrorAction SilentlyContinue
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_NETWORK_PROFILE')
+    Invoke-Hook -Answers @('', '')
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 1) 'public default selection should persist only the network profile'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_NETWORK_PROFILE|public|--environment|test') 'public profile should be persisted'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
+    Write-Host 'PASS PowerShell interactive networking selection defaults to public and persists the choice'
+
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_NETWORK_PROFILE')
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_PROFILE
     $env:KEYVAULTSYNC_NETWORK_MODE = 'private'
-    $env:KEYVAULTSYNC_NETWORK_SOURCE = 'existing'
+    $env:KEYVAULTSYNC_NETWORK_SOURCE = 'managed'
+    $env:AZD_NON_INTERACTIVE = 'true'
+    Invoke-Hook -Answers @()
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 1) 'retired network settings should migrate to one profile'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_NETWORK_PROFILE|private-managed|--environment|test') 'retired managed-private settings should preserve their posture'
+    Remove-Item Env:AZD_NON_INTERACTIVE
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_MODE
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_SOURCE
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
+    Write-Host 'PASS PowerShell retired network mode and source migrate to one managed-private profile'
+
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'unsupported'
+    try {
+        Invoke-Hook -Answers @()
+        throw 'unsupported networking profile should fail'
+    }
+    catch {
+        Assert-True ($_.Exception.Message -match 'KEYVAULTSYNC_NETWORK_PROFILE must be public, private-managed, or private-existing') 'unsupported networking profile should report the accepted values'
+    }
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'unsupported networking profile should fail before persisting configuration'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
+    Write-Host 'PASS PowerShell unsupported networking profile fails before persisting configuration'
+
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_NETWORK_PROFILE')
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_PROFILE
+    Invoke-Hook -Answers @('2', '', '')
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 6) 'private managed selection should persist one profile and topology defaults'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_NETWORK_PROFILE|private-managed|--environment|test') 'private managed profile should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[1] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX|10.42.0.0/24|--environment|test') 'managed VNet prefix should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[2] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME|snet-functions|--environment|test') 'managed Function subnet name should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[3] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX|10.42.0.0/27|--environment|test') 'managed Function subnet prefix should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[4] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME|snet-private-endpoints|--environment|test') 'managed endpoint subnet name should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[5] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX|10.42.0.32/27|--environment|test') 'managed endpoint subnet prefix should be persisted'
+    Assert-True ((($global:KeyVaultSyncTagTestCalls | ForEach-Object { $_[2] }) -contains 'KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS') -eq $false) 'customer vault endpoint IDs must not be requested or persisted'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
+    Write-Host 'PASS PowerShell interactive private managed selection persists topology defaults without requesting vault endpoints'
+
+    foreach ($name in @(
+        'KEYVAULTSYNC_NETWORK_PROFILE',
+        'KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX',
+        'KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME',
+        'KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX',
+        'KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME',
+        'KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX'
+    )) {
+        $null = $global:KeyVaultSyncPersistedTags.Remove($name)
+    }
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_PROFILE
+    Invoke-Hook -Answers @(
+        '2',
+        '2',
+        '10.80.0.0/23',
+        'snet-runtime',
+        '10.80.0.0/26',
+        'snet-endpoints',
+        '10.80.0.64/27',
+        ''
+    )
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 6) 'private managed selection should persist one profile and each custom topology value'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[1] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX|10.80.0.0/23|--environment|test') 'custom managed VNet prefix should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[2] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME|snet-runtime|--environment|test') 'custom Function subnet name should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[3] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX|10.80.0.0/26|--environment|test') 'custom Function subnet prefix should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[4] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME|snet-endpoints|--environment|test') 'custom endpoint subnet name should be persisted'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[5] -join '|') -eq 'env|set|KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX|10.80.0.64/27|--environment|test') 'custom endpoint subnet prefix should be persisted'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
+    Write-Host 'PASS PowerShell interactive private managed selection persists custom VNet and subnet values'
+
+    foreach ($name in @(
+        'KEYVAULTSYNC_NETWORK_PROFILE',
+        'KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID',
+        'KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID',
+        'KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_AMPLS_ID'
+    )) {
+        $null = $global:KeyVaultSyncPersistedTags.Remove($name)
+    }
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_PROFILE
+    $existingValues = @(
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/shared/subnets/functions',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/network/providers/Microsoft.Network/virtualNetworks/shared/subnets/endpoints',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.blob.core.windows.net',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.queue.core.windows.net',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.table.core.windows.net',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.monitor.azure.com',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.oms.opinsights.azure.com',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.ods.opinsights.azure.com',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/dns/providers/Microsoft.Network/privateDnsZones/privatelink.agentsvc.azure-automation.net',
+        '/subscriptions/11111111-1111-1111-1111-111111111111/resourceGroups/monitor/providers/Microsoft.Insights/privateLinkScopes/shared'
+    )
+    Invoke-Hook -Answers (@('3') + $existingValues + @('', ''))
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 11) 'private existing selection should persist one profile and every required network value'
+    Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_NETWORK_PROFILE|private-existing|--environment|test') 'private existing profile should be persisted'
+    Assert-True ($global:KeyVaultSyncTagTestCalls[1][2] -eq 'KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID') 'existing Function subnet should be persisted first'
+    Assert-True ($global:KeyVaultSyncTagTestCalls[2][2] -eq 'KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID') 'existing endpoint subnet should be persisted second'
+    Assert-True ($global:KeyVaultSyncTagTestCalls[10][2] -eq 'KEYVAULTSYNC_EXISTING_AMPLS_ID') 'existing AMPLS should be persisted'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
+    Write-Host 'PASS PowerShell interactive private existing selection prompts for and persists every required network value'
+
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'private-managed'
+    $env:AZD_NON_INTERACTIVE = 'true'
+    $message = ''
+    try {
+        Invoke-Hook -Answers @()
+    }
+    catch {
+        $message = $_.Exception.Message
+    }
+    Assert-True ($message -eq '') 'managed private networking should succeed without customer vault IDs'
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'no additional values should be persisted when the environment is already complete'
+    Remove-Item Env:AZD_NON_INTERACTIVE
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
+    Write-Host 'PASS PowerShell managed private networking succeeds without any customer vault resource IDs'
+
+    foreach ($name in @(
+        'KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID',
+        'KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID',
+        'KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID',
+        'KEYVAULTSYNC_EXISTING_AMPLS_ID'
+    )) {
+        $null = $global:KeyVaultSyncPersistedTags.Remove($name)
+    }
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'private-existing'
     $env:AZD_NON_INTERACTIVE = 'true'
     $message = ''
     try {
@@ -192,8 +368,7 @@ try {
     Assert-True ($message.Contains('KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID is required')) 'incomplete existing networking should fail before Bicep'
     Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'incomplete existing networking must not persist values'
     Remove-Item Env:AZD_NON_INTERACTIVE
-    Remove-Item Env:KEYVAULTSYNC_NETWORK_SOURCE
-    $env:KEYVAULTSYNC_NETWORK_MODE = 'public'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
     Write-Host 'PASS PowerShell incomplete existing-network configuration fails before Bicep'
 
     $env:AZD_NON_INTERACTIVE = 'true'
@@ -211,11 +386,11 @@ try {
     Remove-Item Env:KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME
     Write-Host 'PASS PowerShell incomplete non-interactive tag configuration fails before Bicep'
 
-    Invoke-Hook -Answers @('n')
+    Invoke-Hook -Answers @('')
     Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'declining the optional tag must not write azd environment values'
     Write-Host 'PASS PowerShell declining the optional tag performs no environment writes'
 
-    Invoke-Hook -Answers @('y', 'ComplianceClass', 'Reviewed', '')
+    Invoke-Hook -Answers @('2', 'ComplianceClass', 'Reviewed', '')
     Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 2) 'two azd environment values should be persisted'
     Assert-True (($global:KeyVaultSyncTagTestCalls[0] -join '|') -eq 'env|set|KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME|ComplianceClass|--environment|test') 'the selected tag name should be persisted'
     Assert-True (($global:KeyVaultSyncTagTestCalls[1] -join '|') -eq 'env|set|KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE|Reviewed|--environment|test') 'the selected tag value should be persisted'
@@ -314,7 +489,7 @@ try {
 
     $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_HMAC_KEY')
     $global:KeyVaultSyncTagTestCalls.Clear()
-    Invoke-Hook -Answers @('s', $testHmacKey, '')
+    Invoke-Hook -Answers @($testHmacKey, '')
     Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 1) 'interactive supply should persist exactly one HMAC setting'
     Assert-True ($global:KeyVaultSyncTagTestCalls[0][3] -ceq $testHmacKey) 'the supplied HMAC key should be stored without transformation'
     Write-Host 'PASS PowerShell supplied HMAC key is validated and persisted'
@@ -322,7 +497,7 @@ try {
     $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_HMAC_KEY')
     $message = ''
     try {
-        Invoke-Hook -Answers @('s', 'invalid')
+        Invoke-Hook -Answers @('invalid')
     }
     catch {
         $message = $_.Exception.Message
@@ -342,7 +517,7 @@ try {
     Assert-True ($output.Contains('Verified deployment storage example')) 'direct deploy should validate accessible storage'
     Write-Host 'PASS PowerShell direct deploy revalidates the HMAC key and accessible deployment storage'
 
-    $env:KEYVAULTSYNC_NETWORK_MODE = 'private'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'private-managed'
     $global:KeyVaultSyncStorageAccess = 'Disabled'
     $output = & $hook deploy 6>&1 | Out-String
     Assert-True ($output.Contains('Verified private deployment storage example through the Blob data plane')) 'private deploy should verify Blob connectivity'
@@ -358,7 +533,7 @@ try {
     }
     Assert-True ($message.Contains('not reachable through the deployment agent')) 'unreachable private storage should fail before upload'
     $global:KeyVaultSyncStorageDataPlaneReachable = $true
-    $env:KEYVAULTSYNC_NETWORK_MODE = 'public'
+    $env:KEYVAULTSYNC_NETWORK_PROFILE = 'public'
     Write-Host 'PASS PowerShell unreachable private deployment storage fails before package upload'
 
     $global:KeyVaultSyncStorageAccess = 'Disabled'
@@ -380,12 +555,28 @@ finally {
     Remove-Item Env:KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_HMAC_KEY -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_SUBSCRIPTIONS -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_REGION_CODE -ErrorAction SilentlyContinue
     Remove-Item Env:AZURE_SUBSCRIPTION_ID -ErrorAction SilentlyContinue
     Remove-Item Env:AZURE_RESOURCE_GROUP -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_NETWORK_PROFILE -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_NETWORK_MODE -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_NETWORK_SOURCE -ErrorAction SilentlyContinue
-    Remove-Item Env:KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_EXISTING_AMPLS_ID -ErrorAction SilentlyContinue
     Remove-Item Function:global:azd -ErrorAction SilentlyContinue
     Remove-Item Function:global:az -ErrorAction SilentlyContinue
     Remove-Item Function:global:Read-Host -ErrorAction SilentlyContinue

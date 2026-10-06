@@ -23,11 +23,8 @@
     "optionalResourceGroupTagValue": {
       "value": "${KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE=}"
     },
-    "networkMode": {
-      "value": "${KEYVAULTSYNC_NETWORK_MODE=public}"
-    },
-    "networkSource": {
-      "value": "${KEYVAULTSYNC_NETWORK_SOURCE=managed}"
+    "networkProfile": {
+      "value": "${KEYVAULTSYNC_NETWORK_PROFILE=public}"
     },
     "managedVirtualNetworkName": {
       "value": "${KEYVAULTSYNC_MANAGED_VNET_NAME=}"
@@ -62,9 +59,6 @@
     "existingTablePrivateDnsZoneResourceId": {
       "value": "${KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID=}"
     },
-    "existingKeyVaultPrivateDnsZoneResourceId": {
-      "value": "${KEYVAULTSYNC_EXISTING_KEYVAULT_PRIVATE_DNS_ZONE_ID=}"
-    },
     "existingMonitorPrivateDnsZoneResourceId": {
       "value": "${KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID=}"
     },
@@ -79,9 +73,6 @@
     },
     "existingAzureMonitorPrivateLinkScopeResourceId": {
       "value": "${KEYVAULTSYNC_EXISTING_AMPLS_ID=}"
-    },
-    "privateKeyVaultResourceIds": {
-      "value": "${KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS=}"
     }
   }
 }

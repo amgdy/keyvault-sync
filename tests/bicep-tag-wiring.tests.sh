@@ -7,12 +7,10 @@ compiled_template=$(mktemp)
 trap 'rm -f "$compiled_template"' EXIT
 
 jq -e '
-  .parameters.keyVaultSyncHmacKey.value == "${KEYVAULTSYNC_HMAC_KEY}"
+  .parameters.keyVaultSyncHmacKey.value == "${KEYVAULTSYNC_HMAC_KEY=}"
   and .parameters.optionalResourceGroupTagName.value == "${KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME=}"
   and .parameters.optionalResourceGroupTagValue.value == "${KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE=}"
-  and .parameters.networkMode.value == "${KEYVAULTSYNC_NETWORK_MODE=public}"
-  and .parameters.networkSource.value == "${KEYVAULTSYNC_NETWORK_SOURCE=managed}"
-  and .parameters.privateKeyVaultResourceIds.value == "${KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS=}"
+  and .parameters.networkProfile.value == "${KEYVAULTSYNC_NETWORK_PROFILE=public}"
 ' "$repository_root/infra/main.parameters.json" >/dev/null
 
 az bicep build \
@@ -59,12 +57,16 @@ jq -e \
 ' "$compiled_template" >/dev/null
 
 jq -e '
-  .parameters.networkMode.defaultValue == "public"
-  and .parameters.networkSource.defaultValue == "managed"
+  .parameters.networkProfile.defaultValue == "public"
+  and .parameters.networkProfile.allowedValues == ["public", "private-managed", "private-existing"]
+  and (.parameters | has("networkMode") | not)
+  and (.parameters | has("networkSource") | not)
   and ([.resources[]
     | select(.type == "Microsoft.Resources/deployments")
     | select(.name == "private-networking")
     | select(.condition == "[variables('\''isPrivateNetwork'\'')]")
+    | select((.dependsOn | index("functionStorage")) != null)
+    | select((.dependsOn | index("applicationInsights")) != null)
   ] | length) == 1
   and ([.resources[]
     | select(.type == "Microsoft.Resources/deployments")
@@ -87,6 +89,24 @@ jq -e '
 ' "$compiled_template" >/dev/null
 
 jq -e '
+  .variables.environmentUniqueToken == "[uniqueString(subscription().id, variables('\''lowerEnvironmentName'\''), toLower(parameters('\''location'\'')))]"
+  and (.variables | has("environmentNameToken") | not)
+  and (.variables | has("storageEnvironmentNameToken") | not)
+  and (.variables | has("normalizedEnvironmentName") | not)
+  and (.variables | has("nameSuffix") | not)
+' "$compiled_template" >/dev/null
+
+jq -e '
+  [.resources[]
+    | select(.type == "Microsoft.Resources/deployments")
+    | select(.copy.name? == "subscriptionReaders")
+    | .name
+    | select(contains("environmentUniqueToken"))
+    | select(contains("discoverySubscriptionIds"))
+  ] | length == 1
+' "$compiled_template" >/dev/null
+
+jq -e '
   [.resources[]
     | select(.type == "Microsoft.Resources/deployments")
     | select(.name == "private-networking")
@@ -94,10 +114,10 @@ jq -e '
   ] as $networkResources
   | ([$networkResources[] | select(.type == "Microsoft.Network/virtualNetworks")] | length) == 1
     and ([$networkResources[] | select(.type == "Microsoft.Network/privateDnsZones")] | length) == 1
-    and ([$networkResources[] | select(.type == "Microsoft.Network/privateEndpoints")] | length) == 3
-    and ([$networkResources[] | select(.type == "Microsoft.Network/privateEndpoints/privateDnsZoneGroups")] | length) == 3
+    and ([$networkResources[] | select(.type == "Microsoft.Network/privateEndpoints")] | length) == 2
+    and ([$networkResources[] | select(.type == "Microsoft.Network/privateEndpoints/privateDnsZoneGroups")] | length) == 2
     and ([$networkResources[] | select((.type | ascii_downcase) == "microsoft.insights/privatelinkscopes")] | length) == 1
     and ([$networkResources[] | select(.type == "Microsoft.Insights/privateLinkScopes/scopedResources")] | length) == 2
 ' "$compiled_template" >/dev/null
 
-printf 'PASS azd HMAC and networking values reach Bicep, private mode wires the Function and service access, and optional tags reach all seven tagged modules\n'
+printf 'PASS azd values reach Bicep, deterministic environment naming is reused, private profiles wire service access, and optional tags reach all seven tagged modules\n'

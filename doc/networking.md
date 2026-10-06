@@ -2,9 +2,11 @@
 
 ## Status
 
-Public and private infrastructure modes are implemented in `infra/main.bicep`, `infra/modules/private-networking.bicep`, and the deployment-preparation scripts. Public remains the default.
+Public and private infrastructure profiles are implemented in `infra/main.bicep`, `infra/modules/private-networking.bicep`, and the deployment-preparation scripts. Public remains the default.
 
-Private mode supports a KeyVaultSync-managed VNet or existing enterprise subnets, private DNS zones, and Azure Monitor Private Link Scope. Managed mode requires an explicit, approved list of source and target vault resource IDs; deployment does not infer or silently approve a changed vault set.
+The private profiles support either a KeyVaultSync-managed VNet or existing enterprise subnets, private DNS zones, and Azure Monitor Private Link Scope.
+
+Both private profiles cover only KeyVaultSync-owned components: the Function App, its storage account, and monitoring ingestion. KeyVaultSync never creates private endpoints, private DNS zones, or network changes for participating source and target Key Vaults. Those vaults already exist in customer infrastructure, and their reachability from the Function's outbound path remains the network owner's responsibility.
 
 ## Goals
 
@@ -13,8 +15,8 @@ The networking feature must:
 - preserve the current public deployment as a supported option;
 - offer one enterprise-private deployment option through `azd up`;
 - support a minimal dedicated VNet or an existing enterprise VNet;
-- reach private source and target Key Vault data-plane endpoints;
-- make Function storage and Azure Monitor ingestion private in private mode;
+- rely on customer-provided reachability to source and target Key Vault data-plane endpoints;
+- make Function storage and Azure Monitor ingestion private in either private profile;
 - keep participating Key Vault lifecycle and network-policy ownership outside KeyVaultSync;
 - avoid deploying a firewall, NAT Gateway, VPN, bastion, or general hub-and-spoke platform;
 - fail before package deployment when required private connectivity is incomplete.
@@ -30,8 +32,7 @@ flowchart TD
     Mode -->|Private| Source{Network source}
     Source -->|Create| Managed["Create a minimal dedicated VNet<br/>and private-link resources"]
     Source -->|Existing| Existing["Use supplied enterprise subnets,<br/>DNS, and Azure Monitor Private Link"]
-    Managed --> Vaults["Supply approved source and target<br/>vault resource IDs"]
-    Vaults --> Validate["Validate topology, DNS,<br/>endpoint approval, and deployer access"]
+    Managed --> Validate["Validate topology, DNS,<br/>and deployer access"]
     Existing --> Validate
     Validate --> Ready{All required paths ready?}
     Ready -->|No| Stop["Stop before package deployment"]
@@ -55,12 +56,11 @@ KeyVaultSync creates only the network resources required by this deployment:
 - one Flex Consumption integration subnet;
 - one separate private-endpoint subnet;
 - private DNS zones and VNet links;
-- private endpoints for mapped Key Vaults;
 - private endpoints for Function storage;
 - an Azure Monitor Private Link Scope and endpoint;
 - Function outbound VNet integration.
 
-The template does not create or modify source or target vaults. It creates private endpoint resources that reference explicitly confirmed vault resource IDs.
+The template does not create or modify source or target vaults, and it does not create private endpoints or private DNS zones for them.
 
 ### Private with an existing VNet
 
@@ -84,16 +84,14 @@ flowchart LR
             Function["Flex Consumption<br/>Function App"]
         end
         subgraph Endpoints["Private endpoint subnet"]
-            VaultPE["Key Vault<br/>private endpoints"]
             StoragePE["Storage<br/>private endpoints"]
             MonitorPE["Azure Monitor<br/>private endpoint"]
         end
     end
 
-    Function --> VaultPE
     Function --> StoragePE
     Function --> MonitorPE
-    VaultPE --> Vaults["Existing source and target vaults"]
+    Function -->|Customer-provided network path| Vaults["Existing source and target vaults"]
     StoragePE --> Storage["Host, deployment, state,<br/>and report storage"]
     MonitorPE --> Monitor["Application Insights<br/>and Log Analytics"]
 ```
@@ -130,19 +128,19 @@ The KeyVaultSync template does not create NSGs, UDRs, Azure Firewall rules, NAT 
 sequenceDiagram
     participant Function as KeyVaultSync Function
     participant DNS as Enterprise/private DNS
-    participant VaultPE as Key Vault private endpoint
+    participant Vaults as Source and target vaults
     participant StoragePE as Storage private endpoint
     participant MonitorPE as Azure Monitor private endpoint
 
     Function->>DNS: Resolve source.vault.azure.net
-    DNS-->>Function: Private endpoint address
-    Function->>VaultPE: Read exact source object version
-    VaultPE-->>Function: Key Vault response
+    DNS-->>Function: Customer-provided address
+    Function->>Vaults: Read exact source object version
+    Vaults-->>Function: Key Vault response
 
     Function->>DNS: Resolve target.vault.azure.net
-    DNS-->>Function: Private endpoint address
-    Function->>VaultPE: Guarded target mutation and verification
-    VaultPE-->>Function: Exact target result
+    DNS-->>Function: Customer-provided address
+    Function->>Vaults: Guarded target mutation and verification
+    Vaults-->>Function: Exact target result
 
     Function->>DNS: Resolve storage service endpoint
     DNS-->>Function: Private endpoint address
@@ -153,31 +151,20 @@ sequenceDiagram
     Function->>MonitorPE: Export value-free logs, traces, and metrics
 ```
 
-Azure Resource Manager and Microsoft Entra ID remain control-plane dependencies. Private mode does not create Resource Manager Private Link or private identity endpoints. Enterprise egress controls must continue to permit the required Azure control-plane and identity traffic.
+Azure Resource Manager and Microsoft Entra ID remain control-plane dependencies. The private profiles do not create Resource Manager Private Link or private identity endpoints. Enterprise egress controls must continue to permit the required Azure control-plane and identity traffic.
 
 Route-all is not enabled automatically. Forcing all outbound traffic through an enterprise firewall can break Entra ID, Resource Manager, Functions platform, deployment, or monitoring access unless the enterprise explicitly provides the required routes and rules.
 
-## Key Vault Private Endpoints
+## Participating Key Vault Reachability
 
-Private mode needs one reachable private endpoint for each unique mapped source or target vault whose public network access is disabled.
+KeyVaultSync never creates private endpoints, private DNS zones, firewall changes, or any other network resource for source or target vaults. Those vaults already exist in customer infrastructure, and their reachability is owned by the network team that manages them.
 
-The endpoint configuration uses:
+When a participating vault restricts public network access, the enterprise must provide the path itself, for example through its own private endpoints and private DNS zones, service endpoints, or firewall allowances for the Function's outbound addresses.
 
-- resource type `Microsoft.KeyVault/vaults`;
-- private-link group ID `vault`;
-- private DNS zone `privatelink.vaultcore.azure.net`.
+KeyVaultSync does not disable public access on participating vaults. That decision remains with each vault owner. The preparation hook does not change vault tags, authorization mode, firewall rules, public network access, objects, or RBAC.
 
-Set `KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS` to the comma- or semicolon-separated source and target vault resource IDs approved for new private endpoints. Managed-network mode requires at least one ID. Existing-network mode permits an empty list when enterprise-owned endpoints already provide the required path; supply IDs only for additional KeyVaultSync-owned endpoints.
-
-The preparation hook does not discover or automatically approve endpoint targets. This keeps the private endpoint scope explicit and prevents a newly tagged vault from changing network infrastructure during an unattended deployment. The hook does not change vault tags, authorization mode, firewall rules, public network access, objects, or RBAC.
-
-### Cross-subscription approval
-
-The private endpoint resource can reside in the deployment VNet while referencing a vault in another configured subscription. Automatic approval depends on the deployment principal's permissions on that vault. Without sufficient permission, the private endpoint connection can remain `Pending`.
-
-Provisioning must report `Pending`, `Rejected`, or `Disconnected` connections explicitly. A provisioned endpoint resource is not proof that the Function can reach the vault.
-
-KeyVaultSync does not disable public access on participating vaults. That decision remains with each vault owner.
+> [!WARNING]
+> Provisioning can succeed while synchronization fails at runtime. If the Function's outbound path to a participating vault is not permitted by DNS, firewall, or routing policy, discovery and synchronization report connectivity failures even though every KeyVaultSync resource deployed successfully.
 
 ## Private Function Storage
 
@@ -190,7 +177,7 @@ The shared storage account contains:
 - deletion approvals;
 - durable plans and run reports.
 
-Private mode uses private endpoints for:
+The private profiles use private endpoints for:
 
 | Storage service | Private DNS zone |
 |---|---|
@@ -216,7 +203,7 @@ The deployment must not temporarily expose storage publicly to make package publ
 
 Private Application Insights ingestion uses Azure Monitor Private Link Scope rather than a direct Application Insights private endpoint.
 
-Private mode associates:
+The private profiles associate:
 
 - the Application Insights component;
 - its Log Analytics workspace;
@@ -231,7 +218,7 @@ The monitoring private endpoint uses the Azure Monitor DNS zones required by the
 - `privatelink.agentsvc.azure-automation.net`;
 - `privatelink.blob.core.windows.net`.
 
-Managed-network mode creates a dedicated scope, endpoint, zones, and VNet links. Existing-network mode reuses the enterprise scope and DNS architecture.
+The managed-private profile creates a dedicated scope, endpoint, zones, and VNet links. The existing-private profile reuses the enterprise scope and DNS architecture.
 
 Private monitoring must preserve managed-identity telemetry authentication. Connection strings remain routing configuration and must not replace Entra authorization with local authentication.
 
@@ -239,20 +226,23 @@ Private monitoring must preserve managed-identity telemetry authentication. Conn
 
 KeyVaultSync has a timer trigger and no synchronization HTTP endpoint.
 
-Private mode should disable public Function ingress. It does not need a Function App private endpoint unless a future operational requirement introduces an inbound application endpoint. Avoiding an unused Function private endpoint reduces DNS, address consumption, and deployment complexity.
+The private profiles disable public Function ingress. They do not need a Function App private endpoint unless a future operational requirement introduces an inbound application endpoint. Avoiding an unused Function private endpoint reduces DNS, address consumption, and deployment complexity.
 
 Azure management operations are separate from application ingress. Disabling public application ingress does not eliminate the need for authorized management-plane deployment access.
 
 ## `azd up` Inputs
 
-The preparation hook should persist an explicit network selection:
+The preparation hook persists one explicit network profile:
 
 ```text
-KEYVAULTSYNC_NETWORK_MODE=public|private
-KEYVAULTSYNC_NETWORK_SOURCE=managed|existing
+KEYVAULTSYNC_NETWORK_PROFILE=public|private-managed|private-existing
 ```
 
-Existing environments reuse the saved selection. Changing it requires explicit confirmation because the change can add or remove VNet integration and private endpoints.
+Public is the interactive and noninteractive default. Existing environments
+reuse their saved profile. When the profile is missing, the hook translates a
+retired mode/source pair once and persists the equivalent profile. Changing a
+profile can add or remove VNet integration and private endpoints and must be
+reviewed with `azd provision --preview`.
 
 ### Managed-network inputs
 
@@ -264,12 +254,15 @@ Function integration subnet:   10.42.0.0/27
 Private endpoint subnet:       10.42.0.32/27
 ```
 
-The operator can accept the defaults or supply approved nonoverlapping ranges. Required and optional azd values are:
+Interactive choices use numbered menus; pressing Enter accepts option 1, the
+displayed default. The preprovision hook shows the complete topology and offers
+one choice to accept all recommended values. It asks for the VNet prefix, both
+subnet names, and both subnet prefixes only when customization is selected.
+Every resolved value is persisted in the active azd environment before Bicep runs.
+The ranges must be approved and nonoverlapping. Required and optional azd values are:
 
 ```text
-KEYVAULTSYNC_NETWORK_MODE=private
-KEYVAULTSYNC_NETWORK_SOURCE=managed
-KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS=<source-id>,<target-id>
+KEYVAULTSYNC_NETWORK_PROFILE=private-managed
 
 KEYVAULTSYNC_MANAGED_VNET_NAME=
 KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX=10.42.0.0/24
@@ -279,8 +272,13 @@ KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME=snet-private-endpoints
 KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX=10.42.0.32/27
 ```
 
-The VNet name is generated when omitted. The vault list is mandatory because the dedicated VNet does not inherit enterprise vault connectivity.
-For an interactive new environment, the preparation hook asks for public/private mode, managed/existing source, and this approved vault list. Noninteractive deployments must preconfigure the same values.
+The VNet name is generated when omitted. The managed VNet carries only
+KeyVaultSync-owned private endpoints; reachability to participating vaults stays
+with the customer network team.
+For an interactive new environment, the preparation hook asks for one profile
+and then whether to accept or customize the managed topology. Noninteractive
+deployments set `KEYVAULTSYNC_NETWORK_PROFILE=private-managed`; managed address
+values may continue to use the documented Bicep defaults.
 
 ### Existing-network inputs
 
@@ -294,23 +292,23 @@ The existing path requires:
 The VNet ID is derived from the subnet IDs. The two subnet IDs must not resolve to the same subnet.
 
 ```text
-KEYVAULTSYNC_NETWORK_MODE=private
-KEYVAULTSYNC_NETWORK_SOURCE=existing
+KEYVAULTSYNC_NETWORK_PROFILE=private-existing
 KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID=<resource-id>
-KEYVAULTSYNC_EXISTING_KEYVAULT_PRIVATE_DNS_ZONE_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID=<resource-id>
 KEYVAULTSYNC_EXISTING_AMPLS_ID=<resource-id>
-KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS=
 ```
 
-Leave the vault list empty only when the enterprise network already exposes every participating vault through approved private endpoints and DNS. Otherwise provide the IDs for endpoints this deployment should own.
+For an interactive deployment, every missing existing-network resource ID is
+prompted for and persisted before provisioning. The hook never asks for
+participating vault resource IDs or a Key Vault private DNS zone, because
+KeyVaultSync does not own vault connectivity.
 
 Noninteractive deployment must provide every required value through protected pipeline configuration. It must not select defaults or discover-and-approve new endpoint targets without an explicit persisted configuration.
 
@@ -330,7 +328,6 @@ sequenceDiagram
         Prepare->>Prepare: Preserve current network behavior
     else Private managed network
         Prepare->>Operator: Accept or override minimal address ranges
-        Prepare->>Operator: Require exact approved vault resource IDs
     else Private existing network
         Prepare->>ARM: Validate supplied subnets, DNS, and AMPLS
     end
@@ -351,10 +348,10 @@ sequenceDiagram
 | Function integration | KeyVaultSync | KeyVaultSync attaches to supplied subnet |
 | VNet and subnets | KeyVaultSync | Enterprise |
 | KeyVaultSync storage endpoints | KeyVaultSync | KeyVaultSync, in supplied endpoint subnet |
-| Key Vault endpoint resources | KeyVaultSync for confirmed vault IDs | KeyVaultSync or existing enterprise endpoints, as declared |
+| Participating vault connectivity | Customer network owner | Customer network owner |
 | Participating vault lifecycle | Vault owner | Vault owner |
 | Vault public access/firewall | Vault owner | Vault owner |
-| Private DNS zones and links | KeyVaultSync | Enterprise |
+| KeyVaultSync storage and monitoring private DNS zones and links | KeyVaultSync | Enterprise |
 | Azure Monitor Private Link Scope | KeyVaultSync | Enterprise |
 | Firewall, NAT, VPN, and UDRs | Not deployed | Enterprise |
 
@@ -366,8 +363,7 @@ Deleting a KeyVaultSync environment must never delete a participating vault. In 
 
 The preparation hook validates:
 
-- supported network mode and source;
-- presence of the approved vault list for a managed VNet;
+- a supported network profile;
 - two distinct subnet IDs and all required DNS/AMPLS IDs for an existing network.
 
 ARM deployment then validates address prefixes, subnet delegation and suitability, region compatibility, referenced resources, and permissions needed to create endpoints and associations.
@@ -377,7 +373,6 @@ ARM deployment then validates address prefixes, subnet delegation and suitabilit
 Validate:
 
 - storage private endpoint connection state;
-- Key Vault endpoint connection state;
 - Azure Monitor endpoint connection state;
 - Function VNet integration;
 - private DNS zone links or enterprise DNS readiness;
@@ -389,21 +384,20 @@ Validate:
 Structured telemetry and durable run reports should distinguish:
 
 - DNS resolution failure;
-- private endpoint connection not approved;
 - network timeout;
 - TLS or service authentication failure;
 - RBAC authorization failure;
 - ordinary Key Vault object conflict.
 
-Do not treat all `403`, timeout, or name-resolution failures as equivalent. A private endpoint existing in ARM is not proof of DNS resolution or application connectivity.
+Do not treat all `403`, timeout, or name-resolution failures as equivalent. A KeyVaultSync-owned private endpoint existing in ARM is not proof of DNS resolution or application connectivity. Participating vault connectivity is diagnosed as an external customer-network dependency.
 
 ## Operational Diagnostics
 
-For a private vault:
+For a participating vault:
 
 1. resolve `<vault-name>.vault.azure.net` from the Function-integrated network;
-2. confirm that it resolves through `privatelink.vaultcore.azure.net` to the expected private address;
-3. confirm the endpoint connection is `Approved`;
+2. confirm that the returned address and route match the customer-owned network design;
+3. confirm the customer firewall or private endpoint configuration permits the Function's outbound path;
 4. confirm the runtime identity has the required data-plane and authorization roles;
 5. correlate Function dependency telemetry with the durable run report.
 
@@ -427,9 +421,8 @@ For private monitoring:
 
 - Private Link does not replace Azure RBAC.
 - Public DNS visibility of a Key Vault name does not mean its data plane is publicly accessible.
-- Private endpoint IP addresses, subnet IDs, vault resource IDs, and DNS topology are operational inventory and should remain in restricted state and reports.
+- Private endpoint IP addresses, subnet IDs, and DNS topology are operational inventory and should remain in restricted state and reports.
 - Never put subscription IDs, tenant IDs, customer names, resource inventories, or network diagrams containing real addresses into committed examples.
-- Do not automatically approve a changed discovered vault set during unattended deployment.
 - Do not temporarily enable public network access as an automatic deployment fallback.
 - Do not report deployment success when an endpoint is pending or DNS is unresolved.
 

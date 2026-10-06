@@ -49,9 +49,6 @@ param existingQueuePrivateDnsZoneResourceId string
 @description('Existing private DNS zone resource ID for Storage Table.')
 param existingTablePrivateDnsZoneResourceId string
 
-@description('Existing private DNS zone resource ID for Key Vault.')
-param existingKeyVaultPrivateDnsZoneResourceId string
-
 @description('Existing private DNS zone resource ID for Azure Monitor.')
 param existingMonitorPrivateDnsZoneResourceId string
 
@@ -76,9 +73,6 @@ param logAnalyticsWorkspaceResourceId string
 @description('Application Insights component resource ID.')
 param applicationInsightsResourceId string
 
-@description('Existing source and target Key Vault resource IDs that need KeyVaultSync-owned private endpoints.')
-param keyVaultResourceIds array = []
-
 var useManagedNetwork = networkSource == 'managed'
 var useExistingNetwork = networkSource == 'existing'
 var existingSubnetIdsAreDistinct = existingFunctionIntegrationSubnetResourceId != existingPrivateEndpointSubnetResourceId
@@ -90,7 +84,6 @@ var existingPrivateDnsZoneResourceIds = [
   existingBlobPrivateDnsZoneResourceId
   existingQueuePrivateDnsZoneResourceId
   existingTablePrivateDnsZoneResourceId
-  existingKeyVaultPrivateDnsZoneResourceId
   existingMonitorPrivateDnsZoneResourceId
   existingOmsPrivateDnsZoneResourceId
   existingOdsPrivateDnsZoneResourceId
@@ -98,22 +91,13 @@ var existingPrivateDnsZoneResourceIds = [
 ]
 var existingInputsComplete = !empty(existingFunctionIntegrationSubnetResourceId) && !empty(existingPrivateEndpointSubnetResourceId) && existingSubnetIdsAreDistinct && !contains(existingPrivateDnsZoneResourceIds, '') && existingAzureMonitorPrivateLinkScopeIdValid
 var validatedExistingInputs = useExistingNetwork && !existingInputsComplete
-  ? fail('Existing private networking requires two distinct subnet IDs, all eight private DNS zone IDs, and an Azure Monitor Private Link Scope ID.')
+  ? fail('Existing private networking requires two distinct subnet IDs, all seven private DNS zone IDs, and an Azure Monitor Private Link Scope ID.')
   : true
-var invalidKeyVaultResourceIds = filter(
-  keyVaultResourceIds,
-  keyVaultResourceId => !contains(toLower(keyVaultResourceId), '/providers/microsoft.keyvault/vaults/'))
-var validatedKeyVaultResourceIds = useManagedNetwork && empty(keyVaultResourceIds)
-  ? fail('Managed private networking requires at least one source or target Key Vault resource ID in privateKeyVaultResourceIds.')
-  : (!empty(invalidKeyVaultResourceIds)
-      ? fail('Every privateKeyVaultResourceIds entry must be a Microsoft.KeyVault/vaults resource ID.')
-      : keyVaultResourceIds)
 
 var privateDnsZoneNames = [
   'privatelink.blob.${environment().suffixes.storage}'
   'privatelink.queue.${environment().suffixes.storage}'
   'privatelink.table.${environment().suffixes.storage}'
-  'privatelink.vaultcore.azure.net'
   'privatelink.monitor.azure.com'
   'privatelink.oms.opinsights.azure.com'
   'privatelink.ods.opinsights.azure.com'
@@ -252,46 +236,6 @@ resource storagePrivateDnsZoneGroups 'Microsoft.Network/privateEndpoints/private
   }
 }]
 
-resource keyVaultPrivateEndpoints 'Microsoft.Network/privateEndpoints@2024-07-01' = [for keyVaultResourceId in validatedKeyVaultResourceIds: {
-  name: 'pe-kvs-vault-${take(uniqueString(keyVaultResourceId), 8)}'
-  location: location
-  tags: tags
-  properties: {
-    subnet: {
-      id: resolvedPrivateEndpointSubnetResourceId
-    }
-    privateLinkServiceConnections: [
-      {
-        name: 'vault'
-        properties: {
-          privateLinkServiceId: keyVaultResourceId
-          groupIds: [
-            'vault'
-          ]
-        }
-      }
-    ]
-  }
-  dependsOn: [
-    managedVirtualNetwork
-  ]
-}]
-
-resource keyVaultPrivateDnsZoneGroups 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-07-01' = [for (keyVaultResourceId, vaultIndex) in validatedKeyVaultResourceIds: {
-  name: 'default'
-  parent: keyVaultPrivateEndpoints[vaultIndex]
-  properties: {
-    privateDnsZoneConfigs: [
-      {
-        name: 'vault'
-        properties: {
-          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[3]
-        }
-      }
-    ]
-  }
-}]
-
 resource managedAzureMonitorPrivateLinkScope 'Microsoft.Insights/privateLinkScopes@2021-07-01-preview' = if (useManagedNetwork) {
   name: 'ampls-keyvaultsync-${nameToken}'
   location: 'global'
@@ -383,25 +327,25 @@ resource azureMonitorPrivateDnsZoneGroup 'Microsoft.Network/privateEndpoints/pri
       {
         name: 'monitor'
         properties: {
-          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[4]
+          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[3]
         }
       }
       {
         name: 'oms'
         properties: {
-          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[5]
+          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[4]
         }
       }
       {
         name: 'ods'
         properties: {
-          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[6]
+          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[5]
         }
       }
       {
         name: 'agentsvc'
         properties: {
-          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[7]
+          privateDnsZoneId: resolvedPrivateDnsZoneResourceIds[6]
         }
       }
       {

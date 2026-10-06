@@ -62,27 +62,21 @@ param logAnalyticsRetentionDays int = 30
 @maxValue(1000)
 param maximumInstanceCount int = 10
 
-@description('Flex Consumption instance memory in MB. Supported sizes are 512, 2048, and 4096; the default is 2048.')
+@description('Flex Consumption instance memory in MB. Supported sizes are 512, 2048, and 4096; the default is 4096. Confirm the selected size is available for Flex Consumption in the target region before deploying.')
 @allowed([
   512
   2048
   4096
 ])
-param instanceMemoryMB int = 2048
+param instanceMemoryMB int = 4096
 
 @allowed([
   'public'
-  'private'
+  'private-managed'
+  'private-existing'
 ])
-@description('Network posture for KeyVaultSync-managed resources. Public preserves service endpoints; private enables VNet integration and private endpoints.')
-param networkMode string = 'public'
-
-@allowed([
-  'managed'
-  'existing'
-])
-@description('Private network ownership model. Managed creates a dedicated VNet/DNS/AMPLS; existing attaches to supplied enterprise resources.')
-param networkSource string = 'managed'
+@description('Networking profile for KeyVaultSync-managed resources. Public preserves service endpoints; private-managed creates dedicated networking; private-existing attaches to supplied enterprise resources.')
+param networkProfile string = 'public'
 
 @description('Optional managed VNet name. Empty generates a CAF-style name.')
 @maxLength(64)
@@ -103,67 +97,52 @@ param managedPrivateEndpointSubnetName string = 'snet-private-endpoints'
 @description('Address prefix for the managed private endpoint subnet.')
 param managedPrivateEndpointSubnetPrefix string = '10.42.0.32/27'
 
-@description('Existing Flex Consumption integration subnet resource ID. Required for private/existing mode.')
+@description('Existing Flex Consumption integration subnet resource ID. Required for the private-existing profile.')
 param existingFunctionIntegrationSubnetResourceId string = ''
 
-@description('Existing private endpoint subnet resource ID. Required for private/existing mode and must differ from the integration subnet.')
+@description('Existing private endpoint subnet resource ID. Required for the private-existing profile and must differ from the integration subnet.')
 param existingPrivateEndpointSubnetResourceId string = ''
 
-@description('Existing Storage Blob private DNS zone resource ID. Required for private/existing mode.')
+@description('Existing Storage Blob private DNS zone resource ID. Required for the private-existing profile.')
 param existingBlobPrivateDnsZoneResourceId string = ''
 
-@description('Existing Storage Queue private DNS zone resource ID. Required for private/existing mode.')
+@description('Existing Storage Queue private DNS zone resource ID. Required for the private-existing profile.')
 param existingQueuePrivateDnsZoneResourceId string = ''
 
-@description('Existing Storage Table private DNS zone resource ID. Required for private/existing mode.')
+@description('Existing Storage Table private DNS zone resource ID. Required for the private-existing profile.')
 param existingTablePrivateDnsZoneResourceId string = ''
 
-@description('Existing Key Vault private DNS zone resource ID. Required for private/existing mode.')
-param existingKeyVaultPrivateDnsZoneResourceId string = ''
-
-@description('Existing Azure Monitor private DNS zone resource ID. Required for private/existing mode.')
+@description('Existing Azure Monitor private DNS zone resource ID. Required for the private-existing profile.')
 param existingMonitorPrivateDnsZoneResourceId string = ''
 
-@description('Existing Log Analytics OMS private DNS zone resource ID. Required for private/existing mode.')
+@description('Existing Log Analytics OMS private DNS zone resource ID. Required for the private-existing profile.')
 param existingOmsPrivateDnsZoneResourceId string = ''
 
-@description('Existing Log Analytics ODS private DNS zone resource ID. Required for private/existing mode.')
+@description('Existing Log Analytics ODS private DNS zone resource ID. Required for the private-existing profile.')
 param existingOdsPrivateDnsZoneResourceId string = ''
 
-@description('Existing Azure Automation agent-service private DNS zone resource ID. Required for private/existing mode.')
+@description('Existing Azure Automation agent-service private DNS zone resource ID. Required for the private-existing profile.')
 param existingAgentServicePrivateDnsZoneResourceId string = ''
 
-@description('Existing Azure Monitor Private Link Scope resource ID. Required for private/existing mode.')
+@description('Existing Azure Monitor Private Link Scope resource ID. Required for the private-existing profile.')
 param existingAzureMonitorPrivateLinkScopeResourceId string = ''
 
-@description('Comma- or semicolon-separated existing source and target Key Vault resource IDs for which private endpoints are created in private mode.')
-param privateKeyVaultResourceIds string = ''
-
-// CAF uses type/workload/environment components. Filter before truncation so arbitrary azd
-// environment labels cannot introduce invalid storage/DNS characters. The full label seeds uniqueness.
+// One deterministic token keeps generated names stable for a subscription, environment, and location.
 var lowerEnvironmentName = toLower(environmentName)
-var environmentCharacters = [for characterIndex in range(0, length(lowerEnvironmentName)): substring(lowerEnvironmentName, characterIndex, 1)]
-var normalizedEnvironmentName = join(filter(environmentCharacters, character => contains('abcdefghijklmnopqrstuvwxyz0123456789', character)), '')
-var environmentToken = take(empty(normalizedEnvironmentName) ? 'env' : normalizedEnvironmentName, 8)
-var storageEnvironmentToken = take(environmentToken, 4)
-var nameSuffix = uniqueString(subscription().id, resourceGroup().id, environmentName)
-var resolvedFunctionAppName = empty(functionAppName) ? 'func-keyvaultsync-${environmentToken}-${nameSuffix}' : functionAppName
-var resolvedFunctionPlanName = empty(functionPlanName) ? 'asp-keyvaultsync-${environmentToken}-${nameSuffix}' : functionPlanName
-// Retain the former Function-storage default so existing environments adopt it in place.
-// st + kvs (KeyVaultSync) + fn + environment (<=4) + hash (13) fits 24 characters.
-var resolvedFunctionStorageName = empty(functionStorageAccountName) ? 'stkvsfn${storageEnvironmentToken}${nameSuffix}' : toLower(functionStorageAccountName)
-var resolvedLogAnalyticsName = empty(logAnalyticsWorkspaceName) ? 'log-keyvaultsync-${environmentToken}-${nameSuffix}' : logAnalyticsWorkspaceName
-var resolvedApplicationInsightsName = empty(applicationInsightsName) ? 'appi-keyvaultsync-${environmentToken}-${nameSuffix}' : applicationInsightsName
-var resolvedManagedIdentityName = empty(managedIdentityName) ? 'id-keyvaultsync-${environmentToken}-${nameSuffix}' : managedIdentityName
-var resolvedManagedVirtualNetworkName = empty(managedVirtualNetworkName) ? 'vnet-keyvaultsync-${environmentToken}-${nameSuffix}' : managedVirtualNetworkName
+var environmentUniqueToken = uniqueString(subscription().id, lowerEnvironmentName, toLower(location))
+var resolvedFunctionAppName = empty(functionAppName) ? 'func-keyvaultsync-${environmentUniqueToken}' : functionAppName
+var resolvedFunctionPlanName = empty(functionPlanName) ? 'asp-keyvaultsync-${environmentUniqueToken}' : functionPlanName
+var resolvedFunctionStorageName = empty(functionStorageAccountName) ? 'stkvsfn${environmentUniqueToken}' : toLower(functionStorageAccountName)
+var resolvedLogAnalyticsName = empty(logAnalyticsWorkspaceName) ? 'log-keyvaultsync-${environmentUniqueToken}' : logAnalyticsWorkspaceName
+var resolvedApplicationInsightsName = empty(applicationInsightsName) ? 'appi-keyvaultsync-${environmentUniqueToken}' : applicationInsightsName
+var resolvedManagedIdentityName = empty(managedIdentityName) ? 'id-keyvaultsync-${environmentUniqueToken}' : managedIdentityName
+var resolvedManagedVirtualNetworkName = empty(managedVirtualNetworkName) ? 'vnet-keyvaultsync-${environmentUniqueToken}' : managedVirtualNetworkName
 var runtimeIdentityResourceId = resourceId('Microsoft.ManagedIdentity/userAssignedIdentities', resolvedManagedIdentityName)
 var discoverySubscriptionIds = filter(
   map(split(replace(keyVaultSyncSubscriptions, ';', ','), ','), subscriptionId => trim(subscriptionId)),
   subscriptionId => !empty(subscriptionId))
-var isPrivateNetwork = networkMode == 'private'
-var privateKeyVaultIds = filter(
-  map(split(replace(privateKeyVaultResourceIds, ';', ','), ','), keyVaultResourceId => trim(keyVaultResourceId)),
-  keyVaultResourceId => !empty(keyVaultResourceId))
+var isPrivateNetwork = networkProfile != 'public'
+var privateNetworkSource = networkProfile == 'private-managed' ? 'managed' : 'existing'
 
 var baseResourceTags = {
   workload: 'KeyVaultSync'
@@ -217,7 +196,7 @@ module runtimeIdentity 'br/public:avm/res/managed-identity/user-assigned-identit
 }
 
 // One account owns replaceable host/package artifacts and durable KeyVaultSync state/history.
-// Do not consume AVM key/connection-string outputs. Private mode permits only private endpoints.
+// Do not consume AVM key/connection-string outputs. Private profiles permit only private endpoints.
 module functionStorage 'br/public:avm/res/storage/storage-account:0.33.1' = {
   params: {
     name: resolvedFunctionStorageName
@@ -338,8 +317,8 @@ module privateNetworking './modules/private-networking.bicep' = if (isPrivateNet
   name: 'private-networking'
   params: {
     location: location
-    networkSource: networkSource
-    nameToken: take(nameSuffix, 8)
+    networkSource: privateNetworkSource
+    nameToken: take(environmentUniqueToken, 8)
     tags: resourceTags
     managedVirtualNetworkName: resolvedManagedVirtualNetworkName
     managedVirtualNetworkAddressPrefix: managedVirtualNetworkAddressPrefix
@@ -352,7 +331,6 @@ module privateNetworking './modules/private-networking.bicep' = if (isPrivateNet
     existingBlobPrivateDnsZoneResourceId: existingBlobPrivateDnsZoneResourceId
     existingQueuePrivateDnsZoneResourceId: existingQueuePrivateDnsZoneResourceId
     existingTablePrivateDnsZoneResourceId: existingTablePrivateDnsZoneResourceId
-    existingKeyVaultPrivateDnsZoneResourceId: existingKeyVaultPrivateDnsZoneResourceId
     existingMonitorPrivateDnsZoneResourceId: existingMonitorPrivateDnsZoneResourceId
     existingOmsPrivateDnsZoneResourceId: existingOmsPrivateDnsZoneResourceId
     existingOdsPrivateDnsZoneResourceId: existingOdsPrivateDnsZoneResourceId
@@ -361,8 +339,11 @@ module privateNetworking './modules/private-networking.bicep' = if (isPrivateNet
     storageAccountResourceId: functionStorageScope.id
     logAnalyticsWorkspaceResourceId: logAnalytics.outputs.resourceId
     applicationInsightsResourceId: applicationInsightsScope.id
-    keyVaultResourceIds: privateKeyVaultIds
   }
+  dependsOn: [
+    functionStorage
+    applicationInsights
+  ]
 }
 
 // Flex owns runtime selection. Remove legacy connection selectors as well so an exact connection
@@ -537,7 +518,9 @@ module deploymentPrincipalOwner 'br/public:avm/res/authorization/role-assignment
 }
 
 module subscriptionReaders 'br/public:avm/res/authorization/role-assignment/sub-scope:0.1.1' = [for discoverySubscriptionId in discoverySubscriptionIds: {
-  name: 'subscription-reader-${take(uniqueString(discoverySubscriptionId), 8)}'
+  // Subscription-scope deployment names are immutable to their original location. Include the
+  // reusable environment token and target subscription to avoid cross-region/environment reuse.
+  name: 'subscription-reader-${take(uniqueString(discoverySubscriptionId, environmentUniqueToken), 8)}'
   scope: subscription(discoverySubscriptionId)
   params: {
     name: guid(discoverySubscriptionId, runtimeIdentity.outputs.principalId, readerRoleDefinitionId)
@@ -572,7 +555,7 @@ output KEYVAULTSYNC_STORAGE_ACCOUNT_URI string = functionStorage.outputs.service
 
 @description('Non-secret central identity resource ID for the separate, approval-gated vault-access script. Not a runtime setting.')
 output KEYVAULTSYNC_IDENTITY_RESOURCE_ID string = runtimeIdentity.outputs.resourceId
-@description('Configured networking posture.')
-output KEYVAULTSYNC_NETWORK_MODE string = networkMode
-@description('Flex integration subnet resource ID in private mode; empty in public mode.')
+@description('Configured networking profile.')
+output KEYVAULTSYNC_NETWORK_PROFILE string = networkProfile
+@description('Flex integration subnet resource ID for either private profile; empty for the public profile.')
 output KEYVAULTSYNC_FUNCTION_INTEGRATION_SUBNET_ID string = isPrivateNetwork ? privateNetworking!.outputs.functionIntegrationSubnetResourceId : ''

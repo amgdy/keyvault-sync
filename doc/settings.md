@@ -33,7 +33,7 @@ The retired source-side `sync-vault-id` tag does not enable discovery.
 
 ## HMAC Key Handling
 
-The shared azd deployment-preparation hook runs before provisioning and before every package deployment. If the active environment has no key, an interactive run asks whether to generate a cryptographically random 256-bit key or supply an existing Base64 key. Non-interactive runs must receive the key from protected pipeline configuration.
+The shared azd deployment-preparation hook runs before provisioning and before every package deployment. If the active environment has no key, an interactive run shows one hidden prompt: paste an existing Base64-encoded 256-bit key, or press Enter to generate one cryptographically. The key is saved once; the later predeploy invocation reuses it without prompting. Non-interactive runs must receive the key from protected pipeline configuration.
 
 When a valid environment key already exists, the hook reuses it without displaying or rotating it. The ignored `.azure/<environment>/.env` contains the plaintext value; protect it and backups, do not enable shell tracing, and do not copy it to tickets, logs, or telemetry.
 

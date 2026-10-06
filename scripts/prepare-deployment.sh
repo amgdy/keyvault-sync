@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Prepare protected azd configuration before provisioning or package deployment.
-# Provision phase: validate the mapping subscriptions, establish the stable HMAC key,
-# and optionally configure one deployment tag. Deploy phase: preserve the HMAC key and
-# verify that Flex deployment storage is reachable. The HMAC value is never displayed.
+# Provision phase: validate subscriptions, establish CAF-style resource-group naming,
+# collect and persist network configuration, establish the stable HMAC key, and optionally
+# configure one deployment tag. Deploy phase: preserve the HMAC key and verify that Flex
+# deployment storage is reachable.
+# The HMAC value is never displayed.
 set -euo pipefail
 
 # Validate the azd hook phase before doing any configuration work.
@@ -21,20 +23,47 @@ fail() {
     exit 1
 }
 
-# Ask an interactive question whose empty response means yes.
-confirm_default_yes() {
-    local prompt="$1"
-    local answer=''
-    read -r -p "$prompt [Y/n] " answer || return 2
-    [[ -z "$answer" || "$answer" == 'y' || "$answer" == 'Y' || "$answer" == 'yes' || "$answer" == 'YES' ]]
-}
+# Render a numbered menu and resolve the chosen option into SELECTED_OPTION.
+# Each option is "value|label|alias,alias"; the first option answers empty input.
+# A global is used instead of stdout capture so fail() stops the hook, not a subshell.
+SELECTED_OPTION=''
+select_option() {
+    local title="$1"
+    shift
+    local options=("$@")
+    local total=${#options[@]}
+    local index=0
+    local value='' label='' aliases='' answer='' suffix=''
 
-# Ask an interactive question whose empty response means no.
-confirm_yes() {
-    local prompt="$1"
-    local answer=''
-    read -r -p "$prompt [y/N] " answer || return 1
-    [[ "$answer" == 'y' || "$answer" == 'Y' || "$answer" == 'yes' || "$answer" == 'YES' ]]
+    printf '%s\n' "$title"
+    for ((index = 0; index < total; index++)); do
+        IFS='|' read -r value label aliases <<<"${options[index]}"
+        suffix=''
+        if [[ $index -eq 0 ]]; then
+            suffix=' (default)'
+        fi
+        printf '  %d) %s%s\n' "$((index + 1))" "$label" "$suffix"
+    done
+    printf 'Enter a number [1]: '
+    read -r answer || fail 'No interactive response was available.'
+
+    answer=$(printf '%s' "$answer" | tr '[:upper:]' '[:lower:]' \
+        | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+    if [[ -z "$answer" ]]; then
+        IFS='|' read -r value label aliases <<<"${options[0]}"
+        SELECTED_OPTION="$value"
+        return 0
+    fi
+
+    for ((index = 0; index < total; index++)); do
+        IFS='|' read -r value label aliases <<<"${options[index]}"
+        if [[ "$answer" == "$((index + 1))" || "$answer" == "$value" || ",$aliases," == *",$answer,"* ]]; then
+            SELECTED_OPTION="$value"
+            return 0
+        fi
+    done
+
+    fail "Enter a number between 1 and $total, or press Enter for the default."
 }
 
 # Persist one value in the selected azd environment.
@@ -117,7 +146,6 @@ ensure_hmac_key() {
     local environment_key=''
     local process_key=''
     local hmac_key=''
-    local choice=''
 
     environment_name=$(normalize_scalar "${AZURE_ENV_NAME:-$(get_azd_value AZURE_ENV_NAME)}")
     process_key=$(normalize_scalar "${KEYVAULTSYNC_HMAC_KEY:-}")
@@ -145,7 +173,7 @@ ensure_hmac_key() {
         cat <<'EOF'
 
 The saved KEYVAULTSYNC_HMAC_KEY is not valid Base64 for exactly 32 bytes and
-cannot be used for object signatures. Choose a replacement below. The invalid
+cannot be used for object signatures. Supply a replacement below. The invalid
 value will not be displayed and will be overwritten only after the replacement
 passes validation.
 EOF
@@ -165,21 +193,15 @@ its backups. Reuse the saved key on later deployments; generating a replacement 
 existing object baselines incompatible.
 EOF
 
-    printf 'Choose [G]enerate a new key (recommended) or [S]upply an existing Base64 key [G]: '
-    read -r choice || fail 'No interactive response was available.'
-    case "$choice" in
-        '' | g | G)
-            hmac_key=$(generate_hmac_key)
-            ;;
-        s | S)
-            read -r -s -p 'Enter the Base64-encoded 32-byte key (input hidden): ' hmac_key \
-                || fail 'No interactive response was available.'
-            printf '\n'
-            ;;
-        *)
-            fail 'Choose G to generate a key or S to supply one.'
-            ;;
-    esac
+    # A single prompt covers both paths: supplied input is validated, empty input generates a key.
+    read -r -s -p 'Enter an existing Base64-encoded 32-byte HMAC key, or press Enter to generate a new one (input hidden): ' hmac_key \
+        || fail 'No interactive response was available.'
+    printf '\n'
+    hmac_key=$(normalize_scalar "$hmac_key")
+    if [[ -z "$hmac_key" ]]; then
+        hmac_key=$(generate_hmac_key)
+        printf 'No key was entered; generated a new HMAC key.\n'
+    fi
 
     is_valid_hmac_key "$hmac_key" || fail 'The HMAC key must be Base64 for exactly 32 bytes. No key was saved.'
     persist_hmac_key "$environment_name" "$hmac_key"
@@ -199,7 +221,7 @@ verify_deployment_storage() {
     local storage_network=''
     local public_network_access=''
     local bypass=''
-    local network_mode="${KEYVAULTSYNC_NETWORK_MODE:-$(get_azd_value KEYVAULTSYNC_NETWORK_MODE)}"
+    local network_profile=''
     local container_status=''
 
     [[ -n "$storage_uri" ]] || fail 'KEYVAULTSYNC_STORAGE_ACCOUNT_URI is missing. Run azd provision before azd deploy.'
@@ -228,10 +250,11 @@ verify_deployment_storage() {
 
     public_network_access=$(jq -r '.publicNetworkAccess // ""' <<<"$storage_network")
     bypass=$(jq -r '.bypass // ""' <<<"$storage_network")
-    network_mode="${network_mode:-public}"
-    if [[ "$network_mode" == 'private' ]]; then
+    network_profile=$(resolve_network_profile)
+    network_profile="${network_profile:-public}"
+    if [[ "$network_profile" == 'private-managed' || "$network_profile" == 'private-existing' ]]; then
         [[ "$public_network_access" == 'Disabled' ]] \
-            || fail "Private mode requires deployment storage publicNetworkAccess=Disabled; found $public_network_access."
+            || fail "A private networking profile requires deployment storage publicNetworkAccess=Disabled; found $public_network_access."
         container_status=$(
             az storage container exists \
                 --account-name "$storage_account" \
@@ -246,8 +269,8 @@ verify_deployment_storage() {
         return
     fi
 
-    if [[ "$network_mode" != 'public' ]]; then
-        fail "KEYVAULTSYNC_NETWORK_MODE must be public or private; found $network_mode."
+    if [[ "$network_profile" != 'public' ]]; then
+        fail "KEYVAULTSYNC_NETWORK_PROFILE must be public, private-managed, or private-existing; found $network_profile."
     fi
     if [[ "$public_network_access" != 'Enabled' && "$bypass" != *'AzureServices'* ]]; then
         cat >&2 <<EOF
@@ -260,6 +283,46 @@ EOF
 
     printf 'Verified deployment storage %s is reachable by the deployment service (publicNetworkAccess=%s, bypass=%s).\n' \
         "$storage_account" "$public_network_access" "$bypass"
+}
+
+# Resolve the single networking profile, migrating the retired mode/source pair when present.
+resolve_network_profile() {
+    local network_profile=''
+    local legacy_mode=''
+    local legacy_source=''
+
+    network_profile=$(normalize_scalar "${KEYVAULTSYNC_NETWORK_PROFILE:-$(get_azd_value KEYVAULTSYNC_NETWORK_PROFILE)}")
+    if [[ -n "$network_profile" ]]; then
+        printf '%s' "$network_profile"
+        return
+    fi
+
+    legacy_mode=$(normalize_scalar "${KEYVAULTSYNC_NETWORK_MODE:-$(get_azd_value KEYVAULTSYNC_NETWORK_MODE)}")
+    legacy_source=$(normalize_scalar "${KEYVAULTSYNC_NETWORK_SOURCE:-$(get_azd_value KEYVAULTSYNC_NETWORK_SOURCE)}")
+    if [[ -z "$legacy_mode" ]]; then
+        return
+    fi
+
+    case "$legacy_mode|$legacy_source" in
+        public | public\|managed | public\|existing)
+            network_profile='public'
+            ;;
+        private\|managed)
+            network_profile='private-managed'
+            ;;
+        private\|existing)
+            network_profile='private-existing'
+            ;;
+        private\|)
+            fail 'The retired private network configuration is incomplete. Set KEYVAULTSYNC_NETWORK_PROFILE to private-managed or private-existing.'
+            ;;
+        *)
+            fail "The retired KEYVAULTSYNC_NETWORK_MODE/KEYVAULTSYNC_NETWORK_SOURCE values are invalid: $legacy_mode/$legacy_source."
+            ;;
+    esac
+
+    set_azd_value KEYVAULTSYNC_NETWORK_PROFILE "$network_profile" >/dev/null
+    printf '%s' "$network_profile"
 }
 
 # Validate every delimiter-separated entry as an Azure subscription GUID.
@@ -289,89 +352,233 @@ ensure_subscription_list() {
     printf 'Configured %s subscription list for KeyVaultSync discovery.\n' "${AZURE_ENV_NAME:-current}"
 }
 
-# Persist an explicit public/private posture and private network ownership model.
-ensure_network_configuration() {
-    local network_mode="${KEYVAULTSYNC_NETWORK_MODE:-$(get_azd_value KEYVAULTSYNC_NETWORK_MODE)}"
-    local network_source="${KEYVAULTSYNC_NETWORK_SOURCE:-$(get_azd_value KEYVAULTSYNC_NETWORK_SOURCE)}"
-    local choice=''
+# Preserve an existing resource-group name or configure the CAF-style name azd will create.
+ensure_resource_group_name() {
+    local resource_group=''
+    local region_code=''
+    local environment_name=''
+    local resource_group_environment=''
 
-    if [[ -z "$network_mode" ]]; then
-        if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
-            network_mode='public'
-        else
-            printf 'Choose [P]ublic endpoints (default) or p[R]ivate networking [P]: '
-            read -r choice || fail 'No interactive response was available.'
-            case "$choice" in
-                '' | p | P) network_mode='public' ;;
-                r | R) network_mode='private' ;;
-                *) fail 'Choose P for public endpoints or R for private networking.' ;;
-            esac
-        fi
-        set_azd_value KEYVAULTSYNC_NETWORK_MODE "$network_mode" >/dev/null
+    resource_group=$(normalize_scalar "${AZURE_RESOURCE_GROUP:-$(get_azd_value AZURE_RESOURCE_GROUP)}")
+    if [[ -n "$resource_group" ]]; then
+        printf 'Using configured deployment resource group %s.\n' "$resource_group"
+        return
     fi
 
-    [[ "$network_mode" == 'public' || "$network_mode" == 'private' ]] \
-        || fail "KEYVAULTSYNC_NETWORK_MODE must be public or private; found $network_mode."
-    if [[ "$network_mode" == 'public' ]]; then
+    region_code=$(normalize_scalar "${KEYVAULTSYNC_REGION_CODE:-$(get_azd_value KEYVAULTSYNC_REGION_CODE)}")
+    if [[ -z "$region_code" ]]; then
+        if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
+            fail 'KEYVAULTSYNC_REGION_CODE is required when AZURE_RESOURCE_GROUP is not configured. Provide a three-letter Azure region abbreviation such as eun or swc.'
+        fi
+        read -r -p 'Three-letter Azure region abbreviation for the new resource group (for example eun or swc): ' region_code \
+            || fail 'No interactive response was available.'
+        region_code=$(normalize_scalar "$region_code")
+    fi
+    region_code=$(printf '%s' "$region_code" | tr '[:upper:]' '[:lower:]')
+    [[ "$region_code" =~ ^[a-z]{3}$ ]] \
+        || fail 'KEYVAULTSYNC_REGION_CODE must contain exactly three ASCII letters.'
+
+    environment_name=$(normalize_scalar "${AZURE_ENV_NAME:-$(get_azd_value AZURE_ENV_NAME)}")
+    [[ -n "$environment_name" ]] || fail 'AZURE_ENV_NAME is missing; select an azd environment before provisioning.'
+    resource_group_environment=$(printf '%s' "$environment_name" \
+        | tr '[:upper:]_' '[:lower:]-' \
+        | sed -E 's/[^a-z0-9-]+/-/g; s/-+/-/g; s/^-//; s/-$//')
+    [[ -n "$resource_group_environment" ]] \
+        || fail 'AZURE_ENV_NAME must contain at least one letter or number for resource-group naming.'
+
+    resource_group="rg-keyvaultsync-${region_code}-${resource_group_environment}"
+    [[ ${#resource_group} -le 90 ]] || fail 'The generated resource-group name exceeds Azure'\''s 90-character limit.'
+
+    set_azd_value KEYVAULTSYNC_REGION_CODE "$region_code" >/dev/null
+    set_azd_value AZURE_RESOURCE_GROUP "$resource_group" >/dev/null
+    printf 'Configured new deployment resource group %s.\n' "$resource_group"
+}
+
+# Resolve one network value, preferring an explicit process value over the saved azd value.
+resolve_network_value() {
+    local name="$1"
+    local process_value="${!name:-}"
+    local saved_value=''
+
+    process_value=$(normalize_scalar "$process_value")
+    saved_value=$(get_azd_value "$name")
+    if [[ -n "$process_value" ]]; then
+        if [[ "$saved_value" != "$process_value" ]]; then
+            set_azd_value "$name" "$process_value" >/dev/null
+        fi
+        printf '%s' "$process_value"
+        return
+    fi
+    printf '%s' "$saved_value"
+}
+
+# Prompt for and persist one missing network value.
+prompt_network_value() {
+    local name="$1"
+    local prompt="$2"
+    local default_value="${3:-}"
+    local value=''
+
+    if [[ -n "$default_value" ]]; then
+        read -r -p "$prompt [$default_value]: " value || fail 'No interactive response was available.'
+        value="${value:-$default_value}"
+    else
+        read -r -p "$prompt: " value || fail 'No interactive response was available.'
+    fi
+    value=$(normalize_scalar "$value")
+    [[ -n "$value" ]] || fail "$name cannot be empty."
+    set_azd_value "$name" "$value" >/dev/null
+    printf '%s' "$value"
+}
+
+# Prompt for missing managed VNet and subnet values, with safe standalone defaults.
+ensure_managed_network_values() {
+    local names=(
+        KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX
+        KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME
+        KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX
+        KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME
+        KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX
+    )
+    local prompts=(
+        'Managed VNet address prefix'
+        'Function integration subnet name'
+        'Function integration subnet address prefix'
+        'Private endpoint subnet name'
+        'Private endpoint subnet address prefix'
+    )
+    local defaults=(
+        '10.42.0.0/24'
+        'snet-functions'
+        '10.42.0.0/27'
+        'snet-private-endpoints'
+        '10.42.0.32/27'
+    )
+    local values=()
+    local missing_count=0
+    local index=0
+
+    for index in "${!names[@]}"; do
+        values[index]=$(resolve_network_value "${names[index]}")
+        [[ -n "${values[index]}" ]] || missing_count=$((missing_count + 1))
+    done
+
+    if [[ "$missing_count" -eq 0 || "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
+        return
+    fi
+
+    cat <<'EOF'
+
+Recommended managed private network:
+  VNet:                         10.42.0.0/24
+  Function integration subnet: 10.42.0.0/27
+  Private endpoint subnet:     10.42.0.32/27
+
+Confirm that these ranges do not overlap with connected enterprise, VPN,
+peering, or ExpressRoute networks.
+EOF
+
+    if [[ "$missing_count" -eq "${#names[@]}" ]]; then
+        select_option 'How should the managed private network be configured?' \
+            'defaults|Use the recommended network names and ranges|d' \
+            'customize|Customize the network names or ranges|c'
+        if [[ "$SELECTED_OPTION" == 'defaults' ]]; then
+            for index in "${!names[@]}"; do
+                set_azd_value "${names[index]}" "${defaults[index]}" >/dev/null
+            done
+            return
+        fi
+    fi
+
+    for index in "${!names[@]}"; do
+        if [[ -z "${values[index]}" ]]; then
+            values[index]=$(prompt_network_value "${names[index]}" "${prompts[index]}" "${defaults[index]}")
+        fi
+    done
+}
+
+# Persist one explicit networking profile and collect only the inputs that profile needs.
+ensure_network_configuration() {
+    local network_profile=''
+
+    network_profile=$(resolve_network_profile)
+    if [[ -z "$network_profile" ]]; then
+        if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
+            network_profile='public'
+        else
+            select_option 'Select the networking profile for KeyVaultSync-managed components:' \
+                'public|Public service endpoints|p' \
+                'private-managed|Private with a dedicated KeyVaultSync network|m,managed' \
+                'private-existing|Private with existing enterprise networking|e,existing'
+            network_profile="$SELECTED_OPTION"
+        fi
+        set_azd_value KEYVAULTSYNC_NETWORK_PROFILE "$network_profile" >/dev/null
+    fi
+
+    [[ "$network_profile" == 'public' || "$network_profile" == 'private-managed' || "$network_profile" == 'private-existing' ]] \
+        || fail "KEYVAULTSYNC_NETWORK_PROFILE must be public, private-managed, or private-existing; found $network_profile."
+    if [[ "$network_profile" == 'public' ]]; then
         printf 'Configured public service networking.\n'
         return
     fi
 
-    if [[ -z "$network_source" ]]; then
-        if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
-            fail 'KEYVAULTSYNC_NETWORK_SOURCE is required for non-interactive private deployment.'
-        fi
-        printf 'Choose [M]anaged VNet (default) or [E]xisting enterprise network [M]: '
-        read -r choice || fail 'No interactive response was available.'
-        case "$choice" in
-            '' | m | M) network_source='managed' ;;
-            e | E) network_source='existing' ;;
-            *) fail 'Choose M for a managed VNet or E for an existing enterprise network.' ;;
-        esac
-        set_azd_value KEYVAULTSYNC_NETWORK_SOURCE "$network_source" >/dev/null
+    if [[ "$network_profile" == 'private-managed' ]]; then
+        ensure_managed_network_values
     fi
-
-    [[ "$network_source" == 'managed' || "$network_source" == 'existing' ]] \
-        || fail "KEYVAULTSYNC_NETWORK_SOURCE must be managed or existing; found $network_source."
-    if [[ "$network_source" == 'managed' ]]; then
-        local private_vault_ids="${KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS:-$(get_azd_value KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS)}"
-        if [[ -z "$private_vault_ids" ]]; then
-            if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
-                fail 'KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS is required for private/managed networking. Supply the comma-separated source and target vault resource IDs approved for private endpoints.'
-            fi
-            read -r -p 'Approved source and target Key Vault resource IDs (comma-separated): ' private_vault_ids \
-                || fail 'No interactive response was available.'
-            [[ -n "$private_vault_ids" ]] || fail 'At least one approved Key Vault resource ID is required for a managed private network.'
-            set_azd_value KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS "$private_vault_ids" >/dev/null
-        fi
-    fi
-    if [[ "$network_source" == 'existing' ]]; then
+    if [[ "$network_profile" == 'private-existing' ]]; then
         local required_name=''
         local required_value=''
-        local existing_function_subnet="${KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID:-$(get_azd_value KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID)}"
-        local existing_endpoint_subnet="${KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID:-$(get_azd_value KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID)}"
+        local existing_function_subnet=''
+        local existing_endpoint_subnet=''
         local required_existing_values=(
             KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID
             KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID
             KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID
             KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID
             KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID
-            KEYVAULTSYNC_EXISTING_KEYVAULT_PRIVATE_DNS_ZONE_ID
             KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID
             KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID
             KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID
             KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID
             KEYVAULTSYNC_EXISTING_AMPLS_ID
         )
-        for required_name in "${required_existing_values[@]}"; do
-            required_value="${!required_name:-$(get_azd_value "$required_name")}"
-            [[ -n "$required_value" ]] || fail "$required_name is required for private/existing networking."
+        local required_existing_prompts=(
+            'Existing Function integration subnet resource ID'
+            'Existing private endpoint subnet resource ID'
+            'Existing Blob private DNS zone resource ID'
+            'Existing Queue private DNS zone resource ID'
+            'Existing Table private DNS zone resource ID'
+            'Existing Azure Monitor private DNS zone resource ID'
+            'Existing OMS private DNS zone resource ID'
+            'Existing ODS private DNS zone resource ID'
+            'Existing agent-service private DNS zone resource ID'
+            'Existing Azure Monitor Private Link Scope resource ID'
+        )
+        local index=0
+
+        printf '\nSupply the existing enterprise network resources used by KeyVaultSync.\n'
+        for index in "${!required_existing_values[@]}"; do
+            required_name="${required_existing_values[index]}"
+            required_value=$(resolve_network_value "$required_name")
+            if [[ -z "$required_value" ]]; then
+                if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
+                    fail "$required_name is required for the private-existing networking profile."
+                fi
+                required_value=$(prompt_network_value "$required_name" "${required_existing_prompts[index]}")
+            fi
+            if [[ "$required_name" == 'KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID' ]]; then
+                existing_function_subnet="$required_value"
+            elif [[ "$required_name" == 'KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID' ]]; then
+                existing_endpoint_subnet="$required_value"
+            fi
         done
         [[ "$existing_function_subnet" != "$existing_endpoint_subnet" ]] \
             || fail 'The Function integration subnet and private endpoint subnet must be different.'
     fi
 
-    printf 'Configured private networking with networkSource=%s.\n' "$network_source"
+    printf 'Configured networking profile %s.\n' "$network_profile"
+    printf 'Private networking covers KeyVaultSync components only (Function App, storage, monitoring).\n'
+    printf 'Source and target Key Vaults stay customer-owned; confirm they are reachable from the Function subnet.\n'
 }
 
 command -v azd >/dev/null 2>&1 || fail 'azd is required.'
@@ -385,8 +592,9 @@ if [[ "$phase" == 'deploy' ]]; then
     exit 0
 fi
 
-# Preprovision validates runtime discovery scope before Bicep receives parameters.
+# Preprovision validates deployment naming and runtime discovery scope before Bicep receives parameters.
 ensure_subscription_list
+ensure_resource_group_name
 ensure_network_configuration
 
 current_name="${KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME:-$(get_azd_value KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME)}"
@@ -413,15 +621,17 @@ EOF
 
 # Interactive tagging changes only azd environment values consumed by Bicep.
 if [[ -n "$current_name" && -n "$current_value" ]]; then
-    confirm_default_yes "Use the configured tag $current_name=$current_value?" || confirmation_status=$?
-    if [[ "${confirmation_status:-0}" -eq 0 ]]; then
-        exit 0
-    elif [[ "$confirmation_status" -eq 2 ]]; then
-        printf 'Using the configured deployment tag %s=%s without prompting.\n' "$current_name" "$current_value"
+    select_option "How should the configured tag $current_name=$current_value be handled?" \
+        'keep|Keep the configured tag|k' \
+        'replace|Replace the configured tag|r'
+    if [[ "$SELECTED_OPTION" == 'keep' ]]; then
         exit 0
     fi
 elif [[ -z "$current_name" && -z "$current_value" ]]; then
-    if ! confirm_yes 'Add an optional tag to this deployment?'; then
+    select_option 'Would you like to add an optional deployment tag?' \
+        'skip|Continue without an optional tag|n,no' \
+        'add|Add an optional tag|y,yes'
+    if [[ "$SELECTED_OPTION" == 'skip' ]]; then
         printf 'Continuing without an optional deployment tag.\n'
         exit 0
     fi
@@ -441,7 +651,10 @@ read -r -p 'Tag value: ' tag_value || fail 'No interactive response was availabl
 [[ -n "$tag_value" ]] || fail 'The tag value cannot be empty.'
 [[ ${#tag_value} -le 256 ]] || fail 'The tag value must be 256 characters or fewer.'
 
-if ! confirm_default_yes "Use optional deployment tag $tag_name=$tag_value?"; then
+select_option "Save optional deployment tag $tag_name=$tag_value?" \
+    'save|Save this tag|y,yes' \
+    'cancel|Do not change the optional tag|n,no'
+if [[ "$SELECTED_OPTION" == 'cancel' ]]; then
     printf 'Optional deployment tag was not changed.\n'
     exit 0
 fi

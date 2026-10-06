@@ -43,10 +43,11 @@ flowchart TB
 The azd environment must supply:
 
 - deployment subscription and location;
+- either an existing `AZURE_RESOURCE_GROUP` or a three-letter `KEYVAULTSYNC_REGION_CODE` for generated resource-group naming;
 - `KEYVAULTSYNC_SUBSCRIPTIONS`;
 - the HMAC key;
-- an explicit public/private network mode;
-- private-network inputs when private mode is selected;
+- one networking profile (`public`, `private-managed`, or `private-existing`);
+- profile-specific private-network inputs when required;
 - optional adopted resource-name overrides;
 - optional deployment tags.
 
@@ -65,10 +66,37 @@ azd up
 
 Review the preview before applying. One deployment-preparation script serves both azd phases:
 
-- before provisioning, it validates and persists multi-subscription and network configuration, obtains or preserves the HMAC key, and optionally configures one deployment tag;
+- before provisioning, it validates and persists multi-subscription configuration, establishes the deployment resource-group name, collects missing private-network details, obtains or preserves the HMAC key, and optionally configures one deployment tag;
 - before package deployment, it revalidates the HMAC key and confirms that Flex deployment storage is reachable through the expected public or private Blob path.
 
-`azd` defers subscription-list and HMAC initialization to the preprovision hook, so it does not collect those Bicep parameters before the preparation logic runs. If no key exists, an interactive run asks whether to generate a cryptographically random key or supply one. Valid existing keys are reused without being displayed or rotated. An invalid saved value can be interactively replaced after warning the operator, but the replacement is persisted only after it validates as Base64 for exactly 32 bytes. Non-interactive pipelines must provide valid protected HMAC material.
+`azd` defers subscription-list and HMAC initialization to the preprovision hook, so it does not collect those Bicep parameters before the preparation logic runs. If no key exists, an interactive run shows one hidden prompt: paste an existing Base64-encoded 32-byte key, or press Enter to generate one cryptographically. The key is saved once in the active azd environment; the later predeploy hook reuses it without asking again. Valid existing keys are never displayed or rotated. An invalid saved value can be interactively replaced after warning the operator, but the replacement is persisted only after it validates as Base64 for exactly 32 bytes. Non-interactive pipelines must provide valid protected HMAC material.
+
+When `AZURE_RESOURCE_GROUP` is absent, an interactive run asks for exactly three ASCII letters representing the Azure region abbreviation, normalizes them to lowercase, and persists:
+
+```text
+KEYVAULTSYNC_REGION_CODE=swc
+AZURE_RESOURCE_GROUP=rg-keyvaultsync-swc-<environment>
+```
+
+Use a consistent internal abbreviation such as `eun` for North Europe or `swc` for Sweden Central. The environment component is normalized to lowercase letters, numbers, and hyphens. Existing `AZURE_RESOURCE_GROUP` values are reused without requesting a region abbreviation or renaming the group. Non-interactive creation must provide `KEYVAULTSYNC_REGION_CODE` when it does not provide `AZURE_RESOURCE_GROUP`.
+
+Generated resource names use one reusable Bicep variable: `environmentUniqueToken`.
+It is the deterministic `uniqueString` value seeded with the deployment
+subscription ID, normalized environment name, and location.
+
+Changing any seed changes every generated solution-resource name. Resource-name override parameters remain the adoption mechanism when an existing name must be retained.
+
+For a new interactive environment, the same hook asks for one networking
+profile. Public endpoints are the default; the other choices create a dedicated
+KeyVaultSync private network or attach to existing enterprise networking.
+Selections are numbered and Enter accepts option 1. The managed-private profile
+shows the complete recommended topology and offers one default choice. Individual
+VNet and subnet values are requested only when customization is selected.
+The existing-private profile prompts for every missing subnet, private DNS zone,
+and Azure Monitor Private Link Scope resource ID. Resolved values are written
+with `azd env set` before Bicep provisioning begins and reused on later runs.
+When an older environment has no profile but still has the retired mode/source
+pair, the hook translates that pair once and persists the equivalent profile.
 
 The ignored `.azure/<environment>/.env` stores sensitive plaintext configuration. Protect it and backups.
 
@@ -136,9 +164,9 @@ Adopting an existing deployment requires compatible state and exact resource nam
 
 ## Networking
 
-Public mode uses public service endpoints with Entra authorization and Shared Key disabled.
+The `public` profile uses public service endpoints with Entra authorization and Shared Key disabled.
 
-Private mode supports either a minimal dedicated VNet or supplied enterprise resources. It configures Flex Consumption VNet integration, disables public access on the Function, storage, and Application Insights, and creates private endpoints for Blob, Queue, Table, Azure Monitor, and the explicitly supplied Key Vault IDs. Managed mode creates and links private DNS zones and an Azure Monitor Private Link Scope; existing mode reuses supplied zones and scope. See [networking](networking.md) for inputs, ownership boundaries, package-deployment constraints, and validation.
+The `private-managed` and `private-existing` profiles configure Flex Consumption VNet integration, disable public access on the Function, storage, and Application Insights, and create private endpoints for Blob, Queue, Table, and Azure Monitor. They do not create private endpoints or network resources for participating source and target vaults; customer infrastructure must make those vaults reachable from the Function. The managed profile creates a minimal dedicated VNet, private DNS zones, and an Azure Monitor Private Link Scope. The existing profile reuses supplied enterprise subnets, zones, and scope. See [networking](networking.md) for inputs, ownership boundaries, package-deployment constraints, and validation.
 
 ## Validation
 

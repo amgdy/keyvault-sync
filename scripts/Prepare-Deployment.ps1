@@ -3,9 +3,10 @@
 .SYNOPSIS
 Prepares protected azd configuration for provisioning or package deployment.
 .DESCRIPTION
-The provision phase validates discovery subscriptions, establishes the stable HMAC key,
-and optionally configures one deployment tag. The deploy phase preserves the HMAC key
-and validates Flex deployment-storage reachability. The HMAC value is never displayed.
+The provision phase validates discovery subscriptions, establishes CAF-style resource-group
+naming, collects and persists network configuration, establishes the stable HMAC key, and
+optionally configures one deployment tag. The deploy phase preserves the HMAC key and
+validates Flex deployment-storage reachability. The HMAC value is never displayed.
 #>
 param(
     [Parameter(Mandatory = $true)]
@@ -15,29 +16,44 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-# Ask an interactive yes/no question with explicit unavailable-input behavior.
-function Confirm-Yes {
+# Render a numbered menu and return the selected option value.
+# Each option supplies Value, Label, and optional Aliases; the first option answers empty input.
+function Read-Choice {
     param(
-        [Parameter(Mandatory = $true)][string] $Prompt,
-        [switch] $DefaultYes,
-        [switch] $AllowUnavailableDefault
+        [Parameter(Mandatory = $true)][string] $Title,
+        [Parameter(Mandatory = $true)][object[]] $Options
     )
 
-    $suffix = if ($DefaultYes) { '[Y/n]' } else { '[y/N]' }
+    Write-Host $Title
+    for ($index = 0; $index -lt $Options.Count; $index++) {
+        $suffix = if ($index -eq 0) { ' (default)' } else { '' }
+        Write-Host ("  {0}) {1}{2}" -f ($index + 1), $Options[$index].Label, $suffix)
+    }
+
     try {
-        $answer = Read-Host "$Prompt $suffix"
+        $answer = Read-Host 'Enter a number [1]'
     }
     catch {
-        if ($DefaultYes -and $AllowUnavailableDefault) {
-            return $true
-        }
         throw 'No interactive response was available.'
     }
 
-    if ($DefaultYes -and [string]::IsNullOrWhiteSpace($answer)) {
-        return $true
+    if ([string]::IsNullOrWhiteSpace($answer)) {
+        return $Options[0].Value
     }
-    return $answer -in @('y', 'Y', 'yes', 'YES')
+
+    $answer = $answer.Trim().ToLowerInvariant()
+    for ($index = 0; $index -lt $Options.Count; $index++) {
+        $option = $Options[$index]
+        $aliases = @()
+        if ($option.Contains('Aliases') -and $null -ne $option.Aliases) {
+            $aliases = @($option.Aliases)
+        }
+        if ($answer -eq [string]($index + 1) -or $answer -eq $option.Value -or $aliases -contains $answer) {
+            return $option.Value
+        }
+    }
+
+    throw "Enter a number between 1 and $($Options.Count), or press Enter for the default."
 }
 
 # Persist one value in the selected azd environment.
@@ -125,7 +141,14 @@ function New-HmacKey {
 
 # Read supplied HMAC material without echoing it and clear unmanaged plaintext storage.
 function Read-HmacKey {
-    $secureValue = Read-Host 'Enter the Base64-encoded 32-byte key (input hidden)' -AsSecureString
+    param(
+        [string] $Prompt = 'Enter the Base64-encoded 32-byte key (input hidden)'
+    )
+
+    $secureValue = Read-Host $Prompt -AsSecureString
+    if ($secureValue -isnot [System.Security.SecureString]) {
+        return [string] $secureValue
+    }
     $pointer = [IntPtr]::Zero
     try {
         $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureValue)
@@ -176,7 +199,7 @@ function Ensure-HmacKey {
         Write-Host @'
 
 The saved KEYVAULTSYNC_HMAC_KEY is not valid Base64 for exactly 32 bytes and
-cannot be used for object signatures. Choose a replacement below. The invalid
+cannot be used for object signatures. Supply a replacement below. The invalid
 value will not be displayed and will be overwritten only after the replacement
 passes validation.
 '@
@@ -196,11 +219,11 @@ its backups. Reuse the saved key on later deployments; generating a replacement 
 existing object baselines incompatible.
 '@
 
-    $choice = Read-Host 'Choose [G]enerate a new key (recommended) or [S]upply an existing Base64 key [G]'
-    switch -Regex ($choice) {
-        '^\s*$|^[gG]$' { $hmacKey = New-HmacKey; break }
-        '^[sS]$' { $hmacKey = Read-HmacKey; break }
-        default { throw 'Choose G to generate a key or S to supply one.' }
+    $hmacKey = ConvertFrom-AzdScalar (Read-HmacKey `
+        -Prompt 'Paste an existing Base64-encoded 32-byte HMAC key, or press Enter to generate a new one (input hidden)')
+    if ([string]::IsNullOrWhiteSpace($hmacKey)) {
+        $hmacKey = New-HmacKey
+        Write-Host 'No key was entered; generated a new HMAC key.'
     }
 
     if (-not (Test-HmacKey $hmacKey)) {
@@ -240,94 +263,245 @@ function Ensure-SubscriptionList {
     Write-Host "Configured $($subscriptionIds.Count) subscription(s) for KeyVaultSync discovery."
 }
 
-# Persist an explicit public/private posture and private network ownership model.
-function Ensure-NetworkConfiguration {
-    $networkMode = $env:KEYVAULTSYNC_NETWORK_MODE
-    if ([string]::IsNullOrWhiteSpace($networkMode)) {
-        $networkMode = Get-AzdValue 'KEYVAULTSYNC_NETWORK_MODE'
+# Preserve an existing resource-group name or configure the CAF-style name azd will create.
+function Ensure-ResourceGroupName {
+    $resourceGroup = ConvertFrom-AzdScalar $env:AZURE_RESOURCE_GROUP
+    if ([string]::IsNullOrWhiteSpace($resourceGroup)) {
+        $resourceGroup = Get-AzdValue 'AZURE_RESOURCE_GROUP'
     }
-    $networkSource = $env:KEYVAULTSYNC_NETWORK_SOURCE
-    if ([string]::IsNullOrWhiteSpace($networkSource)) {
-        $networkSource = Get-AzdValue 'KEYVAULTSYNC_NETWORK_SOURCE'
+    if (-not [string]::IsNullOrWhiteSpace($resourceGroup)) {
+        Write-Host "Using configured deployment resource group $resourceGroup."
+        return
     }
 
-    if ([string]::IsNullOrWhiteSpace($networkMode)) {
+    $regionCode = ConvertFrom-AzdScalar $env:KEYVAULTSYNC_REGION_CODE
+    if ([string]::IsNullOrWhiteSpace($regionCode)) {
+        $regionCode = Get-AzdValue 'KEYVAULTSYNC_REGION_CODE'
+    }
+    if ([string]::IsNullOrWhiteSpace($regionCode)) {
         if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
-            $networkMode = 'public'
+            throw 'KEYVAULTSYNC_REGION_CODE is required when AZURE_RESOURCE_GROUP is not configured. Provide a three-letter Azure region abbreviation such as eun or swc.'
+        }
+        $regionCode = ConvertFrom-AzdScalar (Read-Host 'Three-letter Azure region abbreviation for the new resource group (for example eun or swc)')
+    }
+    $regionCode = $regionCode.ToLowerInvariant()
+    if ($regionCode -cnotmatch '\A[a-z]{3}\z') {
+        throw 'KEYVAULTSYNC_REGION_CODE must contain exactly three ASCII letters.'
+    }
+
+    $environmentName = ConvertFrom-AzdScalar $env:AZURE_ENV_NAME
+    if ([string]::IsNullOrWhiteSpace($environmentName)) {
+        $environmentName = Get-AzdValue 'AZURE_ENV_NAME'
+    }
+    if ([string]::IsNullOrWhiteSpace($environmentName)) {
+        throw 'AZURE_ENV_NAME is missing; select an azd environment before provisioning.'
+    }
+    $resourceGroupEnvironment = $environmentName.ToLowerInvariant().Replace('_', '-')
+    $resourceGroupEnvironment = [regex]::Replace($resourceGroupEnvironment, '[^a-z0-9-]+', '-')
+    $resourceGroupEnvironment = [regex]::Replace($resourceGroupEnvironment, '-+', '-').Trim('-')
+    if ([string]::IsNullOrWhiteSpace($resourceGroupEnvironment)) {
+        throw 'AZURE_ENV_NAME must contain at least one letter or number for resource-group naming.'
+    }
+
+    $resourceGroup = "rg-keyvaultsync-$regionCode-$resourceGroupEnvironment"
+    if ($resourceGroup.Length -gt 90) {
+        throw "The generated resource-group name exceeds Azure's 90-character limit."
+    }
+
+    Set-AzdValue -Name 'KEYVAULTSYNC_REGION_CODE' -Value $regionCode | Out-Null
+    Set-AzdValue -Name 'AZURE_RESOURCE_GROUP' -Value $resourceGroup | Out-Null
+    Write-Host "Configured new deployment resource group $resourceGroup."
+}
+
+# Resolve one network value, preferring an explicit process value and persisting overrides.
+function Resolve-NetworkValue {
+    param([Parameter(Mandatory = $true)][string] $Name)
+
+    $processValue = ConvertFrom-AzdScalar ([Environment]::GetEnvironmentVariable($Name))
+    $savedValue = Get-AzdValue $Name
+    if (-not [string]::IsNullOrWhiteSpace($processValue)) {
+        if ($savedValue -cne $processValue) {
+            Set-AzdValue -Name $Name -Value $processValue | Out-Null
+        }
+        return $processValue
+    }
+    return $savedValue
+}
+
+# Prompt for and persist one missing network value.
+function Read-NetworkValue {
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [Parameter(Mandatory = $true)][string] $Prompt,
+        [string] $DefaultValue = ''
+    )
+
+    $displayPrompt = if ([string]::IsNullOrWhiteSpace($DefaultValue)) {
+        $Prompt
+    }
+    else {
+        "$Prompt [$DefaultValue]"
+    }
+    $value = ConvertFrom-AzdScalar (Read-Host $displayPrompt)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $value = $DefaultValue
+    }
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        throw "$Name cannot be empty."
+    }
+    Set-AzdValue -Name $Name -Value $value | Out-Null
+    return $value
+}
+
+# Prompt for missing managed VNet and subnet values, with safe standalone defaults.
+function Ensure-ManagedNetworkValues {
+    $settings = @(
+        @{ Name = 'KEYVAULTSYNC_MANAGED_VNET_ADDRESS_PREFIX'; Prompt = 'Managed VNet address prefix'; Default = '10.42.0.0/24' },
+        @{ Name = 'KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_NAME'; Prompt = 'Function integration subnet name'; Default = 'snet-functions' },
+        @{ Name = 'KEYVAULTSYNC_MANAGED_FUNCTION_SUBNET_PREFIX'; Prompt = 'Function integration subnet address prefix'; Default = '10.42.0.0/27' },
+        @{ Name = 'KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_NAME'; Prompt = 'Private endpoint subnet name'; Default = 'snet-private-endpoints' },
+        @{ Name = 'KEYVAULTSYNC_MANAGED_PRIVATE_ENDPOINT_SUBNET_PREFIX'; Prompt = 'Private endpoint subnet address prefix'; Default = '10.42.0.32/27' }
+    )
+    $resolvedValues = @{}
+    foreach ($setting in $settings) {
+        $resolvedValues[$setting.Name] = Resolve-NetworkValue $setting.Name
+    }
+    $missingSettings = @($settings | Where-Object {
+        [string]::IsNullOrWhiteSpace($resolvedValues[$_.Name])
+    })
+
+    if ($missingSettings.Count -eq 0 -or $env:AZD_NON_INTERACTIVE -ieq 'true') {
+        return
+    }
+
+    Write-Host @'
+
+Recommended managed private network:
+  VNet:                         10.42.0.0/24
+  Function integration subnet: 10.42.0.0/27
+  Private endpoint subnet:     10.42.0.32/27
+
+Confirm that these ranges do not overlap with connected enterprise, VPN,
+peering, or ExpressRoute networks.
+'@
+
+    if ($missingSettings.Count -eq $settings.Count) {
+        $managedNetworkAction = Read-Choice `
+            -Title 'How should the managed private network be configured?' `
+            -Options @(
+                @{ Value = 'defaults'; Label = 'Use the recommended network names and ranges'; Aliases = @('d') },
+                @{ Value = 'customize'; Label = 'Customize the network names or ranges'; Aliases = @('c') }
+            )
+        if ($managedNetworkAction -eq 'defaults') {
+            foreach ($setting in $settings) {
+                Set-AzdValue -Name $setting.Name -Value $setting.Default | Out-Null
+            }
+            return
+        }
+    }
+
+    foreach ($setting in $missingSettings) {
+        $resolvedValues[$setting.Name] = Read-NetworkValue `
+            -Name $setting.Name `
+            -Prompt $setting.Prompt `
+            -DefaultValue $setting.Default
+    }
+}
+
+# Resolve the single networking profile, migrating the retired mode/source pair when present.
+function Resolve-NetworkProfile {
+    $networkProfile = ConvertFrom-AzdScalar $env:KEYVAULTSYNC_NETWORK_PROFILE
+    if ([string]::IsNullOrWhiteSpace($networkProfile)) {
+        $networkProfile = Get-AzdValue 'KEYVAULTSYNC_NETWORK_PROFILE'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($networkProfile)) {
+        return $networkProfile
+    }
+
+    $legacyMode = ConvertFrom-AzdScalar $env:KEYVAULTSYNC_NETWORK_MODE
+    if ([string]::IsNullOrWhiteSpace($legacyMode)) {
+        $legacyMode = Get-AzdValue 'KEYVAULTSYNC_NETWORK_MODE'
+    }
+    $legacySource = ConvertFrom-AzdScalar $env:KEYVAULTSYNC_NETWORK_SOURCE
+    if ([string]::IsNullOrWhiteSpace($legacySource)) {
+        $legacySource = Get-AzdValue 'KEYVAULTSYNC_NETWORK_SOURCE'
+    }
+    if ([string]::IsNullOrWhiteSpace($legacyMode)) {
+        return ''
+    }
+
+    $networkProfile = switch ("$legacyMode|$legacySource") {
+        'public|' { 'public'; break }
+        'public|managed' { 'public'; break }
+        'public|existing' { 'public'; break }
+        'private|managed' { 'private-managed'; break }
+        'private|existing' { 'private-existing'; break }
+        'private|' {
+            throw 'The retired private network configuration is incomplete. Set KEYVAULTSYNC_NETWORK_PROFILE to private-managed or private-existing.'
+        }
+        default {
+            throw "The retired KEYVAULTSYNC_NETWORK_MODE/KEYVAULTSYNC_NETWORK_SOURCE values are invalid: $legacyMode/$legacySource."
+        }
+    }
+
+    Set-AzdValue -Name 'KEYVAULTSYNC_NETWORK_PROFILE' -Value $networkProfile | Out-Null
+    return $networkProfile
+}
+
+# Persist one explicit networking profile and collect only the inputs that profile needs.
+function Ensure-NetworkConfiguration {
+    $networkProfile = Resolve-NetworkProfile
+
+    if ([string]::IsNullOrWhiteSpace($networkProfile)) {
+        if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
+            $networkProfile = 'public'
         }
         else {
-            $choice = Read-Host 'Choose [P]ublic endpoints (default) or p[R]ivate networking [P]'
-            $networkMode = switch -Regex ($choice) {
-                '^\s*$|^[pP]$' { 'public'; break }
-                '^[rR]$' { 'private'; break }
-                default { throw 'Choose P for public endpoints or R for private networking.' }
-            }
+            $networkProfile = Read-Choice `
+                -Title 'Select the networking profile for KeyVaultSync-managed components:' `
+                -Options @(
+                    @{ Value = 'public'; Label = 'Public service endpoints'; Aliases = @('p') },
+                    @{ Value = 'private-managed'; Label = 'Private with a dedicated KeyVaultSync network'; Aliases = @('m', 'managed') },
+                    @{ Value = 'private-existing'; Label = 'Private with existing enterprise networking'; Aliases = @('e', 'existing') }
+                )
         }
-        Set-AzdValue -Name 'KEYVAULTSYNC_NETWORK_MODE' -Value $networkMode | Out-Null
+        Set-AzdValue -Name 'KEYVAULTSYNC_NETWORK_PROFILE' -Value $networkProfile | Out-Null
     }
 
-    if ($networkMode -notin @('public', 'private')) {
-        throw "KEYVAULTSYNC_NETWORK_MODE must be public or private; found $networkMode."
+    if (@('public', 'private-managed', 'private-existing') -cnotcontains $networkProfile) {
+        throw "KEYVAULTSYNC_NETWORK_PROFILE must be public, private-managed, or private-existing; found $networkProfile."
     }
-    if ($networkMode -eq 'public') {
+    if ($networkProfile -eq 'public') {
         Write-Host 'Configured public service networking.'
         return
     }
 
-    if ([string]::IsNullOrWhiteSpace($networkSource)) {
-        if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
-            throw 'KEYVAULTSYNC_NETWORK_SOURCE is required for non-interactive private deployment.'
-        }
-        $choice = Read-Host 'Choose [M]anaged VNet (default) or [E]xisting enterprise network [M]'
-        $networkSource = switch -Regex ($choice) {
-            '^\s*$|^[mM]$' { 'managed'; break }
-            '^[eE]$' { 'existing'; break }
-            default { throw 'Choose M for a managed VNet or E for an existing enterprise network.' }
-        }
-        Set-AzdValue -Name 'KEYVAULTSYNC_NETWORK_SOURCE' -Value $networkSource | Out-Null
+    if ($networkProfile -eq 'private-managed') {
+        Ensure-ManagedNetworkValues
     }
-
-    if ($networkSource -notin @('managed', 'existing')) {
-        throw "KEYVAULTSYNC_NETWORK_SOURCE must be managed or existing; found $networkSource."
-    }
-    if ($networkSource -eq 'managed') {
-        $privateVaultResourceIds = $env:KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS
-        if ([string]::IsNullOrWhiteSpace($privateVaultResourceIds)) {
-            $privateVaultResourceIds = Get-AzdValue 'KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS'
-        }
-        if ([string]::IsNullOrWhiteSpace($privateVaultResourceIds)) {
-            if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
-                throw 'KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS is required for private/managed networking. Supply the comma-separated source and target vault resource IDs approved for private endpoints.'
-            }
-            $privateVaultResourceIds = Read-Host 'Approved source and target Key Vault resource IDs (comma-separated)'
-            if ([string]::IsNullOrWhiteSpace($privateVaultResourceIds)) {
-                throw 'At least one approved Key Vault resource ID is required for a managed private network.'
-            }
-            Set-AzdValue -Name 'KEYVAULTSYNC_PRIVATE_VAULT_RESOURCE_IDS' -Value $privateVaultResourceIds | Out-Null
-        }
-    }
-    if ($networkSource -eq 'existing') {
-        $requiredExistingValues = @(
-            'KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID',
-            'KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID',
-            'KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_KEYVAULT_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID',
-            'KEYVAULTSYNC_EXISTING_AMPLS_ID'
+    if ($networkProfile -eq 'private-existing') {
+        $requiredExistingSettings = @(
+            @{ Name = 'KEYVAULTSYNC_EXISTING_FUNCTION_SUBNET_ID'; Prompt = 'Existing Function integration subnet resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_PRIVATE_ENDPOINT_SUBNET_ID'; Prompt = 'Existing private endpoint subnet resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_BLOB_PRIVATE_DNS_ZONE_ID'; Prompt = 'Existing Blob private DNS zone resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_QUEUE_PRIVATE_DNS_ZONE_ID'; Prompt = 'Existing Queue private DNS zone resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_TABLE_PRIVATE_DNS_ZONE_ID'; Prompt = 'Existing Table private DNS zone resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_MONITOR_PRIVATE_DNS_ZONE_ID'; Prompt = 'Existing Azure Monitor private DNS zone resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_OMS_PRIVATE_DNS_ZONE_ID'; Prompt = 'Existing OMS private DNS zone resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_ODS_PRIVATE_DNS_ZONE_ID'; Prompt = 'Existing ODS private DNS zone resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_AGENTSVC_PRIVATE_DNS_ZONE_ID'; Prompt = 'Existing agent-service private DNS zone resource ID' },
+            @{ Name = 'KEYVAULTSYNC_EXISTING_AMPLS_ID'; Prompt = 'Existing Azure Monitor Private Link Scope resource ID' }
         )
         $resolvedValues = @{}
-        foreach ($requiredName in $requiredExistingValues) {
-            $requiredValue = [Environment]::GetEnvironmentVariable($requiredName)
+        Write-Host "`nSupply the existing enterprise network resources used by KeyVaultSync."
+        foreach ($setting in $requiredExistingSettings) {
+            $requiredName = $setting.Name
+            $requiredValue = Resolve-NetworkValue $requiredName
             if ([string]::IsNullOrWhiteSpace($requiredValue)) {
-                $requiredValue = Get-AzdValue $requiredName
-            }
-            if ([string]::IsNullOrWhiteSpace($requiredValue)) {
-                throw "$requiredName is required for private/existing networking."
+                if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
+                    throw "$requiredName is required for the private-existing networking profile."
+                }
+                $requiredValue = Read-NetworkValue -Name $requiredName -Prompt $setting.Prompt
             }
             $resolvedValues[$requiredName] = $requiredValue
         }
@@ -337,7 +511,9 @@ function Ensure-NetworkConfiguration {
         }
     }
 
-    Write-Host "Configured private networking with networkSource=$networkSource."
+    Write-Host "Configured networking profile $networkProfile."
+    Write-Host 'Private networking covers KeyVaultSync components only (Function App, storage, monitoring).'
+    Write-Host 'Source and target Key Vaults stay customer-owned; confirm they are reachable from the Function subnet.'
 }
 
 # Verify the deployed storage network posture required by Flex package deployment.
@@ -375,16 +551,13 @@ function Test-DeploymentStorage {
 
     $publicNetworkAccess = [string]$network.publicNetworkAccess
     $bypass = [string]$network.bypass
-    $networkMode = $env:KEYVAULTSYNC_NETWORK_MODE
-    if ([string]::IsNullOrWhiteSpace($networkMode)) {
-        $networkMode = Get-AzdValue 'KEYVAULTSYNC_NETWORK_MODE'
+    $networkProfile = Resolve-NetworkProfile
+    if ([string]::IsNullOrWhiteSpace($networkProfile)) {
+        $networkProfile = 'public'
     }
-    if ([string]::IsNullOrWhiteSpace($networkMode)) {
-        $networkMode = 'public'
-    }
-    if ($networkMode -eq 'private') {
+    if ($networkProfile -in @('private-managed', 'private-existing')) {
         if ($publicNetworkAccess.Trim() -ne 'Disabled') {
-            throw "Private mode requires deployment storage publicNetworkAccess=Disabled; found $($publicNetworkAccess.Trim())."
+            throw "A private networking profile requires deployment storage publicNetworkAccess=Disabled; found $($publicNetworkAccess.Trim())."
         }
         $containerStatus = & az storage container exists `
             --account-name $storageAccount `
@@ -401,8 +574,8 @@ function Test-DeploymentStorage {
         Write-Host "Verified private deployment storage $storageAccount through the Blob data plane."
         return
     }
-    if ($networkMode -ne 'public') {
-        throw "KEYVAULTSYNC_NETWORK_MODE must be public or private; found $networkMode."
+    if ($networkProfile -ne 'public') {
+        throw "KEYVAULTSYNC_NETWORK_PROFILE must be public, private-managed, or private-existing; found $networkProfile."
     }
     if ($publicNetworkAccess.Trim() -ne 'Enabled' -and $bypass -notmatch 'AzureServices') {
         throw @"
@@ -428,8 +601,9 @@ if ($Phase -eq 'deploy') {
     return
 }
 
-# Preprovision validates runtime discovery scope before Bicep receives parameters.
+# Preprovision validates deployment naming and runtime discovery scope before Bicep receives parameters.
 Ensure-SubscriptionList
+Ensure-ResourceGroupName
 Ensure-NetworkConfiguration
 
 $currentName = $env:KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME
@@ -464,12 +638,24 @@ Do not use tag names or values to store secrets or personal information.
 
 # Interactive tagging changes only azd environment values consumed by Bicep.
 if (-not [string]::IsNullOrWhiteSpace($currentName) -and -not [string]::IsNullOrWhiteSpace($currentValue)) {
-    if (Confirm-Yes "Use the configured tag $currentName=$currentValue?" -DefaultYes -AllowUnavailableDefault) {
+    $tagAction = Read-Choice `
+        -Title "How should the configured tag $currentName=$currentValue be handled?" `
+        -Options @(
+            @{ Value = 'keep'; Label = 'Keep the configured tag'; Aliases = @('k') },
+            @{ Value = 'replace'; Label = 'Replace the configured tag'; Aliases = @('r') }
+        )
+    if ($tagAction -eq 'keep') {
         return
     }
 }
 elseif ([string]::IsNullOrWhiteSpace($currentName) -and [string]::IsNullOrWhiteSpace($currentValue)) {
-    if (-not (Confirm-Yes 'Add an optional tag to this deployment?')) {
+    $tagAction = Read-Choice `
+        -Title 'Would you like to add an optional deployment tag?' `
+        -Options @(
+            @{ Value = 'skip'; Label = 'Continue without an optional tag'; Aliases = @('n', 'no') },
+            @{ Value = 'add'; Label = 'Add an optional tag'; Aliases = @('y', 'yes') }
+        )
+    if ($tagAction -eq 'skip') {
         Write-Host 'Continuing without an optional deployment tag.'
         return
     }
@@ -494,7 +680,13 @@ if ($tagValue.Length -gt 256) {
     throw 'The tag value must be 256 characters or fewer.'
 }
 
-if (-not (Confirm-Yes "Use optional deployment tag $tagName=$tagValue?" -DefaultYes)) {
+$tagAction = Read-Choice `
+    -Title "Save optional deployment tag $tagName=$tagValue?" `
+    -Options @(
+        @{ Value = 'save'; Label = 'Save this tag'; Aliases = @('y', 'yes') },
+        @{ Value = 'cancel'; Label = 'Do not change the optional tag'; Aliases = @('n', 'no') }
+    )
+if ($tagAction -eq 'cancel') {
     Write-Host 'Optional deployment tag was not changed.'
     return
 }
