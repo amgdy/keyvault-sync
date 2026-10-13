@@ -17,6 +17,36 @@ flowchart TD
 
 Start with the durable Blob run record. Telemetry helps locate a failure, but it is not the authoritative mutation record.
 
+## Offline Log Analyzer
+
+Open [the self-contained KeyVaultSync log analyzer](../tools/keyvaultsync-log-analyzer.html) in a current browser and provide one of:
+
+- a CSV export from Application Insights or Log Analytics; or
+- one durable JSON run record from `keyvaultsync-runs/runs/<year>/<month>/<day>/<run-id>.json`.
+
+The file is processed only in the browser. The page has no external scripts, upload endpoint, or network dependency. It recognizes legacy message text and the stable `KVS-*` diagnostic fields, labels parsed evidence separately from inferred remediation, and can download a sanitized incident summary as JSON or standalone HTML.
+
+The assessment and action order are deterministic:
+
+- `Blocked` and P1: a denied RBAC mutation, unresolved or ambiguous mutation, pair-state persistence failure, or lease-renewal failure requires investigation before another mutation attempt;
+- `Partial`: any inventory warning or a partial terminal run means the run is not complete deletion evidence;
+- `Needs review`: another high-priority cataloged outcome was observed;
+- `Healthy`: no recognized outcome requires administrator review, but the durable record remains authoritative.
+
+The symbols use `✓` for observed healthy/informational states, `!` for partial or review states, and `×` for blocked/high-severity states. Recommendations are explicitly labeled as inference; they do not prove effective permissions or live target state.
+
+The public copy is published from the same tracked HTML by the `Publish log analyzer` GitHub Actions workflow:
+
+`https://amgdy.com/keyvault-sync/`
+
+GitHub Pages serves the HTML and JavaScript, but selected log files are still read locally by the visitor's browser and are not sent back to GitHub or another service. The analyzer rejects empty files, malformed run-record structures, malformed CSV quoting, CSVs without a supported message column, and files larger than 25 MB.
+
+GitHub Pages is configured for this repository with **GitHub Actions** as its build source and HTTPS enforcement enabled. The workflow publishes changes to `main`; it does not require an external hosting account or repository secret.
+
+Identifier display is disabled by default. The JSON and HTML downloads replace the source filename, redact evidence independently of the display toggle, and preserve only bounded codes, priorities, recommendations, timestamps, and redacted evidence. The original export and run record remain private operational data, and automated redaction is not a declassification guarantee. Review the downloaded summary before sharing it.
+
+Use CSV for a timeline and HTTP/error evidence. Use the durable JSON when you need the exact inventory warning, affected plan item, or persisted mutation outcome; those details are intentionally not duplicated into general telemetry.
+
 ## Telemetry Does Not Appear
 
 1. Check the startup log: Azure Monitor export must be enabled.
@@ -48,6 +78,19 @@ Start with the durable Blob run record. Telemetry helps locate a failure, but it
 ## Incomplete Inventory
 
 A partial/failed scan is not deletion evidence. Check the child activity for the failing stage (secrets, keys, certificates, deleted objects, authorization, ARM discovery, or Blob state) and resolve permissions/network/timeout issues before the next complete checkpoint. Existing run history in Blob remains the durable record even when telemetry arrives late.
+
+`KVS-INV-*` identifies the bounded warning category. `KVS-PLAN-INCOMPLETE-INVENTORY` confirms that object mutation failed closed because one or both inventories were incomplete. The exact warning text and affected object are available only in the protected durable run record.
+
+## Role-Assignment Mutation Is Denied
+
+`KVS-RBAC-403` means the ARM role-assignment request was denied. Successful role-assignment listing does not prove write authorization.
+
+1. Identify the Function runtime managed identity without copying its principal ID into a public ticket.
+2. Confirm it has effective **Key Vault Data Access Administrator** at the target vault or the required target child scope.
+3. Allow for role-assignment propagation.
+4. Check ancestor deny assignments and role-assignment conditions.
+5. Review the diagnostic `ScopeKind`, `RoleDefinitionId`, `HttpStatus`, and `ErrorCode` fields and the exact private run-record item.
+6. Let a later scheduled run re-plan after authorization is corrected; do not interpret a retry as proof that an earlier ambiguous mutation failed.
 
 ## A Vault Is Not Being Synchronized
 

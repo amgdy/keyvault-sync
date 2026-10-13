@@ -307,6 +307,23 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
             logger.LogInformation(KeyVaultSyncPairEvaluatedEventId, logMessage,
                 source.Name, target?.Name, syncEnabled, syncId, decision);
         }
+
+        var diagnostic = AdminDiagnostics.ClassifyDiscoveryDecision(decision);
+        logger.Log(
+            isMappingIssue ? LogLevel.Warning : LogLevel.Information,
+            AdminDiagnostics.DiscoveryDecisionEventId,
+            "Discovery diagnostic {DiagnosticCode}. Stage {DiagnosticStage}; outcome {DiagnosticOutcome}; decision {DiscoveryDecision}; sync enabled {SyncEnabled}; priority {AdminPriority}; evidence type {EvidenceType}; action decision {ActionDecision}; confidence {Confidence}; summary {DiagnosticSummary}; administrator action {AdminAction}.",
+            diagnostic.Code,
+            "Discovery",
+            decision,
+            decision,
+            syncEnabled,
+            AdminDiagnostics.GetPriority(diagnostic.Code),
+            "Evidence",
+            AdminDiagnostics.GetActionDecision(diagnostic),
+            AdminDiagnostics.GetConfidence(diagnostic.Code),
+            diagnostic.Summary,
+            diagnostic.AdminAction);
     }
 
     /// <summary>Reads the authorization mode, access policies, and role-assignment declarations around a vault.</summary>

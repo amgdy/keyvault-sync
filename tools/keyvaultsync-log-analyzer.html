@@ -1,0 +1,819 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KeyVaultSync Log Analyzer</title>
+  <link rel="icon" href="data:,">
+  <script>
+    (() => {
+      const param = new URLSearchParams(window.location.search).get("scoutTheme");
+      const theme =
+        param || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      document.documentElement.setAttribute("data-theme", theme);
+    })();
+  </script>
+  <style>
+:root {
+  color-scheme: light;
+  --cp-bg: #f7f4ef;
+  --cp-bg-elevated: #fcfbf8;
+  --cp-surface: #ffffff;
+  --cp-surface-soft: #f5f5f5;
+  --cp-border: #dedede;
+  --cp-border-strong: #919191;
+  --cp-text: #242424;
+  --cp-text-muted: #5c5c5c;
+  --cp-text-soft: #6f6f6f;
+  --cp-accent: #b11f4b;
+  --cp-accent-hover: #9a1a41;
+  --cp-accent-soft: rgba(177, 31, 75, 0.08);
+  --cp-accent-fg: #ffffff;
+  --cp-success: #16a34a;
+  --cp-danger: #dc2626;
+  --cp-warning: #f59e0b;
+  --cp-link: #0078d4;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+  --cp-overlay: rgba(255, 255, 255, 0.8);
+  --cp-panel: rgba(255, 255, 255, 0.86);
+  --cp-panel-strong: rgba(255, 255, 255, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.55);
+  --cp-highlight: rgba(177, 31, 75, 0.12);
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --cp-bg: #3d3b3a;
+  --cp-bg-elevated: #343231;
+  --cp-surface: #292929;
+  --cp-surface-soft: #2e2e2e;
+  --cp-border: #474747;
+  --cp-border-strong: #5f5f5f;
+  --cp-text: #dedede;
+  --cp-text-muted: #919191;
+  --cp-text-soft: #b0b0b0;
+  --cp-accent: #fd8ea1;
+  --cp-accent-hover: #fb7b91;
+  --cp-accent-soft: rgba(253, 142, 161, 0.14);
+  --cp-accent-fg: #1a1a1a;
+  --cp-success: #4ade80;
+  --cp-danger: #f87171;
+  --cp-warning: #fbbf24;
+  --cp-link: #4da6ff;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+  --cp-overlay: rgba(41, 41, 41, 0.88);
+  --cp-panel: rgba(41, 41, 41, 0.72);
+  --cp-panel-strong: rgba(41, 41, 41, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.04);
+  --cp-highlight: rgba(253, 142, 161, 0.12);
+}
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--cp-bg);
+      color: var(--cp-text);
+      font-family: "Segoe UI", Aptos, Calibri, -apple-system, BlinkMacSystemFont, sans-serif;
+      line-height: 1.5;
+    }
+    button, input { font: inherit; }
+    button:focus-visible, input:focus-visible, .drop:focus-visible {
+      outline: 3px solid var(--cp-highlight);
+      outline-offset: 2px;
+    }
+    main { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 32px 0 56px; }
+    header { display: flex; justify-content: space-between; gap: 24px; align-items: flex-start; margin-bottom: 24px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { font-size: clamp(1.75rem, 4vw, 2.75rem); line-height: 1.1; margin-bottom: 8px; letter-spacing: -0.03em; }
+    h2 { font-size: 1.25rem; margin-bottom: 16px; }
+    h3 { font-size: 1rem; margin-bottom: 6px; }
+    .eyebrow { color: var(--cp-accent); font-weight: 700; text-transform: uppercase; letter-spacing: .08em; font-size: .75rem; }
+    .muted { color: var(--cp-text-muted); }
+    .privacy { max-width: 510px; padding: 12px 16px; border-left: 4px solid var(--cp-success); background: var(--cp-surface); border-radius: 0.625rem; }
+    .card { background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: 16px; padding: 20px; }
+    .drop {
+      min-height: 190px;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      border: 2px dashed var(--cp-border-strong);
+      background: var(--cp-bg-elevated);
+      border-radius: 16px;
+      padding: 28px;
+      cursor: pointer;
+      transition: border-color .15s, background .15s;
+    }
+    .drop.drag { border-color: var(--cp-accent); background: var(--cp-accent-soft); }
+    .drop strong { display: block; font-size: 1.1rem; margin-bottom: 6px; }
+    input[type=file] { position: absolute; inline-size: 1px; block-size: 1px; opacity: 0; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 14px; }
+    button {
+      border: 1px solid var(--cp-border-strong);
+      background: var(--cp-surface);
+      color: var(--cp-text);
+      border-radius: 0.625rem;
+      padding: 9px 14px;
+      cursor: pointer;
+    }
+    button.primary { background: var(--cp-accent); border-color: var(--cp-accent); color: var(--cp-accent-fg); }
+    button:hover { border-color: var(--cp-accent); }
+    button.primary:hover { background: var(--cp-accent-hover); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .switch { display: inline-flex; gap: 8px; align-items: center; color: var(--cp-text-muted); }
+    .switch input { accent-color: var(--cp-accent); }
+    #results[hidden], #empty[hidden], #error[hidden] { display: none; }
+    .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 20px 0; }
+    .metric { padding: 16px; background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: 0.625rem; }
+    .metric span { display: block; color: var(--cp-text-muted); font-size: .8rem; }
+    .metric strong { display: block; font-size: 1.55rem; margin-top: 2px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(280px, .75fr); gap: 16px; }
+    .stack { display: grid; gap: 12px; }
+    .finding { border: 1px solid var(--cp-border); border-left-width: 5px; padding: 16px; border-radius: 0.625rem; background: var(--cp-bg-elevated); }
+    .finding.high { border-left-color: var(--cp-danger); }
+    .finding.medium { border-left-color: var(--cp-warning); }
+    .finding.low { border-left-color: var(--cp-link); }
+    .finding.ok { border-left-color: var(--cp-success); }
+    .row { display: flex; justify-content: space-between; gap: 12px; align-items: start; }
+    .code { font-family: Consolas, "Courier New", Courier, monospace; font-size: .75rem; color: var(--cp-accent); word-break: break-word; }
+    .badge { border: 1px solid var(--cp-border); border-radius: 999px; padding: 3px 8px; font-size: .72rem; white-space: nowrap; }
+    .badge.priority { border-color: var(--cp-accent); color: var(--cp-accent); font-weight: 700; }
+    .basis { display: inline-block; margin-right: 6px; color: var(--cp-text); font-weight: 700; }
+    .recommendation { margin: 10px 0 0; padding: 10px 12px; border: 1px solid var(--cp-border); border-radius: 0.625rem; background: var(--cp-surface-soft); }
+    .evidence { margin: 10px 0 0; padding-top: 10px; border-top: 1px solid var(--cp-border); color: var(--cp-text-muted); font-size: .86rem; }
+    .action-list { margin: 0; padding-left: 20px; }
+    .action-list li { margin-bottom: 12px; }
+    .timeline { max-height: 450px; overflow: auto; }
+    .timeline-item { display: grid; grid-template-columns: 142px 1fr; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--cp-border); font-size: .84rem; }
+    .timeline-item time { color: var(--cp-text-muted); font-family: Consolas, "Courier New", Courier, monospace; }
+    .notice { margin-top: 14px; padding: 12px 16px; border: 1px solid var(--cp-warning); border-radius: 0.625rem; background: var(--cp-surface); }
+    .error { color: var(--cp-danger); border-color: var(--cp-danger); }
+    footer { margin-top: 24px; color: var(--cp-text-muted); font-size: .8rem; text-align: center; }
+    @media (max-width: 820px) {
+      header, .layout { display: grid; grid-template-columns: 1fr; }
+      .summary { grid-template-columns: repeat(2, 1fr); }
+      .privacy { max-width: none; }
+    }
+    @media (max-width: 480px) {
+      main { width: min(100% - 20px, 1180px); padding-top: 20px; }
+      .summary { grid-template-columns: 1fr; }
+      .timeline-item { grid-template-columns: 1fr; gap: 2px; }
+    }
+    @media print {
+      .drop, .toolbar, footer { display: none; }
+      main { width: 100%; padding: 0; }
+      .card, .metric, .finding { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <div class="eyebrow">Offline administrator assistant</div>
+      <h1>KeyVaultSync Log Analyzer</h1>
+      <p class="muted">Turn exported telemetry or a durable run record into evidence-based remediation.</p>
+    </div>
+    <div class="privacy"><strong>Local-only processing</strong><br><span class="muted">Files stay in this browser. This page has no upload endpoint, external scripts, or network dependency.</span></div>
+  </header>
+
+  <section class="card">
+    <label class="drop" id="drop" for="file" tabindex="0">
+      <span><strong>Drop a CSV or run-record JSON file</strong><span class="muted">Application Insights / Log Analytics CSV, or <code>keyvaultsync-runs/runs/.../*.json</code></span></span>
+    </label>
+    <input id="file" type="file" accept=".csv,.json,text/csv,application/json">
+    <div class="toolbar">
+      <button class="primary" id="choose">Choose file</button>
+      <button id="export" disabled>Download sanitized JSON</button>
+      <button id="export-html" disabled>Download sanitized HTML</button>
+      <button id="clear" disabled>Clear</button>
+      <label class="switch"><input id="identifiers" type="checkbox"> Show raw identifiers in evidence</label>
+    </div>
+    <div id="error" class="notice error" role="alert" hidden></div>
+  </section>
+
+  <section id="empty" class="notice">No file analyzed yet. CSV exports can provide operational evidence; the durable JSON run record provides the exact warning and plan details.</section>
+
+  <section id="results" hidden>
+    <div class="summary" id="summary"></div>
+    <div class="layout">
+      <div class="stack">
+        <section class="card"><h2>Findings</h2><div class="stack" id="findings"></div></section>
+        <section class="card"><h2>Evidence timeline</h2><div class="timeline" id="timeline"></div></section>
+      </div>
+      <aside class="stack">
+        <section class="card"><h2>Prioritized actions</h2><p class="muted" id="assessment"></p><ol class="action-list" id="actions"></ol></section>
+        <section class="card">
+          <h2>Interpretation limits</h2>
+          <p class="muted">“Evidence” comes directly from parsed fields or messages. “Inference” is a recommendation derived from that evidence. This tool never proves live permissions, target integrity, or successful mutation.</p>
+          <p class="muted">Keep source exports and durable run records private: they can contain subscription, vault, object, and principal identifiers.</p>
+        </section>
+      </aside>
+    </div>
+  </section>
+  <footer>KeyVaultSync operator tool · self-contained HTML · no telemetry or uploads</footer>
+</main>
+<script>
+"use strict";
+
+const catalog = {
+  "KVS-CONFIG-HMAC-INVALID": { severity: "high", title: "Protected HMAC configuration is invalid", action: "Restore the original protected Base64-encoded 32-byte key and nonempty version label. Never print or replace an established key." },
+  "KVS-CONFIG-SUBSCRIPTIONS": { severity: "high", title: "Subscription configuration is invalid", action: "Set KEYVAULTSYNC_SUBSCRIPTIONS to one or more subscription GUIDs separated by commas, semicolons, or whitespace." },
+  "KVS-CONFIG-STORAGE-URI": { severity: "high", title: "Storage URI configuration is invalid", action: "Set KEYVAULTSYNC_STORAGE_ACCOUNT_URI to the intended HTTPS Blob service URI." },
+  "KVS-CONFIG-PRINCIPAL": { severity: "high", title: "Runtime principal configuration is invalid", action: "Set KEYVAULTSYNC_PRINCIPAL_ID to the runtime managed identity object GUID." },
+  "KVS-CONFIG-RETIRED": { severity: "high", title: "Retired configuration is present", action: "Remove the retired setting and use the current mapping-driven configuration." },
+  "KVS-CONFIG-COMMAND-LINE": { severity: "high", title: "Unsupported command-line configuration was supplied", action: "Configure the Azure Function through application settings." },
+  "KVS-CONFIG-LOG-LEVEL": { severity: "medium", title: "Log level configuration is invalid", action: "Set KEYVAULTSYNC_LOG_LEVEL to Trace, Debug, Information, Warning, Error, or Critical." },
+  "KVS-STORAGE-INITIALIZE": { severity: "high", title: "Blob initialization failed", action: "Verify storage URI, managed-identity authorization, DNS, network reachability, and role propagation." },
+  "KVS-STORAGE-RUN-RECORD": { severity: "high", title: "Run history persistence failed", action: "Restore Blob write access and reachability; telemetry alone is not authoritative run history." },
+  "KVS-STORAGE-PAIR-STATE": { severity: "high", title: "Pair state persistence failed", action: "Stop dependent mutation work and verify the Blob lease, ETag, authorization, and storage reachability." },
+  "KVS-STORAGE-LEASE-RENEW": { severity: "high", title: "Pair lease renewal failed", action: "Treat the pair as failed, inspect pending intents, and restore storage reachability before a later run." },
+  "KVS-STORAGE-LEASE-RELEASE": { severity: "medium", title: "Pair lease release failed", action: "Wait for the finite lease to expire and verify storage reachability. Do not bypass the lease." },
+  "KVS-PAIR-SCAN-FAILED": { severity: "high", title: "Pair scan or planning failed", action: "Inspect the exception type and preceding stage diagnostics. Do not infer that any mutation occurred." },
+  "KVS-PAIR-EXECUTION-FAILED": { severity: "high", title: "Pair execution failed", action: "Inspect pending intents, state persistence, and the private run record before another run." },
+  "KVS-RUN-ORCHESTRATION-FAILED": { severity: "high", title: "Discovery or orchestration failed", action: "Inspect ARM, Key Vault, Blob, credential, and network diagnostics and the durable progress record when available." },
+  "KVS-SYSTEM-FAILURE": { severity: "high", title: "Unclassified runtime failure", action: "Preserve telemetry and the private run record, identify the failing stage, and update the diagnostic catalog." },
+  "KVS-LIFECYCLE": { severity: "ok", title: "Lifecycle transition observed", action: "No administrator action is required unless a later stage is missing or reports a non-success outcome." },
+  "KVS-RBAC-403": { severity: "high", title: "Role-assignment mutation denied", action: "Verify the runtime identity has effective Key Vault Data Access Administrator at the target scope. Check propagation, deny assignments, and role conditions." },
+  "KVS-RBAC-429": { severity: "medium", title: "Role-assignment request throttled", action: "Review ARM throttling and retry only in a later scheduled run after the prior outcome is conclusively known." },
+  "KVS-RBAC-FAILED": { severity: "high", title: "Role-assignment action failed", action: "Inspect the HTTP status and ARM error code, then verify target-scope role-assignment authority." },
+  "KVS-RBAC-VERIFY": { severity: "high", title: "Role-assignment verification did not converge", action: "Read the exact assignment after propagation and compare its scope, principal, role, and condition." },
+  "KVS-RBAC-INVALID-PLAN": { severity: "high", title: "Role-assignment plan is incomplete", action: "Inspect planner inputs and the private run record. Do not execute an assignment manually from incomplete data." },
+  "KVS-RBAC-ROLE-NOT-ALLOWED": { severity: "high", title: "Role is outside the allowlist", action: "Use a supported Key Vault data-plane role. Broader Azure roles are intentionally not replicated." },
+  "KVS-RBAC-SYNC-IDENTITY-MISSING": { severity: "medium", title: "Runtime identity ID is missing", action: "Set KEYVAULTSYNC_PRINCIPAL_ID to the runtime managed identity object ID before target-only assignment deletion." },
+  "KVS-RBAC-ROLE-DEFINITION": { severity: "medium", title: "Role definition is unavailable", action: "Confirm the assignment uses a supported Key Vault data-plane role and that the role definition is visible." },
+  "KVS-RBAC-SELF-PROTECTION": { severity: "ok", title: "Runtime identity self-protection applied", action: "No action is normally required. Manage this assignment only through an approved deployment procedure." },
+  "KVS-RBAC-READY-CREATE": { severity: "low", title: "Role assignment is ready for creation", action: "No action is required unless ARM mutation or verification fails." },
+  "KVS-RBAC-READY-DELETE": { severity: "low", title: "Role assignment is ready for deletion", action: "No action is required unless ARM mutation or verification fails." },
+  "KVS-RBAC-IN-SYNC": { severity: "ok", title: "Role assignment is in sync", action: "No administrator action is required." },
+  "KVS-RBAC-CREATED": { severity: "ok", title: "Role assignment was created and verified", action: "No administrator action is required." },
+  "KVS-RBAC-DELETED": { severity: "ok", title: "Role assignment was deleted and verified", action: "No administrator action is required." },
+  "KVS-RBAC-ALREADY-ABSENT": { severity: "ok", title: "Role assignment was already absent", action: "No administrator action is required." },
+  "KVS-RBAC-INTENT-MATCH": { severity: "low", title: "Legacy RBAC intent matches observed state", action: "Review legacy state only if migration or cleanup remains pending." },
+  "KVS-ACCESS-POLICY-INTENT-MATCH": { severity: "medium", title: "Legacy access-policy intent matches observed state", action: "Access-policy synchronization is not implemented; preserve this evidence for explicit migration or recovery." },
+  "KVS-PLAN-INCOMPLETE-INVENTORY": { severity: "high", title: "Object mutation blocked by incomplete inventory", action: "Resolve every source and target inventory warning, then allow a new complete run to create a new plan." },
+  "KVS-INV-PARTIAL": { severity: "high", title: "Inventory contains warnings", action: "Download the private durable run record to identify each warning. Fix read permission, reachability, or ambiguous object metadata before relying on deletion evidence." },
+  "KVS-INV-COMPLETE": { severity: "ok", title: "Inventory contains no recorded warnings", action: "No administrator action is required for inventory completeness." },
+  "KVS-INV-SECRET-HEAD": { severity: "high", title: "Secret head version is ambiguous", action: "Inspect secret versions in the private run record and establish one unambiguous current version." },
+  "KVS-INV-KEY-HEAD": { severity: "high", title: "Key head version is ambiguous", action: "Inspect key versions and current metadata before the next run." },
+  "KVS-INV-KEY-VERSION-MISMATCH": { severity: "high", title: "Key head is absent from version inventory", action: "Inspect active key versions and allow Key Vault metadata to converge before another run." },
+  "KVS-INV-CERTIFICATE-METADATA": { severity: "high", title: "Certificate backing metadata is unreadable", action: "Verify certificate read permissions and inspect backing secret and key references." },
+  "KVS-INV-CERTIFICATE-HEAD": { severity: "high", title: "Certificate head version is ambiguous", action: "Inspect certificate versions and establish one readable current version." },
+  "KVS-INV-CERTIFICATE-VERSION-MISMATCH": { severity: "high", title: "Certificate head is absent from version inventory", action: "Inspect certificate version metadata and allow observations to converge." },
+  "KVS-INV-DELETED-SECRETS": { severity: "high", title: "Deleted-secret inventory is incomplete", action: "Verify deleted-secret list permission and reachability. Do not use this run as deletion evidence." },
+  "KVS-INV-DELETED-KEYS": { severity: "high", title: "Deleted-key inventory is incomplete", action: "Verify deleted-key list permission and reachability. Do not use this run as deletion evidence." },
+  "KVS-INV-DELETED-CERTIFICATES": { severity: "high", title: "Deleted-certificate inventory is incomplete", action: "Verify deleted-certificate list permission and reachability. Do not use this run as deletion evidence." },
+  "KVS-INV-OBJECT-RBAC": { severity: "high", title: "Object-scope RBAC inventory is incomplete", action: "Verify ARM Reader access and deny assignments at the affected vault or child scope." },
+  "KVS-INV-VAULT-RBAC": { severity: "high", title: "Vault RBAC inventory is incomplete", action: "Verify ARM Reader access and deny assignments at vault and ancestor scopes." },
+  "KVS-INV-UNKNOWN": { severity: "high", title: "Unclassified inventory warning", action: "Inspect the private run record and update the diagnostic catalog before relying on deletion evidence." },
+  "KVS-PLAN-HMAC-MISSING": { severity: "high", title: "Protected HMAC key unavailable", action: "Restore the environment's original protected HMAC key. Never generate a replacement for committed baselines." },
+  "KVS-PLAN-UNRESOLVED-INTENT": { severity: "high", title: "Prior mutation outcome is unresolved", action: "Inspect exact target state through the approved recovery process. Do not automatically retry or clear the intent." },
+  "KVS-PLAN-SOFT-DELETED-NAME": { severity: "high", title: "Target name is soft-deleted", action: "Review the deleted object through approved recovery. KeyVaultSync never purges." },
+  "KVS-PLAN-CERTIFICATE-NONEXPORTABLE": { severity: "medium", title: "Certificate requires reissuance", action: "Reissue or externally import the certificate and private key into the target." },
+  "KVS-PLAN-KEY-PROVISIONING": { severity: "medium", title: "Target key requires independent provisioning", action: "Generate or externally import the target key before key-scope RBAC can converge." },
+  "KVS-PLAN-KEY-EQUIVALENCE": { severity: "medium", title: "Key material equivalence cannot be verified", action: "Treat key material synchronization as an external process." },
+  "KVS-PLAN-INCOMPATIBLE-BASELINE": { severity: "high", title: "Baseline is absent or incompatible", action: "Use explicit administrative recovery. Never silently adopt the target or replace the established HMAC key." },
+  "KVS-PLAN-AUTH-INVENTORY": { severity: "high", title: "Authorization inventory is incomplete", action: "Restore complete ARM role-assignment reads for source and target scopes, then run again." },
+  "KVS-PLAN-DEPENDENCY-FAILED": { severity: "high", title: "Object-scope RBAC dependency failed", action: "Resolve the related object outcome first. Child-scope RBAC will be replanned later." },
+  "KVS-PLAN-EXTERNAL-MODIFICATION": { severity: "high", title: "Target changed outside KeyVaultSync", action: "Identify the external writer and resolve ownership. Do not force overwrite or silently rebaseline." },
+  "KVS-PLAN-UNMANAGED-TARGET": { severity: "high", title: "Unmanaged target object exists", action: "Investigate ownership and use an approved recovery decision; do not automatically adopt or overwrite it." },
+  "KVS-PLAN-UNMANAGED-TARGET-ONLY": { severity: "medium", title: "Target-only object is unmanaged", action: "Confirm ownership. KeyVaultSync will not delete an unmanaged target-only object." },
+  "KVS-PLAN-MANAGED-TARGET-MISSING": { severity: "high", title: "Managed target is missing", action: "Investigate deletion or vault recovery and use explicit state recovery." },
+  "KVS-PLAN-DELETE-CIRCUIT": { severity: "medium", title: "Deletion circuit breaker stopped the plan", action: "Review the exact deletion plan hash and authorize one use only when every proposed deletion is expected." },
+  "KVS-PLAN-READY-CREATE": { severity: "low", title: "Object is ready for guarded creation", action: "No action is required unless execution reports a conflict or failure." },
+  "KVS-PLAN-READY-RECONCILE": { severity: "low", title: "Object is ready for guarded reconciliation", action: "No action is required unless execution reports a conflict, failure, or unresolved intent." },
+  "KVS-PLAN-READY-DELETE": { severity: "low", title: "Object is ready for guarded soft deletion", action: "Review deletion approval when required. KeyVaultSync never purges." },
+  "KVS-PLAN-BLOCKED": { severity: "medium", title: "A safety precondition blocked planned work", action: "Inspect the private run record status and detail, resolve the precondition, and allow a new plan." },
+  "KVS-PLAN-CONFLICT": { severity: "high", title: "Observed target state conflicts with the plan", action: "Investigate target ownership and state. Do not force adoption, overwrite, or deletion." },
+  "KVS-PLAN-UNKNOWN-STATUS": { severity: "high", title: "Unknown plan status", action: "Preserve the private run record and update the analyzer/catalog before interpreting or retrying the item." },
+  "KVS-OBJECT-TARGET-APPEARED": { severity: "high", title: "Target appeared after planning", action: "Identify the concurrent writer and re-establish the operational single-writer boundary." },
+  "KVS-OBJECT-STALE-SOURCE": { severity: "medium", title: "Planned source version is unavailable", action: "Inspect source version lifecycle activity and allow a later run to create a fresh plan." },
+  "KVS-OBJECT-WRITE-DEFINITIVE": { severity: "high", title: "Object write was definitively rejected", action: "Inspect HTTP status and error code, correct authorization, policy, input, or network configuration, then run again." },
+  "KVS-OBJECT-DELETE-DEFINITIVE": { severity: "high", title: "Object delete was definitively rejected", action: "Inspect HTTP status and error code, correct delete authorization or policy, then run again." },
+  "KVS-OBJECT-AMBIGUOUS": { severity: "high", title: "Object mutation outcome is ambiguous", action: "Do not retry automatically. Inspect exact target state and resolve durable intent through the approved recovery process." },
+  "KVS-OBJECT-IN-SYNC": { severity: "ok", title: "Object signatures are in sync", action: "No administrator action is required." },
+  "KVS-OBJECT-REPLICATED": { severity: "ok", title: "Object was replicated and verified", action: "No administrator action is required." },
+  "KVS-OBJECT-DELETED": { severity: "ok", title: "Object was soft-deleted and verified", action: "No administrator action is required. KeyVaultSync does not purge." },
+  "KVS-DISCOVERY-ENABLED": { severity: "ok", title: "Mapping is enabled and eligible", action: "No administrator action is required." },
+  "KVS-DISCOVERY-SOURCE-DISABLED": { severity: "low", title: "Source disables synchronization", action: "Remove or change KeyVaultSyncDisabled=true only when synchronization should resume." },
+  "KVS-DISCOVERY-TARGET-DISABLED": { severity: "low", title: "Target disables synchronization", action: "Remove or change KeyVaultSyncDisabled=true only when synchronization should resume." },
+  "KVS-DISCOVERY-INVALID-SOURCE-ID": { severity: "high", title: "Mapping source ID is invalid", action: "Set sync-source-keyvault-id to the exact versionless ARM ID of the intended source vault." },
+  "KVS-DISCOVERY-TARGET-UNREADABLE": { severity: "high", title: "Target vault is unreadable through ARM", action: "Verify ARM Reader access, network reachability, resource existence, and subscription configuration." },
+  "KVS-DISCOVERY-SOURCE-UNREADABLE": { severity: "high", title: "Source vault is unreadable through ARM", action: "Verify source existence and cross-subscription ARM read authorization." },
+  "KVS-DISCOVERY-SELF-MAPPING": { severity: "high", title: "Vault maps to itself", action: "Correct or remove the target mapping tag." },
+  "KVS-DISCOVERY-CHAIN": { severity: "high", title: "Mapping is chained or cyclic", action: "Use direct source-to-target mappings only. A vault cannot be both source and target." },
+  "KVS-DISCOVERY-TENANT": { severity: "high", title: "Pair tenant metadata is incompatible", action: "Use vaults in the same tenant and restore readable ARM metadata." },
+  "KVS-DISCOVERY-AUTH-MODEL": { severity: "high", title: "Vault authorization model is unsupported", action: "Use Azure RBAC authorization for both vaults." },
+  "KVS-DISCOVERY-UNKNOWN": { severity: "high", title: "Unknown discovery decision", action: "Inspect the private run record and update the diagnostic catalog before changing the mapping." },
+  "KVS-PAIR-COMPLETE": { severity: "ok", title: "Pair completed", action: "No administrator action is required." },
+  "KVS-PAIR-UNAPPLIED": { severity: "high", title: "Pair retains unapplied work", action: "Follow plan diagnostics and inspect the private run record." },
+  "KVS-PAIR-PARTIAL-INVENTORY": { severity: "high", title: "Pair inventory is partial", action: "Resolve source and target inventory diagnostics before another run." },
+  "KVS-PAIR-LOCKED": { severity: "medium", title: "Pair was skipped because its lease is held", action: "Confirm only the intended single active deployment is running, or wait for the legitimate owner." },
+  "KVS-PAIR-PLANNING-BARRIER": { severity: "high", title: "Global planning barrier blocked execution", action: "Resolve the pair that failed planning. No pair mutation should begin until all admitted pairs are planned." },
+  "KVS-PAIR-CANCELLED": { severity: "high", title: "Pair was cancelled", action: "Inspect host shutdown, timeout, deployment, or scale events and pending intents." },
+  "KVS-PAIR-FAILED": { severity: "high", title: "Pair failed", action: "Inspect the associated failure category and private run record before retrying." },
+  "KVS-PAIR-INCOMPLETE": { severity: "high", title: "Pair has a nonterminal status", action: "Determine whether the process was interrupted and inspect lease state and pending intents." },
+  "KVS-PAIR-UNKNOWN": { severity: "high", title: "Unknown pair status", action: "Preserve the run record and update the diagnostic catalog." },
+  "KVS-RUN-COMPLETE": { severity: "ok", title: "Run completed", action: "No administrator action is required." },
+  "KVS-RUN-NO-PAIRS": { severity: "low", title: "No enabled mappings were found", action: "No action is required if intentional; otherwise validate mapping and disabled tags." },
+  "KVS-RUN-PARTIAL": { severity: "high", title: "Run completed partially", action: "Follow the highest-priority diagnostic codes and inspect the durable run record before the next scheduled run." },
+  "KVS-RUN-CANCELLED": { severity: "high", title: "Run was cancelled", action: "Inspect host shutdown, timeout, deployment, or scale events and pending intents." },
+  "KVS-RUN-FAILED": { severity: "high", title: "Run failed", action: "Inspect the structured failure stage and durable run record when available." },
+  "KVS-RUN-INCOMPLETE": { severity: "high", title: "Run has a nonterminal status", action: "Determine whether the Function was interrupted and inspect pair states and pending intents." },
+  "KVS-RUN-UNKNOWN": { severity: "high", title: "Unknown run status", action: "Preserve telemetry and update the diagnostic catalog." }
+};
+
+const statusCodes = {
+  "INVENTORY_WARNING": "KVS-INV-PARTIAL",
+  "BLOCKED_INCOMPLETE_INVENTORY": "KVS-PLAN-INCOMPLETE-INVENTORY",
+  "BLOCKED_HMAC_KEY_NOT_CONFIGURED": "KVS-PLAN-HMAC-MISSING",
+  "BLOCKED_UNRESOLVED_INTENT": "KVS-PLAN-UNRESOLVED-INTENT",
+  "BLOCKED_SOFT_DELETED_TARGET": "KVS-PLAN-SOFT-DELETED-NAME",
+  "BLOCKED_CERTIFICATE_REISSUANCE_REQUIRED": "KVS-PLAN-CERTIFICATE-NONEXPORTABLE",
+  "BLOCKED_TARGET_KEY_PROVISIONING_REQUIRED": "KVS-PLAN-KEY-PROVISIONING",
+  "BLOCKED_KEY_MATERIAL_EQUIVALENCE_UNVERIFIABLE": "KVS-PLAN-KEY-EQUIVALENCE",
+  "BLOCKED_DELETE_CIRCUIT_BREAKER": "KVS-PLAN-DELETE-CIRCUIT",
+  "BLOCKED_INCOMPATIBLE_BASELINE": "KVS-PLAN-INCOMPATIBLE-BASELINE",
+  "BLOCKED_AUTHORIZATION_INVENTORY_INCOMPLETE": "KVS-PLAN-AUTH-INVENTORY",
+  "BLOCKED_SYNC_IDENTITY_UNKNOWN": "KVS-RBAC-SYNC-IDENTITY-MISSING",
+  "RBAC_DELETE_BLOCKED_SYNC_IDENTITY_UNKNOWN": "KVS-RBAC-SYNC-IDENTITY-MISSING",
+  "BLOCKED_DEPENDENCY_FAILED": "KVS-PLAN-DEPENDENCY-FAILED",
+  "CONFLICT_UNMANAGED_TARGET_EXISTS": "KVS-PLAN-UNMANAGED-TARGET",
+  "CONFLICT_UNMANAGED_TARGET_ONLY": "KVS-PLAN-UNMANAGED-TARGET-ONLY",
+  "CONFLICT_MANAGED_TARGET_MISSING": "KVS-PLAN-MANAGED-TARGET-MISSING",
+  "CONFLICT_TARGET_APPEARED": "KVS-OBJECT-TARGET-APPEARED",
+  "CONFLICT_EXTERNALLY_MODIFIED": "KVS-PLAN-EXTERNAL-MODIFICATION",
+  "STALE_PLAN_SOURCE_VERSION_UNAVAILABLE": "KVS-OBJECT-STALE-SOURCE",
+  "WRITE_FAILED_DEFINITIVELY": "KVS-OBJECT-WRITE-DEFINITIVE",
+  "DELETE_FAILED_DEFINITIVELY": "KVS-OBJECT-DELETE-DEFINITIVE",
+  "AMBIGUOUS_OUTCOME_UNRESOLVED_INTENT": "KVS-OBJECT-AMBIGUOUS",
+  "ROLE_DEFINITION_NOT_AVAILABLE": "KVS-RBAC-ROLE-DEFINITION",
+  "RBAC_ACTION_FAILED": "KVS-RBAC-FAILED",
+  "RBAC_ACTION_FAILED_VERIFICATION": "KVS-RBAC-VERIFY",
+  "RBAC_ACTION_FAILED_INVALID_PLAN": "KVS-RBAC-INVALID-PLAN",
+  "RBAC_ACTION_BLOCKED_ROLE_NOT_ALLOWED": "KVS-RBAC-ROLE-NOT-ALLOWED",
+  "RBAC_DELETE_SKIPPED_SYNC_IDENTITY": "KVS-RBAC-SELF-PROTECTION",
+  "SKIPPED_SYNC_IDENTITY_SELF_ASSIGNMENT": "KVS-RBAC-SELF-PROTECTION",
+  "READY_CREATE_IF_TARGET_STAYS_EMPTY": "KVS-PLAN-READY-CREATE",
+  "VERIFY_SIGNATURES_THEN_RECONCILE": "KVS-PLAN-READY-RECONCILE",
+  "VERIFY_SIGNATURE_THEN_SOFT_DELETE": "KVS-PLAN-READY-DELETE",
+  "READY_CREATE_ROLE_ASSIGNMENT": "KVS-RBAC-READY-CREATE",
+  "READY_DELETE_ROLE_ASSIGNMENT": "KVS-RBAC-READY-DELETE",
+  "IN_SYNC_SIGNATURE_VERIFIED": "KVS-OBJECT-IN-SYNC",
+  "OBJECT_REPLICATED_AND_VERIFIED": "KVS-OBJECT-REPLICATED",
+  "OBJECT_SOFT_DELETED_AND_VERIFIED": "KVS-OBJECT-DELETED",
+  "RBAC_ASSIGNMENT_IN_SYNC": "KVS-RBAC-IN-SYNC",
+  "RBAC_ASSIGNMENT_CREATED_AND_VERIFIED": "KVS-RBAC-CREATED",
+  "RBAC_ASSIGNMENT_DELETED_AND_VERIFIED": "KVS-RBAC-DELETED",
+  "RBAC_CREATED_AND_VERIFIED": "KVS-RBAC-CREATED",
+  "RBAC_DELETED_AND_VERIFIED": "KVS-RBAC-DELETED",
+  "RBAC_ALREADY_ABSENT": "KVS-RBAC-ALREADY-ABSENT",
+  "RBAC_ASSIGNMENT_INTENT_MATCH": "KVS-RBAC-INTENT-MATCH",
+  "ACCESS_POLICY_INTENT_MATCH": "KVS-ACCESS-POLICY-INTENT-MATCH"
+};
+
+const state = { name: "", kind: "", rows: [], findings: [], timeline: [], meta: {} };
+const $ = id => document.getElementById(id);
+const drop = $("drop");
+const fileInput = $("file");
+
+$("choose").addEventListener("click", () => fileInput.click());
+$("clear").addEventListener("click", reset);
+$("export").addEventListener("click", downloadSummary);
+$("export-html").addEventListener("click", downloadHtmlSummary);
+$("identifiers").addEventListener("change", render);
+fileInput.addEventListener("change", () => fileInput.files[0] && analyze(fileInput.files[0]));
+drop.addEventListener("keydown", event => {
+  if (event.key === "Enter" || event.key === " ") { event.preventDefault(); fileInput.click(); }
+});
+["dragenter", "dragover"].forEach(type => drop.addEventListener(type, event => {
+  event.preventDefault(); drop.classList.add("drag");
+}));
+["dragleave", "drop"].forEach(type => drop.addEventListener(type, event => {
+  event.preventDefault(); drop.classList.remove("drag");
+}));
+drop.addEventListener("drop", event => event.dataTransfer.files[0] && analyze(event.dataTransfer.files[0]));
+
+async function analyze(file) {
+  try {
+    reset(false);
+    if (!file.size) throw new Error("The selected file is empty.");
+    if (file.size > 25 * 1024 * 1024) throw new Error("The selected file exceeds the 25 MB browser safety limit.");
+    state.name = file.name;
+    const text = await file.text();
+    if (!text.trim()) throw new Error("The selected file contains no text.");
+    if (file.name.toLowerCase().endsWith(".json") || text.trimStart().startsWith("{")) parseRunRecord(JSON.parse(text));
+    else parseCsv(text);
+    finalize();
+    render();
+  } catch (error) {
+    $("error").textContent = `Could not analyze the file: ${error.message}`;
+    $("error").hidden = false;
+  }
+}
+
+function parseCsv(text) {
+  state.kind = "Telemetry CSV";
+  const table = csvRows(text);
+  if (table.length < 2) throw new Error("The CSV has no data rows.");
+  const headers = table[0].map(normalizeHeader);
+  if (new Set(headers).size !== headers.length) throw new Error("The CSV contains duplicate normalized column names.");
+  if (!headers.some(header => ["message", "outermessage", "innermostmessage", "renderedmessage"].includes(header))) {
+    throw new Error("The CSV does not contain a supported message column.");
+  }
+  state.rows = table.slice(1).filter(row => row.some(Boolean)).map(row =>
+    Object.fromEntries(headers.map((header, index) => [header, row[index] || ""])));
+  for (const row of state.rows) {
+    const message = pick(row, "message", "outermessage", "innermostmessage", "renderedmessage");
+    const timestamp = pick(row, "timestamp", "timestamputc", "timegenerated", "datetime", "precisetimestamp");
+    const dimensions = parseDimensions(pick(row, "customdimensions", "properties", "customproperties"));
+    const explicitCode = dimensions.DiagnosticCode || dimensions.diagnosticCode || codeFromMessage(message);
+    if (explicitCode) addFinding(explicitCode, message, timestamp, "Evidence");
+    detectLegacy(message, timestamp);
+    if (message) state.timeline.push({ timestamp, message, level: pick(row, "severitylevel", "level", "loglevel") });
+    const runStatus = dimensions.RunStatus || dimensions.runStatus || statusFromMessage(message);
+    if (runStatus) state.meta.status = runStatus;
+  }
+  state.meta.records = state.rows.length;
+  const times = state.timeline.map(item => Date.parse(item.timestamp)).filter(Number.isFinite).sort((a, b) => a - b);
+  if (times.length > 1) state.meta.duration = times[times.length - 1] - times[0];
+}
+
+function parseRunRecord(record) {
+  validateRunRecord(record);
+  state.kind = "Durable run record JSON";
+  state.meta.status = record.status || "Unknown";
+  state.meta.records = 1;
+  state.meta.duration = durationBetween(record.startedAt, record.completedAt);
+  const pairs = Array.isArray(record.pairs) ? record.pairs : [];
+  state.meta.pairs = pairs.length;
+  (record.discoveryIssues || []).forEach(issue =>
+    addFinding(classifyDiscoveryIssue(issue), `Discovery issue: ${issue}`, record.completedAt || record.startedAt, "Evidence"));
+  pairs.forEach((pair, pairIndex) => {
+    const sourceWarnings = pair.source?.warnings || [];
+    const targetWarnings = pair.target?.warnings || [];
+    if (pair.source && sourceWarnings.length === 0) addFinding("KVS-INV-COMPLETE", `Pair ${pairIndex + 1} source inventory recorded no warnings.`, pair.completedAt || pair.startedAt, "Evidence");
+    if (pair.target && targetWarnings.length === 0) addFinding("KVS-INV-COMPLETE", `Pair ${pairIndex + 1} target inventory recorded no warnings.`, pair.completedAt || pair.startedAt, "Evidence");
+    [...sourceWarnings, ...targetWarnings].forEach((warning, index) => {
+      const code = classifyWarning(warning);
+      addFinding(code, `Pair ${pairIndex + 1}, inventory warning ${index + 1}: ${warning}`, pair.completedAt || pair.startedAt, "Evidence");
+    });
+    (pair.plan || []).forEach(item => {
+      const code = codeForStatus(item.status || "");
+      const planEvidence = `Pair ${pairIndex + 1}: ${item.objectType || "item"} ${item.action || "None"} ended as ${item.status || "unknown"}. ${item.detail || ""}`;
+      addFinding(code, planEvidence, pair.completedAt || pair.startedAt, "Evidence");
+      const persistedFailureCode = codeForPersistedFailure(item);
+      if (persistedFailureCode) addFinding(persistedFailureCode, planEvidence, pair.completedAt || pair.startedAt, "Evidence");
+    });
+    addFinding(codeForPairStatus(pair.status), `Pair ${pairIndex + 1} status: ${pair.status}.`, pair.completedAt || pair.startedAt, "Evidence");
+    state.timeline.push({ timestamp: pair.completedAt || pair.startedAt, message: `Pair ${pairIndex + 1} completed with status ${pair.status}.`, level: pair.status === "SyncCompleted" ? "Information" : "Warning" });
+  });
+  addFinding(codeForRunStatus(state.meta.status), `Run status: ${state.meta.status}.`, record.completedAt, "Evidence");
+}
+
+function detectLegacy(message, timestamp) {
+  let match = message.match(/inventory finished.+?(\d+)\s+warnings/i);
+  if (match && Number(match[1]) > 0) addFinding("KVS-INV-PARTIAL", `${match[1]} inventory warnings were reported.`, timestamp, "Evidence");
+  match = message.match(/(\d+)\s+blocked or conflicting/i);
+  if (match && Number(match[1]) > 0) addFinding("KVS-PLAN-INCOMPLETE-INVENTORY", `${match[1]} plan items were blocked or conflicting.`, timestamp, "Inference");
+  if (/RBAC mutation failed.+HTTP\s+403/i.test(message) || /role-assignment request failed.+HTTP\s+403/i.test(message)) addFinding("KVS-RBAC-403", message, timestamp, "Evidence");
+  if (/Could not persist run record/i.test(message)) addFinding("KVS-STORAGE-RUN-RECORD", message, timestamp, "Evidence");
+  if (/Could not save checkpoint/i.test(message)) addFinding("KVS-STORAGE-PAIR-STATE", message, timestamp, "Evidence");
+  if (/lease renewal failed/i.test(message)) addFinding("KVS-STORAGE-LEASE-RENEW", message, timestamp, "Evidence");
+  if (/Could not release Blob lease/i.test(message)) addFinding("KVS-STORAGE-LEASE-RELEASE", message, timestamp, "Evidence");
+  if (/Skipped pair.+holds its state lease/i.test(message)) addFinding("KVS-PAIR-LOCKED", message, timestamp, "Evidence");
+  if (/Object mutation outcome is ambiguous|verification outcome is ambiguous|delete outcome is ambiguous/i.test(message)) addFinding("KVS-OBJECT-AMBIGUOUS", message, timestamp, "Evidence");
+  if (/Pair scan failed/i.test(message)) addFinding("KVS-PAIR-SCAN-FAILED", message, timestamp, "Evidence");
+  if (/Pair execution failed/i.test(message)) addFinding("KVS-PAIR-EXECUTION-FAILED", message, timestamp, "Evidence");
+  if (/failed during discovery or orchestration/i.test(message)) addFinding("KVS-RUN-ORCHESTRATION-FAILED", message, timestamp, "Evidence");
+  const pairStatus = message.match(/Pair .+ completed with status ([A-Za-z]+)/i)?.[1];
+  if (pairStatus) addFinding(codeForPairStatus(pairStatus), message, timestamp, "Evidence");
+  const runStatus = message.match(/Run .+ completed with status ([A-Za-z]+)/i)?.[1];
+  if (runStatus) addFinding(codeForRunStatus(runStatus), message, timestamp, "Evidence");
+  const discoveryDecision = message.match(/decision:\s*([A-Za-z]+)/i)?.[1];
+  if (discoveryDecision) addFinding(codeForDiscoveryDecision(discoveryDecision), message, timestamp, "Evidence");
+}
+
+function finalize() {
+  const byCode = new Map();
+  for (const finding of state.findings) {
+    if (!byCode.has(finding.code)) byCode.set(finding.code, { ...finding, count: 0, evidence: [] });
+    const aggregate = byCode.get(finding.code);
+    aggregate.count++;
+    if (aggregate.evidence.length < 5) aggregate.evidence.push({ text: finding.text, timestamp: finding.timestamp, basis: finding.basis });
+  }
+  state.findings = [...byCode.values()]
+    .map(finding => ({ ...finding, priority: priorityForFinding(finding) }))
+    .sort((a, b) => a.priority.rank - b.priority.rank || severityRank(a.severity) - severityRank(b.severity) || a.code.localeCompare(b.code));
+  if (!state.findings.length) {
+    state.findings.push({ code: "KVS-NO-KNOWN-ISSUE", title: "No known failure signature detected", severity: "ok", action: "Confirm the final run and pair statuses in the durable run record; absence of a recognized signature is not proof of successful synchronization.", count: 1, priority: { rank: 4, label: "P4 · Observe" }, evidence: [{ text: "No cataloged diagnostic code or legacy failure pattern was present.", timestamp: "", basis: "Inference" }] });
+  }
+  state.meta.assessment = deriveAssessment();
+  state.timeline.sort((a, b) => (Date.parse(a.timestamp) || 0) - (Date.parse(b.timestamp) || 0));
+}
+
+function addFinding(code, text, timestamp, basis) {
+  const known = catalog[code] || inferCatalog(code);
+  state.findings.push({ code, text, timestamp, basis, ...known });
+}
+
+function inferCatalog(code) {
+  if (code.startsWith("KVS-INV-")) return { severity: "high", title: "Inventory evidence is incomplete", action: "Inspect the exact warning in the private run record, restore complete read access or metadata, and run again." };
+  if (code.startsWith("KVS-RBAC-")) return { severity: "high", title: "Role-assignment reconciliation needs attention", action: "Inspect the structured HTTP and error fields, then verify effective target-scope authority and deny assignments." };
+  if (code.startsWith("KVS-PLAN-")) return { severity: "medium", title: "Planned work needs administrator attention", action: "Inspect the status and detail in the private run record before retrying or approving recovery." };
+  return { severity: "medium", title: "KeyVaultSync diagnostic", action: "Inspect the private durable run record for exact subjects and evidence." };
+}
+
+function render() {
+  if (!state.name) return;
+  $("error").hidden = true;
+  $("empty").hidden = true;
+  $("results").hidden = false;
+  $("clear").disabled = false;
+  $("export").disabled = false;
+  $("export-html").disabled = false;
+  const priorityFindings = state.findings.filter(finding => finding.priority.rank <= 2).length;
+  $("summary").innerHTML = [
+    metric("Source", state.kind),
+    metric("Run status", state.meta.status || "Not present"),
+    metric("Assessment", `${statusSymbol(state.meta.assessment)} ${state.meta.assessment}`),
+    metric("Priority findings", priorityFindings),
+    metric("Observed duration", state.meta.duration ? formatDuration(state.meta.duration) : "Not available")
+  ].join("");
+  $("findings").innerHTML = state.findings.map(renderFinding).join("");
+  $("assessment").textContent = `${statusSymbol(state.meta.assessment)} ${state.meta.assessment}. Recommendations are inferences ranked from the observed evidence.`;
+  const actions = [...new Map(state.findings
+    .filter(finding => finding.priority.rank <= 3)
+    .map(finding => [finding.action, finding])).values()];
+  $("actions").innerHTML = actions.length
+    ? actions.map(finding => `<li><span class="badge priority">${escapeHtml(finding.priority.label)}</span><br>${escapeHtml(finding.action)}</li>`).join("")
+    : "<li>No administrator action is indicated by the recognized evidence.</li>";
+  $("timeline").innerHTML = state.timeline.length
+    ? state.timeline.slice(0, 200).map(item => `<div class="timeline-item"><time>${escapeHtml(formatTime(item.timestamp))}</time><span>${escapeHtml(displayEvidence(item.message))}</span></div>`).join("")
+    : `<p class="muted">The input did not contain timestamped telemetry.</p>`;
+}
+
+function renderFinding(finding) {
+  const evidence = finding.evidence.map(item =>
+    `<div class="evidence"><span class="basis">${escapeHtml(item.basis)}</span>${item.timestamp ? ` · ${escapeHtml(formatTime(item.timestamp))}` : ""}<br>${escapeHtml(displayEvidence(item.text))}</div>`).join("");
+  return `<article class="finding ${finding.severity}">
+    <div class="row"><div><div class="code">${escapeHtml(finding.code)}</div><h3>${statusSymbolForSeverity(finding.severity)} ${escapeHtml(finding.title)}</h3></div><div><span class="badge priority">${escapeHtml(finding.priority.label)}</span> <span class="badge">${finding.count} signal${finding.count === 1 ? "" : "s"}</span></div></div>
+    <p class="recommendation"><span class="basis">Inference · Recommended action</span><br>${escapeHtml(finding.action)}</p>${evidence}
+  </article>`;
+}
+
+function metric(label, value) { return `<div class="metric"><span>${escapeHtml(String(label))}</span><strong>${escapeHtml(String(value))}</strong></div>`; }
+function severityRank(value) { return ({ high: 0, medium: 1, low: 2, ok: 3 })[value] ?? 2; }
+function priorityForFinding(finding) {
+  if (["KVS-RBAC-403", "KVS-OBJECT-AMBIGUOUS", "KVS-PLAN-UNRESOLVED-INTENT", "KVS-STORAGE-PAIR-STATE", "KVS-STORAGE-LEASE-RENEW"].includes(finding.code)) return { rank: 1, label: "P1 · Stop and investigate" };
+  if (finding.severity === "high") return { rank: 2, label: "P2 · High" };
+  if (finding.severity === "medium") return { rank: 3, label: "P3 · Review" };
+  return { rank: 4, label: "P4 · Observe" };
+}
+function deriveAssessment() {
+  if (state.findings.some(finding => finding.priority.rank === 1)) return "Blocked";
+  if (state.meta.status === "Partial" || state.findings.some(finding => finding.code.startsWith("KVS-INV-") && finding.severity !== "ok")) return "Partial";
+  if (state.findings.some(finding => finding.priority.rank === 2)) return "Needs review";
+  return "Healthy";
+}
+function statusSymbol(status) { return ({ "Healthy": "✓", "Partial": "!", "Needs review": "!", "Blocked": "×" })[status] || "!"; }
+function statusSymbolForSeverity(severity) { return ({ ok: "✓", low: "✓", medium: "!", high: "×" })[severity] || "!"; }
+function codeForStatus(status) {
+  return statusCodes[status]
+    || (status.startsWith("CONFLICT") ? "KVS-PLAN-CONFLICT" : "")
+    || (status.startsWith("BLOCKED") ? "KVS-PLAN-BLOCKED" : "")
+    || "KVS-PLAN-UNKNOWN-STATUS";
+}
+function codeForPersistedFailure(item) {
+  if (item.objectType !== "Authorization" || item.status !== "RBAC_ACTION_FAILED") return "";
+  if (/HTTP\s+403\b/i.test(item.detail || "")) return "KVS-RBAC-403";
+  if (/HTTP\s+429\b/i.test(item.detail || "")) return "KVS-RBAC-429";
+  return "";
+}
+function codeForPairStatus(status) {
+  return ({
+    "SyncCompleted": "KVS-PAIR-COMPLETE",
+    "SyncCompletedWithUnappliedWork": "KVS-PAIR-UNAPPLIED",
+    "PartialInventory": "KVS-PAIR-PARTIAL-INVENTORY",
+    "SkippedPairAlreadyLocked": "KVS-PAIR-LOCKED",
+    "ExecutionBlockedPlanningIncomplete": "KVS-PAIR-PLANNING-BARRIER",
+    "Cancelled": "KVS-PAIR-CANCELLED",
+    "Failed": "KVS-PAIR-FAILED",
+    "Running": "KVS-PAIR-INCOMPLETE",
+    "Planned": "KVS-PAIR-INCOMPLETE",
+    "Executing": "KVS-PAIR-INCOMPLETE"
+  })[status] || "KVS-PAIR-UNKNOWN";
+}
+function codeForRunStatus(status) {
+  return ({
+    "Complete": "KVS-RUN-COMPLETE",
+    "NoConfiguredPairs": "KVS-RUN-NO-PAIRS",
+    "Partial": "KVS-RUN-PARTIAL",
+    "Cancelled": "KVS-RUN-CANCELLED",
+    "Failed": "KVS-RUN-FAILED",
+    "Running": "KVS-RUN-INCOMPLETE"
+  })[status] || "KVS-RUN-UNKNOWN";
+}
+function codeForDiscoveryDecision(decision) {
+  return ({
+    "Enabled": "KVS-DISCOVERY-ENABLED",
+    "SourceDisabled": "KVS-DISCOVERY-SOURCE-DISABLED",
+    "TargetDisabled": "KVS-DISCOVERY-TARGET-DISABLED",
+    "InvalidSourceId": "KVS-DISCOVERY-INVALID-SOURCE-ID",
+    "TargetUnreadable": "KVS-DISCOVERY-TARGET-UNREADABLE",
+    "SourceUnreadable": "KVS-DISCOVERY-SOURCE-UNREADABLE",
+    "SourceMapsToSelf": "KVS-DISCOVERY-SELF-MAPPING",
+    "ChainedOrCyclicMapping": "KVS-DISCOVERY-CHAIN",
+    "CrossTenantOrUnknownTenant": "KVS-DISCOVERY-TENANT",
+    "UnsupportedAuthorizationModel": "KVS-DISCOVERY-AUTH-MODEL"
+  })[decision] || "KVS-DISCOVERY-UNKNOWN";
+}
+function classifyWarning(warning) {
+  if (/Secret head version/.test(warning)) return "KVS-INV-SECRET-HEAD";
+  if (/Key head version/.test(warning)) return "KVS-INV-KEY-HEAD";
+  if (/Key version inventory/.test(warning)) return "KVS-INV-KEY-VERSION-MISMATCH";
+  if (/Certificate metadata/.test(warning)) return "KVS-INV-CERTIFICATE-METADATA";
+  if (/Certificate head version/.test(warning)) return "KVS-INV-CERTIFICATE-HEAD";
+  if (/Certificate version inventory/.test(warning)) return "KVS-INV-CERTIFICATE-VERSION-MISMATCH";
+  if (/Deleted-secret/.test(warning)) return "KVS-INV-DELETED-SECRETS";
+  if (/Deleted-key/.test(warning)) return "KVS-INV-DELETED-KEYS";
+  if (/Deleted-certificate/.test(warning)) return "KVS-INV-DELETED-CERTIFICATES";
+  if (/Object role-assignment/.test(warning)) return "KVS-INV-OBJECT-RBAC";
+  if (/Role-assignment inventory/.test(warning)) return "KVS-INV-VAULT-RBAC";
+  return "KVS-INV-UNKNOWN";
+}
+
+function classifyDiscoveryIssue(issue) {
+  if (/Invalid sync-source-keyvault-id/i.test(issue)) return "KVS-DISCOVERY-INVALID-SOURCE-ID";
+  if (/Target .+ could not be read/i.test(issue)) return "KVS-DISCOVERY-TARGET-UNREADABLE";
+  if (/Source .+ could not be read/i.test(issue)) return "KVS-DISCOVERY-SOURCE-UNREADABLE";
+  if (/maps to itself/i.test(issue)) return "KVS-DISCOVERY-SELF-MAPPING";
+  if (/both a source and a target|chained|cyclic/i.test(issue)) return "KVS-DISCOVERY-CHAIN";
+  if (/same tenant/i.test(issue)) return "KVS-DISCOVERY-TENANT";
+  if (/Azure RBAC authorization/i.test(issue)) return "KVS-DISCOVERY-AUTH-MODEL";
+  return "KVS-DISCOVERY-UNKNOWN";
+}
+
+function validateRunRecord(record) {
+  if (!record || Array.isArray(record) || typeof record !== "object") throw new Error("The JSON root must be a run-record object.");
+  if (typeof record.status !== "string" || !record.status) throw new Error("The run record is missing a string status.");
+  if (!Array.isArray(record.pairs)) throw new Error("The run record is missing the pairs array.");
+  if (record.discoveryIssues !== undefined && !Array.isArray(record.discoveryIssues)) throw new Error("discoveryIssues must be an array when present.");
+  record.pairs.forEach((pair, pairIndex) => {
+    if (!pair || typeof pair !== "object" || typeof pair.status !== "string") throw new Error(`Pair ${pairIndex + 1} is missing a string status.`);
+    if (pair.plan !== undefined && !Array.isArray(pair.plan)) throw new Error(`Pair ${pairIndex + 1} plan must be an array.`);
+    ["source", "target"].forEach(role => {
+      if (pair[role]?.warnings !== undefined && !Array.isArray(pair[role].warnings)) {
+        throw new Error(`Pair ${pairIndex + 1} ${role} warnings must be an array.`);
+      }
+    });
+    (pair.plan || []).forEach((item, itemIndex) => {
+      if (!item || typeof item.status !== "string") throw new Error(`Pair ${pairIndex + 1} plan item ${itemIndex + 1} is missing a string status.`);
+    });
+  });
+}
+
+function csvRows(text) {
+  const rows = []; let row = []; let field = ""; let quoted = false;
+  for (let index = 0; index < text.length; index++) {
+    const character = text[index];
+    if (quoted) {
+      if (character === '"' && text[index + 1] === '"') { field += '"'; index++; }
+      else if (character === '"') quoted = false;
+      else field += character;
+    } else if (character === '"') quoted = true;
+    else if (character === ",") { row.push(field); field = ""; }
+    else if (character === "\n") { row.push(field.replace(/\r$/, "")); rows.push(row); row = []; field = ""; }
+    else field += character;
+  }
+  if (quoted) throw new Error("The CSV contains an unterminated quoted field.");
+  if (field || row.length) { row.push(field.replace(/\r$/, "")); rows.push(row); }
+  return rows;
+}
+
+function normalizeHeader(value) { return value.trim().toLowerCase().replace(/[^a-z0-9]/g, ""); }
+function pick(row, ...keys) { for (const key of keys) if (row[key]) return row[key]; return ""; }
+function parseDimensions(value) { try { return value ? JSON.parse(value) : {}; } catch { return {}; } }
+function codeFromMessage(message) { return message.match(/\b(KVS-[A-Z0-9-]+)\b/)?.[1] || ""; }
+function statusFromMessage(message) { return message.match(/run (?:completed|ended).+?status\s+([A-Za-z]+)/i)?.[1] || ""; }
+function durationBetween(start, end) { const value = Date.parse(end) - Date.parse(start); return Number.isFinite(value) && value >= 0 ? value : 0; }
+function formatDuration(milliseconds) {
+  const seconds = Math.round(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+function formatTime(value) { const date = new Date(value); return Number.isNaN(date.valueOf()) ? (value || "Unknown time") : date.toISOString(); }
+function displayEvidence(value) { return $("identifiers").checked ? value : redact(value); }
+function redact(value) {
+  return String(value)
+    .replace(/\/subscriptions\/[^ "';,]+/gi, "[resource-id]")
+    .replace(/https?:\/\/[^ /\s]+/gi, "[service-host]")
+    .replace(/\b\d{8}T\d+Z-[0-9a-f]{32}\b/gi, "[run-id]")
+    .replace(/\b[0-9a-f]{32}\b/gi, "[identifier]")
+    .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/gi, "[guid]")
+    .replace(/\bfor\s+([A-Za-z0-9][A-Za-z0-9._-]{2,})(?=[:;,. ]|$)/gi, "for [name]")
+    .replace(/\b(Source|Target|Vault|secret|certificate|key)\s+([A-Za-z0-9][A-Za-z0-9._-]{2,})/g, "$1 [name]");
+}
+function escapeHtml(value) { return String(value).replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character]); }
+
+function downloadSummary() {
+  downloadBlob(
+    JSON.stringify(createSanitizedSummary(), null, 2),
+    "application/json",
+    "keyvaultsync-sanitized-incident-summary.json");
+}
+
+function createSanitizedSummary() {
+  return {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    sourceType: state.kind,
+    sourceFile: "[redacted]",
+    runStatus: state.meta.status || null,
+    assessment: state.meta.assessment || "Unknown",
+    observedDurationMs: state.meta.duration || null,
+    interpretation: "Evidence comes from parsed input. Recommendations are inferences and do not prove live state.",
+    findings: state.findings.map(finding => ({
+      code: finding.code, severity: finding.severity, priority: finding.priority.label, title: finding.title, signalCount: finding.count,
+      recommendedAction: finding.action,
+      evidence: finding.evidence.map(item => ({ basis: item.basis, timestamp: item.timestamp || null, text: redact(item.text) }))
+    }))
+  };
+}
+
+function downloadHtmlSummary() {
+  const summary = createSanitizedSummary();
+  const findings = summary.findings.map(finding => `<section><h2>${escapeHtml(finding.code)} · ${escapeHtml(finding.title)}</h2><p><strong>${escapeHtml(finding.priority)}</strong></p><p><strong>Inference · Recommended action:</strong> ${escapeHtml(finding.recommendedAction)}</p>${finding.evidence.map(item => `<p><strong>${escapeHtml(item.basis)}:</strong> ${escapeHtml(item.text)}</p>`).join("")}</section>`).join("");
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Sanitized KeyVaultSync incident summary</title><script>(()=>{const param=new URLSearchParams(window.location.search).get("scoutTheme");const theme=param||(window.matchMedia("(prefers-color-scheme: dark)").matches?"dark":"light");document.documentElement.setAttribute("data-theme",theme);})();<\/script><style>
+:root {
+  color-scheme: light;
+  --cp-bg: #f7f4ef;
+  --cp-bg-elevated: #fcfbf8;
+  --cp-surface: #ffffff;
+  --cp-surface-soft: #f5f5f5;
+  --cp-border: #dedede;
+  --cp-border-strong: #919191;
+  --cp-text: #242424;
+  --cp-text-muted: #5c5c5c;
+  --cp-text-soft: #6f6f6f;
+  --cp-accent: #b11f4b;
+  --cp-accent-hover: #9a1a41;
+  --cp-accent-soft: rgba(177, 31, 75, 0.08);
+  --cp-accent-fg: #ffffff;
+  --cp-success: #16a34a;
+  --cp-danger: #dc2626;
+  --cp-warning: #f59e0b;
+  --cp-link: #0078d4;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.12);
+  --cp-overlay: rgba(255, 255, 255, 0.8);
+  --cp-panel: rgba(255, 255, 255, 0.86);
+  --cp-panel-strong: rgba(255, 255, 255, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.55);
+  --cp-highlight: rgba(177, 31, 75, 0.12);
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --cp-bg: #3d3b3a;
+  --cp-bg-elevated: #343231;
+  --cp-surface: #292929;
+  --cp-surface-soft: #2e2e2e;
+  --cp-border: #474747;
+  --cp-border-strong: #5f5f5f;
+  --cp-text: #dedede;
+  --cp-text-muted: #919191;
+  --cp-text-soft: #b0b0b0;
+  --cp-accent: #fd8ea1;
+  --cp-accent-hover: #fb7b91;
+  --cp-accent-soft: rgba(253, 142, 161, 0.14);
+  --cp-accent-fg: #1a1a1a;
+  --cp-success: #4ade80;
+  --cp-danger: #f87171;
+  --cp-warning: #fbbf24;
+  --cp-link: #4da6ff;
+  --cp-shadow: 0 18px 48px rgba(0, 0, 0, 0.32);
+  --cp-overlay: rgba(41, 41, 41, 0.88);
+  --cp-panel: rgba(41, 41, 41, 0.72);
+  --cp-panel-strong: rgba(41, 41, 41, 0.96);
+  --cp-sheen: rgba(255, 255, 255, 0.04);
+  --cp-highlight: rgba(253, 142, 161, 0.12);
+}
+body{margin:0;background:var(--cp-bg);color:var(--cp-text);font-family:"Segoe UI",Aptos,Calibri,-apple-system,BlinkMacSystemFont,sans-serif;line-height:1.5}main{max-width:900px;margin:auto;padding:32px}section{margin:16px 0;padding:20px;background:var(--cp-surface);border:1px solid var(--cp-border);border-radius:16px}h1,h2{color:var(--cp-text)}p{color:var(--cp-text-muted)}
+</style></head><body><main><h1>KeyVaultSync incident summary</h1><p><strong>Assessment:</strong> ${escapeHtml(summary.assessment)}</p><p>${escapeHtml(summary.interpretation)}</p>${findings}</main></body></html>`;
+  downloadBlob(html, "text/html", "keyvaultsync-sanitized-incident-summary.html");
+}
+
+function downloadBlob(content, type, fileName) {
+  const blob = new Blob([content], { type });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(link.href);
+}
+
+function reset(renderEmpty = true) {
+  Object.assign(state, { name: "", kind: "", rows: [], findings: [], timeline: [], meta: {} });
+  fileInput.value = "";
+  $("results").hidden = true; $("error").hidden = true; $("empty").hidden = !renderEmpty;
+  $("clear").disabled = true; $("export").disabled = true; $("export-html").disabled = true;
+}
+</script>
+</body>
+</html>

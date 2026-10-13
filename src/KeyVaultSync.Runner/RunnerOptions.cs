@@ -42,13 +42,13 @@ internal sealed record RunnerOptions
             if (Environment.GetEnvironmentVariable(retiredSetting) is not null)
             {
                 throw new ArgumentException(
-                    $"{retiredSetting} is no longer supported. Remove it; an enabled source/target mapping automatically enables supported synchronization operations.");
+                    $"[KVS-CONFIG-RETIRED] {retiredSetting} is no longer supported. Remove it; an enabled source/target mapping automatically enables supported synchronization operations.");
             }
         }
 
         if (args.Length != 0)
         {
-            throw new ArgumentException("Command-line configuration is no longer supported. Configure the Azure Function through application settings.");
+            throw new ArgumentException("[KVS-CONFIG-COMMAND-LINE] Command-line configuration is no longer supported. Configure the Azure Function through application settings.");
         }
 
         foreach (var retiredSetting in new[]
@@ -61,16 +61,16 @@ internal sealed record RunnerOptions
         {
             if (Environment.GetEnvironmentVariable(retiredSetting) is not null)
             {
-                throw new ArgumentException($"{retiredSetting} is no longer supported. Use KEYVAULTSYNC_SUBSCRIPTIONS and target-side sync-source-keyvault-id mappings.");
+                throw new ArgumentException($"[KVS-CONFIG-RETIRED] {retiredSetting} is no longer supported. Use KEYVAULTSYNC_SUBSCRIPTIONS and target-side sync-source-keyvault-id mappings.");
             }
         }
 
         var subscriptionIds = ParseSubscriptionIds(Environment.GetEnvironmentVariable("KEYVAULTSYNC_SUBSCRIPTIONS"));
         var storageUriText = Environment.GetEnvironmentVariable("KEYVAULTSYNC_STORAGE_ACCOUNT_URI")
-            ?? throw new ArgumentException("KEYVAULTSYNC_STORAGE_ACCOUNT_URI is required.");
+            ?? throw new ArgumentException("[KVS-CONFIG-STORAGE-URI] KEYVAULTSYNC_STORAGE_ACCOUNT_URI is required.");
         if (!Uri.TryCreate(storageUriText, UriKind.Absolute, out var storageUri) || storageUri.Scheme != Uri.UriSchemeHttps)
         {
-            throw new ArgumentException("KEYVAULTSYNC_STORAGE_ACCOUNT_URI must be an HTTPS Blob service URI.");
+            throw new ArgumentException("[KVS-CONFIG-STORAGE-URI] KEYVAULTSYNC_STORAGE_ACCOUNT_URI must be an HTTPS Blob service URI.");
         }
 
         // Keep key material out of shell history and process arguments. Secret writes are blocked
@@ -80,7 +80,7 @@ internal sealed record RunnerOptions
         var syncPrincipalId = Environment.GetEnvironmentVariable("KEYVAULTSYNC_PRINCIPAL_ID");
         if (!string.IsNullOrWhiteSpace(syncPrincipalId) && !Guid.TryParse(syncPrincipalId, out _))
         {
-            throw new ArgumentException("KEYVAULTSYNC_PRINCIPAL_ID must be a Microsoft Entra object GUID when configured.");
+            throw new ArgumentException("[KVS-CONFIG-PRINCIPAL] KEYVAULTSYNC_PRINCIPAL_ID must be a Microsoft Entra object GUID when configured.");
         }
 
         return new RunnerOptions
@@ -99,7 +99,7 @@ internal sealed record RunnerOptions
     {
         if (string.IsNullOrWhiteSpace(configuredValue))
         {
-            throw new ArgumentException("KEYVAULTSYNC_SUBSCRIPTIONS is required.");
+            throw new ArgumentException("[KVS-CONFIG-SUBSCRIPTIONS] KEYVAULTSYNC_SUBSCRIPTIONS is required.");
         }
 
         var subscriptionIds = configuredValue
@@ -108,7 +108,7 @@ internal sealed record RunnerOptions
             .ToArray();
         if (subscriptionIds.Length == 0 || subscriptionIds.Any(subscriptionId => !Guid.TryParse(subscriptionId, out _)))
         {
-            throw new ArgumentException("KEYVAULTSYNC_SUBSCRIPTIONS must contain one or more Azure subscription GUIDs separated by commas, semicolons, or whitespace.");
+            throw new ArgumentException("[KVS-CONFIG-SUBSCRIPTIONS] KEYVAULTSYNC_SUBSCRIPTIONS must contain one or more Azure subscription GUIDs separated by commas, semicolons, or whitespace.");
         }
 
         return subscriptionIds;

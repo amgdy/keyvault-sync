@@ -43,6 +43,12 @@ internal sealed class ObjectExecutor
         foreach (var objectPlanItem in plan.Where(
                      planItem => planItem.Action is "CreateObject" or "ReconcileObject" or "DeleteObject"))
         {
+            using var objectScope = _logger.BeginScope(new Dictionary<string, object?>
+            {
+                ["RunId"] = runId,
+                ["ObjectType"] = objectPlanItem.ObjectType,
+                ["ObjectAction"] = objectPlanItem.Action,
+            });
             stateLease.EnsureLeaseHeld();
             var objectResult = objectPlanItem.Action == "DeleteObject"
                 ? await DeleteAsync(objectPlanItem, stateLease, runId, targetVaultClient, signatures, cancellationToken)
@@ -337,6 +343,25 @@ internal sealed class ObjectExecutor
             ? $"HTTP {requestFailure.Status}, error {requestFailure.ErrorCode ?? "unknown"}."
             : exception.GetType().Name;
 
-    private static PlanItem Outcome(PlanItem item, string status, string detail) =>
-        item with { Status = status, Detail = detail };
+    private PlanItem Outcome(PlanItem item, string status, string detail)
+    {
+        var diagnostic = AdminDiagnostics.ClassifyPlanStatus(status);
+        _logger.Log(
+            AdminDiagnostics.RequiresAdminAttention(status) ? LogLevel.Warning : LogLevel.Information,
+            AdminDiagnostics.ObjectOutcomeEventId,
+            "Object diagnostic {DiagnosticCode}. Stage {DiagnosticStage}; outcome {DiagnosticOutcome}; object type {ObjectType}; action {ObjectAction}; status {PlanStatus}; priority {AdminPriority}; evidence type {EvidenceType}; action decision {ActionDecision}; confidence {Confidence}; summary {DiagnosticSummary}; administrator action {AdminAction}.",
+            diagnostic.Code,
+            "ObjectExecution",
+            status,
+            item.ObjectType,
+            item.Action,
+            status,
+            AdminDiagnostics.GetPriority(diagnostic.Code),
+            "Evidence",
+            AdminDiagnostics.GetActionDecision(diagnostic),
+            AdminDiagnostics.GetConfidence(diagnostic.Code),
+            diagnostic.Summary,
+            diagnostic.AdminAction);
+        return item with { Status = status, Detail = detail };
+    }
 }

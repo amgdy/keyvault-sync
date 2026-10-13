@@ -91,6 +91,7 @@ internal sealed class BlobStateStore
         {
             RunnerTelemetry.RecordException(activity, exception);
             activity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
+            AdminDiagnostics.LogSystemFailure(_logger, "RunRecordPersistence", exception);
             _logger.LogError(exception, "Could not persist run record {RunId}.", record.RunId);
             throw;
         }
@@ -333,6 +334,7 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
         {
             RunnerTelemetry.RecordException(activity, exception);
             activity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
+            AdminDiagnostics.LogSystemFailure(_logger, "PairStatePersistence", exception);
             _logger.LogError(exception, "Could not save checkpoint for pair {PairId}.", State.PairId);
             throw;
         }
@@ -362,6 +364,7 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
         catch (Exception exception)
         {
             _renewalError = exception;
+            AdminDiagnostics.LogSystemFailure(_logger, "PairLeaseRenewal", exception);
             _logger.LogError(exception, "Blob lease renewal failed for pair {PairId}.", State.PairId);
         }
     }
@@ -389,9 +392,10 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
                 "Pair state lease released. {PairId}; lease held for {ElapsedMs} ms.",
                 State.PairId, _leaseTimer.Elapsed.TotalMilliseconds);
         }
-        catch
+        catch (Exception exception)
         {
             // The lease expires automatically if release cannot reach Storage.
+            AdminDiagnostics.LogSystemFailure(_logger, "PairLeaseRelease", exception);
             _logger.LogWarning("Could not release Blob lease for pair {PairId}; it will expire automatically.", State.PairId);
         }
 

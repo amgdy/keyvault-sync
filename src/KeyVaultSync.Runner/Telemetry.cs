@@ -103,8 +103,12 @@ internal sealed class TelemetryRuntime : IDisposable
         if (!string.IsNullOrWhiteSpace(configuredLevel) && !TryParseMinimumLogLevel(configuredLevel, out _))
         {
             loggerFactory.CreateLogger("KeyVaultSync.Logging").LogWarning(
-                "Ignoring unsupported KEYVAULTSYNC_LOG_LEVEL value {ConfiguredLogLevel}; using {MinimumLogLevel}.",
-                configuredLevel, minimumLevel);
+                AdminDiagnostics.SystemFailureEventId,
+                "Configuration diagnostic {DiagnosticCode}. Ignoring unsupported KEYVAULTSYNC_LOG_LEVEL value {ConfiguredLogLevel}; using {MinimumLogLevel}; administrator action {AdminAction}.",
+                "KVS-CONFIG-LOG-LEVEL",
+                configuredLevel,
+                minimumLevel,
+                "Set KEYVAULTSYNC_LOG_LEVEL to Trace, Debug, Information, Warning, Error, or Critical.");
         }
 
         if (!azureMonitorEnabled)

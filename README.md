@@ -193,6 +193,7 @@ State Blob versioning and 14-day soft-delete retention are enabled. One networki
 - [Identity and RBAC](doc/identity-and-rbac.md)
 - [Observability](doc/observability.md)
 - [Troubleshooting](doc/troubleshooting.md)
+- [Offline log analyzer](tools/keyvaultsync-log-analyzer.html) ([GitHub Pages](https://amgdy.com/keyvault-sync/))
 - [Coding guide](doc/coding-guide.md)
 
 Unit tests, mocked script tests, builds, and Bicep compilation do not prove live Azure permissions, telemetry ingestion, or mutation safety. Validate live behavior only in an explicitly approved disposable scope.

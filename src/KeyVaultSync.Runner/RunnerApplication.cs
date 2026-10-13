@@ -90,11 +90,19 @@ public sealed class RunnerApplication
         // These prerequisites are outside the recorded cycle. If they fail, the host receives the
         // exception directly; no synthetic run ID, completion metric, or durable run record exists yet.
         _logger.LogDebug("RunOnce entered; loading optional HMAC configuration.");
-        using var hmac = ObjectSignatureService.Load(_options);
+        using var hmac = LoadSignatureService();
         _logger.LogDebug("HMAC configuration loaded. Available: {HmacConfigured}; key version: {HmacKeyVersion}.",
             hmac is not null, hmac?.KeyVersion);
         _logger.LogDebug("Initializing state containers.");
-        await _stateStore.InitializeAsync(cancellationToken);
+        try
+        {
+            await _stateStore.InitializeAsync(cancellationToken);
+        }
+        catch (Exception exception)
+        {
+            AdminDiagnostics.LogSystemFailure(_logger, "StorageInitialization", exception);
+            throw;
+        }
         var cycleStarted = DateTimeOffset.UtcNow;
         var run = new RunRecord
         {
@@ -118,6 +126,7 @@ public sealed class RunnerApplication
         });
         _logger.LogInformation("Run {RunId} started in mapping-driven synchronization mode {Mode} across {SubscriptionCount} subscriptions.",
             run.RunId, run.Mode, run.SubscriptionIds.Count);
+        AdminDiagnostics.LogLifecycle(_logger, "Run", "Started");
 
         try
         {
@@ -127,6 +136,7 @@ public sealed class RunnerApplication
             _logger.LogInformation(DiscoveryStartedEventId,
                 "Starting complete Key Vault discovery across {SubscriptionCount} configured subscriptions using target-side {MappingTag}.",
                 _options.SubscriptionIds.Count, KeyVaultSyncResourceTags.SyncSourceKeyVaultId);
+            AdminDiagnostics.LogLifecycle(_logger, "Discovery", "Started");
             using var discoveryActivity = RunnerTelemetry.ActivitySource.StartActivity("sync.discover-vault-pairs");
             var discovery = await _arm.DiscoverPairsAsync(_options, cancellationToken);
             discoveryActivity?.SetTag("vault.discovered_count", discovery.DiscoveredVaultCount);
@@ -141,6 +151,11 @@ public sealed class RunnerApplication
             run.DiscoveryIssues.AddRange(discovery.Issues);
             _logger.LogInformation("Discovered {VaultCount} vaults, {PairCount} enabled pairs, {DisabledPairCount} disabled pairs, and {MappingIssueCount} mapping issues.",
                 discovery.DiscoveredVaultCount, discovery.Pairs.Count, discovery.DisabledPairCount, discovery.Issues.Count);
+            AdminDiagnostics.LogLifecycle(
+                _logger,
+                "Discovery",
+                discovery.Issues.Count == 0 ? "Completed" : "CompletedWithIssues",
+                discovery.Issues.Count == 0 ? "Continue" : "ReviewRequired");
             foreach (var issue in discovery.Issues)
             {
                 _logger.LogWarning("Key Vault pair discovery issue. {Issue}.", issue);
@@ -208,9 +223,21 @@ public sealed class RunnerApplication
                     pairLease.EnsureLeaseHeld();
                     _logger.LogInformation(PairProgressEventId, "Pair lease acquired; scanning source vault {SourceVaultName}.", pair.Source.Name);
                     pairRun.Source = await _scanner.ScanAsync(pair.Source, cancellationToken);
+                    AdminDiagnostics.LogInventoryWarnings(_logger, pairRun.Source, "Source");
+                    AdminDiagnostics.LogLifecycle(
+                        _logger,
+                        "SourceInventory",
+                        pairRun.Source.Warnings.Count == 0 ? "Completed" : "CompletedWithWarnings",
+                        pairRun.Source.Warnings.Count == 0 ? "Continue" : "BlockObjectMutation");
                     _logger.LogInformation(PairProgressEventId, "Source inventory complete for {SourceVaultName}; scanning target vault {TargetVaultName}.",
                         pair.Source.Name, pair.Target.Name);
                     pairRun.Target = await _scanner.ScanAsync(pair.Target, cancellationToken);
+                    AdminDiagnostics.LogInventoryWarnings(_logger, pairRun.Target, "Target");
+                    AdminDiagnostics.LogLifecycle(
+                        _logger,
+                        "TargetInventory",
+                        pairRun.Target.Warnings.Count == 0 ? "Completed" : "CompletedWithWarnings",
+                        pairRun.Target.Warnings.Count == 0 ? "Continue" : "BlockObjectMutation");
                     RunnerTelemetry.RecordInventory(pairRun.Source, "source");
                     RunnerTelemetry.RecordInventory(pairRun.Target, "target");
                     _logger.LogInformation(PairProgressEventId,
@@ -240,6 +267,12 @@ public sealed class RunnerApplication
                     {
                         _logger.LogInformation("Pair plan created. {PlanItemCount} items; no blocked or conflicting items.", pairRun.Plan.Count);
                     }
+                    AdminDiagnostics.LogPlanOutcomeGroups(_logger, pairRun.Plan, "Planning");
+                    AdminDiagnostics.LogLifecycle(
+                        _logger,
+                        "Planning",
+                        blockedPlanItems == 0 ? "Completed" : "CompletedWithBlockedItems",
+                        blockedPlanItems == 0 ? "Execute" : "ReviewRequired");
 
                     var complete = pairRun.Source.Warnings.Count == 0 && pairRun.Target.Warnings.Count == 0;
                     if (complete)
@@ -276,6 +309,7 @@ public sealed class RunnerApplication
                     pairRun.Status = "Failed";
                     pairRun.CompletedAt = DateTimeOffset.UtcNow;
                     pairRun.Errors.Add(SafeError(exception));
+                    AdminDiagnostics.LogSystemFailure(_logger, "PairScan", exception);
                     RunnerTelemetry.RecordException(pairActivity, exception);
                     pairActivity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
                     RunnerTelemetry.Failures.Add(1, new("sync.stage", "pair"), new("error.type", exception.GetType().Name));
@@ -364,6 +398,7 @@ public sealed class RunnerApplication
             RunnerTelemetry.RecordException(runActivity, exception);
             runActivity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
             RunnerTelemetry.Failures.Add(1, new("sync.stage", "run"), new("error.type", exception.GetType().Name));
+            AdminDiagnostics.LogSystemFailure(_logger, "RunOrchestration", exception);
             _logger.LogError(exception, "Run {RunId} failed during discovery or orchestration.", run.RunId);
         }
 
@@ -383,6 +418,30 @@ public sealed class RunnerApplication
 
         RunnerTelemetry.RunsCompleted.Add(1, new KeyValuePair<string, object?>("sync.status", run.Status));
         RunnerTelemetry.RunDuration.Record(runTimer.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("sync.status", run.Status));
+        var runDiagnostic = AdminDiagnostics.ClassifyRunStatus(run.Status);
+        _logger.Log(
+            run.Status is "Complete" or "NoConfiguredPairs" ? LogLevel.Information : LogLevel.Warning,
+            AdminDiagnostics.RunDiagnosticSummaryEventId,
+            "Run diagnostic {DiagnosticCode}. Stage {DiagnosticStage}; outcome {DiagnosticOutcome}; status {RunStatus}; discovered vaults {DiscoveredVaultCount}; enabled pairs {PairCount}; disabled pairs {DisabledPairCount}; mapping issues {MappingIssueCount}; priority {AdminPriority}; evidence type {EvidenceType}; action decision {ActionDecision}; confidence {Confidence}; summary {DiagnosticSummary}; administrator action {AdminAction}.",
+            runDiagnostic.Code,
+            "Run",
+            run.Status,
+            run.Status,
+            run.DiscoveredVaultCount,
+            run.TaggedPairCount,
+            run.DisabledPairCount,
+            run.DiscoveryIssues.Count,
+            AdminDiagnostics.GetPriority(runDiagnostic.Code),
+            "Evidence",
+            AdminDiagnostics.GetActionDecision(runDiagnostic),
+            AdminDiagnostics.GetConfidence(runDiagnostic.Code),
+            runDiagnostic.Summary,
+            runDiagnostic.AdminAction);
+        AdminDiagnostics.LogLifecycle(
+            _logger,
+            "Run",
+            run.Status,
+            run.Status is "Complete" or "NoConfiguredPairs" ? "NoActionRequired" : "ReviewRequired");
         var runMessage = "Run {RunId} completed with status {Status} in {DurationMs} ms.";
         if (run.Status is "Partial" or "Cancelled")
         {
@@ -440,6 +499,7 @@ public sealed class RunnerApplication
             report.Status = "Executing";
             report.CompletedAt = null;
             prepared.Lease.EnsureLeaseHeld();
+            AdminDiagnostics.LogLifecycle(_logger, "Execution", "Started");
 
             await ApplyRbacPhaseAsync(report.Plan, item =>
                 item.Action == "CreateRoleAssignment" && !IsObjectScope(item.TargetScope),
@@ -483,6 +543,12 @@ public sealed class RunnerApplication
 
             report.Status = HasUnappliedWork(report.Plan) ? "SyncCompletedWithUnappliedWork" : "SyncCompleted";
             report.CompletedAt = DateTimeOffset.UtcNow;
+            AdminDiagnostics.LogPlanOutcomeGroups(_logger, report.Plan, "Execution");
+            AdminDiagnostics.LogLifecycle(
+                _logger,
+                "Execution",
+                report.Status,
+                report.Status == "SyncCompleted" ? "NoActionRequired" : "ReviewRequired");
             activity?.SetStatus(report.Status == "SyncCompleted" ? ActivityStatusCode.Ok : ActivityStatusCode.Error, report.Status);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -497,6 +563,7 @@ public sealed class RunnerApplication
             report.Status = "Failed";
             report.CompletedAt = DateTimeOffset.UtcNow;
             report.Errors.Add(SafeError(exception));
+            AdminDiagnostics.LogSystemFailure(_logger, "PairExecution", exception);
             RunnerTelemetry.RecordException(activity, exception);
             activity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
             _logger.LogError(exception, "Pair execution failed for {PairId}.", pair.PairId);
@@ -510,6 +577,30 @@ public sealed class RunnerApplication
 
     private void RecordPairCompletion(PairScanReport report, Stopwatch timer)
     {
+        var pairDiagnostic = AdminDiagnostics.ClassifyPairStatus(report.Status);
+        var attentionItemCount = report.Plan.Count(item => AdminDiagnostics.RequiresAdminAttention(item.Status));
+        var sourceWarningCount = report.Source?.Warnings.Count ?? 0;
+        var targetWarningCount = report.Target?.Warnings.Count ?? 0;
+        var failedRbacCount = report.Plan.Count(item =>
+            item.ObjectType == "Authorization" && item.Status.Contains("FAILED", StringComparison.Ordinal));
+        _logger.Log(
+            report.Status == "SyncCompleted" ? LogLevel.Information : LogLevel.Warning,
+            AdminDiagnostics.PairDiagnosticSummaryEventId,
+            "Pair diagnostic {DiagnosticCode}. Stage {DiagnosticStage}; outcome {DiagnosticOutcome}; status {PairStatus}; source warnings {SourceWarningCount}; target warnings {TargetWarningCount}; attention items {AttentionItemCount}; failed RBAC items {FailedRbacCount}; priority {AdminPriority}; evidence type {EvidenceType}; action decision {ActionDecision}; confidence {Confidence}; summary {DiagnosticSummary}; administrator action {AdminAction}.",
+            pairDiagnostic.Code,
+            "Pair",
+            report.Status,
+            report.Status,
+            sourceWarningCount,
+            targetWarningCount,
+            attentionItemCount,
+            failedRbacCount,
+            AdminDiagnostics.GetPriority(pairDiagnostic.Code),
+            "Evidence",
+            AdminDiagnostics.GetActionDecision(pairDiagnostic),
+            AdminDiagnostics.GetConfidence(pairDiagnostic.Code),
+            pairDiagnostic.Summary,
+            pairDiagnostic.AdminAction);
         RunnerTelemetry.PairsProcessed.Add(1, new KeyValuePair<string, object?>("sync.status", report.Status));
         RunnerTelemetry.PairDuration.Record(timer.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("sync.status", report.Status));
         const string message = "Pair {PairId} completed with status {Status} in {DurationMs} ms.";
@@ -628,6 +719,19 @@ public sealed class RunnerApplication
     /// Other exception messages are retained verbatim. This is not general-purpose sanitization,
     /// and full exceptions are also logged elsewhere; callers must not place secret payloads in exceptions.
     /// </remarks>
+    private ObjectSignatureService? LoadSignatureService()
+    {
+        try
+        {
+            return ObjectSignatureService.Load(_options);
+        }
+        catch (Exception exception)
+        {
+            AdminDiagnostics.LogSystemFailure(_logger, "HmacConfiguration", exception);
+            throw;
+        }
+    }
+
     private static string SafeError(Exception exception)
     {
         return exception is global::Azure.RequestFailedException requestFailure
@@ -645,10 +749,11 @@ public sealed class RunnerApplication
                 || item.Status.Contains("UNRESOLVED", StringComparison.Ordinal)
                 || (item.ObjectType == "Authorization"
                     && item.Status is not ("RBAC_ASSIGNMENT_IN_SYNC"
-                        or "RBAC_CREATED_AND_VERIFIED"
-                        or "RBAC_DELETED_AND_VERIFIED"
+                        or "RBAC_ASSIGNMENT_CREATED_AND_VERIFIED"
+                        or "RBAC_ASSIGNMENT_DELETED_AND_VERIFIED"
                         or "RBAC_ALREADY_ABSENT"
                         or "SKIPPED_SYNC_IDENTITY_SELF_ASSIGNMENT"
+                        or "RBAC_DELETE_SKIPPED_SYNC_IDENTITY"
                         or "RBAC_ASSIGNMENT_INTENT_MATCH"
                         or "ACCESS_POLICY_INTENT_MATCH")))
             {
