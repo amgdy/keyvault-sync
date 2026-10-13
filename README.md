@@ -128,23 +128,22 @@ certificate private key.
 
 ```sh
 bash scripts/grant-keyvault-access.sh \
-  --identity-id "<uami-resource-id>" \
   --target-vault-id "<target-vault-resource-id>"
 ```
+
+When the identity argument is omitted, the script resolves `KEYVAULTSYNC_IDENTITY_RESOURCE_ID` from the process environment and then from the current azd environment. An explicit `--identity-id` or `-IdentityResourceId` takes precedence.
 
 The command above is preview-only. Add `--apply` after reviewing the plan to
 create only the missing assignments:
 
 ```sh
 bash scripts/grant-keyvault-access.sh \
-  --identity-id "<uami-resource-id>" \
   --target-vault-id "<target-vault-resource-id>" \
   --apply
 ```
 
 ```powershell
 .\scripts\Grant-KeyVaultAccess.ps1 `
-  -IdentityResourceId "<uami-resource-id>" `
   -TargetVaultResourceId "<target-vault-resource-id>"
 ```
 
@@ -153,7 +152,6 @@ assignments:
 
 ```powershell
 .\scripts\Grant-KeyVaultAccess.ps1 `
-  -IdentityResourceId "<uami-resource-id>" `
   -TargetVaultResourceId "<target-vault-resource-id>" `
   -Apply
 ```
@@ -171,11 +169,14 @@ See [identity and RBAC](doc/identity-and-rbac.md).
 The deployment grants the runtime identity Reader in every configured discovery subscription. Provisioning therefore requires permission to create those subscription-scoped role assignments.
 
 ```sh
-azd auth login
+azd config set auth.useAzCliAuth true
+az login
 azd env new <environment> --subscription <deployment-subscription-id> --location <region>
 azd provision --preview
 azd up
 ```
+
+Azure CLI owns the single interactive sign-in, and azd delegates authentication to that session. The Dev Container configures this delegation automatically; outside it, run the `azd config set` command once per user profile.
 
 The shared deployment-preparation hook runs before both provisioning and package deployment and writes phase-prefixed progress to the azd transcript. `azd` defers HMAC initialization to this hook instead of collecting the secure Bicep parameter first. For a new environment, preprovision shows one hidden prompt: paste an existing Base64-encoded 256-bit key, or press Enter to generate one securely. The generated or supplied key is saved once; predeploy only validates the saved key and never prompts, generates, or replaces it. If the discovery list is omitted, preprovision uses the selected azd deployment subscription as `KEYVAULTSYNC_SUBSCRIPTIONS`. Interactive option selections use numbered menus, with Enter accepting the displayed default. An invalid saved key can be interactively replaced only during preprovision and only after the replacement passes validation. The ignored `.azure/<environment>/.env` contains sensitive plaintext configuration and must be protected.
 

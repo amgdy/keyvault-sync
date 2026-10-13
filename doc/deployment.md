@@ -58,11 +58,14 @@ Each target vault declares its source with `sync-source-keyvault-id`. Cross-subs
 ## Provision
 
 ```sh
-azd auth login
+azd config set auth.useAzCliAuth true
+az login
 azd env new <environment> --subscription <deployment-subscription-id> --location <region>
 azd provision --preview
 azd up
 ```
+
+Azure CLI owns the single interactive sign-in, and azd delegates authentication to that session. The Dev Container configures this delegation automatically; outside it, run the `azd config set` command once per user profile.
 
 Review the preview before applying. One deployment-preparation script serves both azd phases:
 
@@ -134,15 +137,15 @@ After deployment, use the target-based onboarding scripts:
 
 ```sh
 bash scripts/grant-keyvault-access.sh \
-  --identity-id "<uami-resource-id>" \
   --target-vault-id "<target-vault-resource-id>"
 ```
 
 ```powershell
 .\scripts\Grant-KeyVaultAccess.ps1 `
-  -IdentityResourceId "<uami-resource-id>" `
   -TargetVaultResourceId "<target-vault-resource-id>"
 ```
+
+The identity argument is optional. Resolution prefers an explicit `--identity-id`/`-IdentityResourceId`, then `KEYVAULTSYNC_IDENTITY_RESOURCE_ID` in the process environment, then the value from the current azd environment (using `AZURE_ENV_NAME` when present). If none resolves to a valid user-assigned managed identity resource ID, the script fails before Azure resource reads.
 
 Preview is the default. `--apply`/`-Apply` is required for IAM changes. The scripts resolve the source from the target tag, support cross-subscription pairs, and require Azure RBAC on both vaults. Before any pair is approved, the read-only preflight verifies that the current signed-in user or service principal has an effective inherited, group, or direct `Owner`, `User Access Administrator`, or `Role Based Access Control Administrator` assignment on both source and target vault scopes. Azure still makes the authoritative authorization decision when an assignment is created; deny assignments, role conditions, or propagation can cause that mutation to fail.
 

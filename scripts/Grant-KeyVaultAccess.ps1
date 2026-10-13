@@ -8,7 +8,6 @@ The target declares its source through sync-source-keyvault-id. Preview is the d
 changes vaults, tags, authorization mode, role definitions, objects, or existing assignments.
 #>
 param(
-    [Parameter(Mandatory = $true)]
     [string] $IdentityResourceId,
 
     [Parameter(Mandatory = $true)]
@@ -21,11 +20,56 @@ $ErrorActionPreference = 'Stop'
 $guidPattern = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 $identityPattern = "(?i)^/subscriptions/$guidPattern/resourceGroups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[^/]+$"
 $vaultPattern = "(?i)^/subscriptions/$guidPattern/resourceGroups/[^/]+/providers/Microsoft.KeyVault/vaults/[^/]+$"
+
+function ConvertFrom-AzdScalar {
+    param([AllowEmptyString()][string] $Value)
+    $normalized = $Value.Trim()
+    if ($normalized.Length -ge 2 -and
+        (($normalized[0] -eq '"' -and $normalized[-1] -eq '"') -or
+         ($normalized[0] -eq "'" -and $normalized[-1] -eq "'"))) {
+        return $normalized.Substring(1, $normalized.Length - 2)
+    }
+    return $normalized
+}
+
+function Resolve-IdentityResourceId {
+    if (-not [string]::IsNullOrWhiteSpace($IdentityResourceId)) {
+        return (ConvertFrom-AzdScalar $IdentityResourceId)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:KEYVAULTSYNC_IDENTITY_RESOURCE_ID)) {
+        return (ConvertFrom-AzdScalar $env:KEYVAULTSYNC_IDENTITY_RESOURCE_ID)
+    }
+    if ($null -eq (Get-Command azd -ErrorAction SilentlyContinue)) {
+        throw 'azd is required when IdentityResourceId and KEYVAULTSYNC_IDENTITY_RESOURCE_ID are not supplied.'
+    }
+    $arguments = @('env', 'get-value', 'KEYVAULTSYNC_IDENTITY_RESOURCE_ID')
+    if (-not [string]::IsNullOrWhiteSpace($env:AZURE_ENV_NAME)) {
+        $arguments += @('--environment', $env:AZURE_ENV_NAME)
+    }
+    $output = & azd @arguments 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not read KEYVAULTSYNC_IDENTITY_RESOURCE_ID from the current azd environment.'
+    }
+    $resolved = ConvertFrom-AzdScalar ($output -join [Environment]::NewLine)
+    if ([string]::IsNullOrWhiteSpace($resolved)) {
+        throw 'No managed identity was resolved. Supply IdentityResourceId or set KEYVAULTSYNC_IDENTITY_RESOURCE_ID in the current azd environment.'
+    }
+    return $resolved
+}
+
+$IdentityResourceId = Resolve-IdentityResourceId
 if ($IdentityResourceId -notmatch $identityPattern) {
     throw 'IdentityResourceId must be a user-assigned managed identity ARM resource ID.'
 }
 if ($TargetVaultResourceId -notmatch $vaultPattern) {
     throw 'TargetVaultResourceId must be a Key Vault ARM resource ID.'
+}
+if ($null -eq (Get-Command az -ErrorAction SilentlyContinue)) {
+    throw 'az is required.'
+}
+$authenticationCheck = & az account show --only-show-errors --output none 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw 'Azure CLI is not authenticated. Run az login once; azd must be configured with auth.useAzCliAuth=true so both tools share that session.'
 }
 Write-Host "[KeyVaultSync][vault-access] Starting $(if ($Apply) { 'apply' } else { 'read-only preview' }) for one target-declared mapping."
 
@@ -183,10 +227,10 @@ $targetSubscriptionId = Get-SubscriptionId $targetId
 # have already been onboarded.
 Write-Host 'Checking whether the current Azure principal can assign Key Vault RBAC permissions on both vaults.'
 $currentPrincipalId = Get-SignedInPrincipalId
-Assert-CanManageRbacOnScope -Scope $sourceId -SubscriptionId $sourceSubscriptionId -PrincipalId $currentPrincipalId
-Write-Host 'Verified the current Azure principal can manage role assignments on the source vault.'
 Assert-CanManageRbacOnScope -Scope $targetId -SubscriptionId $targetSubscriptionId -PrincipalId $currentPrincipalId
 Write-Host 'Verified the current Azure principal can manage role assignments on the target vault.'
+Assert-CanManageRbacOnScope -Scope $sourceId -SubscriptionId $sourceSubscriptionId -PrincipalId $currentPrincipalId
+Write-Host 'Verified the current Azure principal can manage role assignments on the source vault.'
 
 $plans = @(
     # Key Vault Administrator (source backup/read access)

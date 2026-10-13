@@ -10,7 +10,7 @@ export source_subscription='11111111-1111-1111-1111-111111111111'
 export target_subscription='22222222-2222-2222-2222-222222222222'
 export tenant_id='33333333-3333-3333-3333-333333333333'
 export principal_id='44444444-4444-4444-4444-444444444444'
-identity_id="/subscriptions/$source_subscription/resourceGroups/identity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/keyvaultsync"
+export identity_id="/subscriptions/$source_subscription/resourceGroups/identity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/keyvaultsync"
 export source_id="/subscriptions/$source_subscription/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/source-vault"
 export target_id="/subscriptions/$target_subscription/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/target-vault"
 
@@ -29,10 +29,14 @@ az() {
     local id scope role
     case "$1 $2" in
         'identity show')
-            jq -n --arg principal "$principal_id" --arg tenant "$tenant_id" \
+            jq -n --arg principal "$principal_id" --arg tenant "${MOCK_IDENTITY_TENANT_ID:-$tenant_id}" \
                 '{principalId:$principal,tenantId:$tenant}'
             ;;
         'account show')
+            if [[ "$*" == *'--output none'* && "${MOCK_AZ_LOGIN_MISSING:-false}" == true ]]; then
+                printf 'Please run az login.\n' >&2
+                return 1
+            fi
             if [[ "$*" == *'--query user.name'* ]]; then
                 printf '%s\n' "$principal_id"
                 return 0
@@ -68,7 +72,11 @@ az() {
                 list)
                     scope=$(argument --scope "$@")
                     if [[ "$*" == *'--include-inherited'* ]]; then
-                        if [[ "${MOCK_OPERATOR_RBAC_DENIED:-false}" == true ]]; then
+                        if [[ "${MOCK_OPERATOR_RBAC_READ_FAILURE_SCOPE:-}" == "$scope" ]]; then
+                            printf 'mock role assignment read failure\n' >&2
+                            return 55
+                        fi
+                        if [[ "${MOCK_OPERATOR_RBAC_DENIED_SCOPE:-}" == "$scope" ]]; then
                             printf '[]\n'
                         else
                             jq -n --arg scope "$scope" --arg principal "$principal_id" \
@@ -98,11 +106,20 @@ az() {
         *) printf 'Unexpected mocked Azure call: %s\n' "$*" >&2; return 99 ;;
     esac
 }
-export -f az argument
+azd() {
+    printf '%s\n' "$*" >>"$fixture_directory/azd-calls.txt"
+    [[ "${MOCK_AZD_FAILURE:-false}" != true ]] || return 42
+    printf '%s\n' "${MOCK_AZD_IDENTITY_VALUE:-}"
+}
+export -f az azd argument
 
 reset_fixture() {
     export mock_drift=false
     : >"$fixture_directory/calls.jsonl"
+    : >"$fixture_directory/azd-calls.txt"
+    unset KEYVAULTSYNC_IDENTITY_RESOURCE_ID AZURE_ENV_NAME MOCK_AZD_IDENTITY_VALUE MOCK_AZD_FAILURE \
+        MOCK_AZ_LOGIN_MISSING MOCK_IDENTITY_TENANT_ID MOCK_OPERATOR_RBAC_DENIED_SCOPE \
+        MOCK_OPERATOR_RBAC_READ_FAILURE_SCOPE
     printf '[]\n' >"$fixture_directory/assignments.json"
     jq -n --arg id "$source_id" --arg tenant "$tenant_id" \
         '{id:$id,tags:{},properties:{tenantId:$tenant,enableRbacAuthorization:true}}' \
@@ -115,6 +132,12 @@ reset_fixture() {
 run_script() {
     bash "$repository_root/scripts/grant-keyvault-access.sh" \
         --identity-id "$identity_id" \
+        --target-vault-id "$target_id" \
+        "$@"
+}
+
+run_script_without_identity() {
+    bash "$repository_root/scripts/grant-keyvault-access.sh" \
         --target-vault-id "$target_id" \
         "$@"
 }
@@ -139,6 +162,59 @@ expected_grants=$(printf '%s\n' \
     "$target_id $key_vault_administrator" \
     "$target_id $key_vault_data_access_administrator" | sort)
 
+
+reset_fixture
+export KEYVAULTSYNC_IDENTITY_RESOURCE_ID="'$identity_id'"
+run_script_without_identity >/dev/null
+[[ ! -s "$fixture_directory/azd-calls.txt" ]]
+
+reset_fixture
+export MOCK_AZD_IDENTITY_VALUE="  \"$identity_id\"  "
+export AZURE_ENV_NAME='test-environment'
+run_script_without_identity >/dev/null
+grep -q '^env get-value KEYVAULTSYNC_IDENTITY_RESOURCE_ID --environment test-environment$' "$fixture_directory/azd-calls.txt"
+
+reset_fixture
+export MOCK_AZD_IDENTITY_VALUE='/invalid/identity'
+run_script >/dev/null
+[[ ! -s "$fixture_directory/azd-calls.txt" ]]
+
+reset_fixture
+export MOCK_AZD_IDENTITY_VALUE='/invalid/identity'
+if run_script_without_identity >"$fixture_directory/invalid-identity.out" 2>&1; then
+    echo 'Expected malformed azd identity to fail.' >&2
+    exit 1
+fi
+grep -q -- '--identity-id must be a user-assigned managed identity ARM resource ID' "$fixture_directory/invalid-identity.out"
+[[ ! -s "$fixture_directory/calls.jsonl" ]]
+
+reset_fixture
+export MOCK_AZD_IDENTITY_VALUE=''
+if run_script_without_identity >"$fixture_directory/missing-identity.out" 2>&1; then
+    echo 'Expected unresolved azd identity to fail.' >&2
+    exit 1
+fi
+grep -q 'No managed identity was resolved' "$fixture_directory/missing-identity.out"
+[[ ! -s "$fixture_directory/calls.jsonl" ]]
+
+reset_fixture
+export MOCK_AZ_LOGIN_MISSING=true
+if run_script >"$fixture_directory/azure-login-missing.out" 2>&1; then
+    echo 'Expected missing Azure CLI authentication to fail.' >&2
+    exit 1
+fi
+grep -q 'Run az login once' "$fixture_directory/azure-login-missing.out"
+[[ "$(write_count)" == 0 ]]
+
+reset_fixture
+export MOCK_IDENTITY_TENANT_ID='55555555-5555-5555-5555-555555555555'
+if run_script >"$fixture_directory/identity-tenant-mismatch.out" 2>&1; then
+    echo 'Expected identity tenant mismatch to fail.' >&2
+    exit 1
+fi
+grep -q 'runtime identity must belong to the same tenant' "$fixture_directory/identity-tenant-mismatch.out"
+[[ "$(write_count)" == 0 ]]
+
 reset_fixture
 preview=$(run_script)
 grep -q 'Preview only' <<<"$preview"
@@ -154,6 +230,17 @@ reset_fixture
 export MOCK_OPERATOR_ROLE_NAME='Role Based Access Control Administrator'
 run_script >/dev/null
 unset MOCK_OPERATOR_ROLE_NAME
+
+reset_fixture
+export MOCK_OPERATOR_RBAC_READ_FAILURE_SCOPE="$target_id"
+if run_script >"$fixture_directory/operator-rbac-read-failure.out" 2>&1; then
+    echo 'Expected operator RBAC read failure to stop preview.' >&2
+    exit 1
+fi
+grep -q 'could not read effective RBAC assignments on the target vault' \
+    "$fixture_directory/operator-rbac-read-failure.out"
+grep -q 'mock role assignment read failure' "$fixture_directory/operator-rbac-read-failure.out"
+[[ "$(write_count)" == 0 ]]
 
 reset_fixture
 apply_output=$(run_script --apply)
@@ -203,14 +290,13 @@ fi
 [[ "$(write_count)" == 0 ]]
 
 reset_fixture
-export MOCK_OPERATOR_RBAC_DENIED=true
+export MOCK_OPERATOR_RBAC_DENIED_SCOPE="$target_id"
 if run_script >"$fixture_directory/operator-denied.out" 2>&1; then
-    echo 'Expected missing operator RBAC authority to fail during preview.' >&2
+    echo 'Expected missing target operator RBAC authority to fail during preview.' >&2
     exit 1
 fi
 grep -q 'does not have Owner, User Access Administrator, or Role Based Access Control Administrator' \
     "$fixture_directory/operator-denied.out"
 [[ "$(write_count)" == 0 ]]
-unset MOCK_OPERATOR_RBAC_DENIED
 
 printf 'grant-keyvault-access.sh offline tests passed.\n'

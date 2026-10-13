@@ -12,9 +12,7 @@
       "version": "4"
     }
   },
-  "forwardPorts": [
-    7071
-  ],
+  "forwardPorts": [7071],
   "portsAttributes": {
     "7071": {
       "label": "Azure Functions host",
@@ -44,5 +42,6 @@
     }
   },
   "remoteUser": "vscode",
-  "shutdownAction": "stopCompose"
+  "shutdownAction": "stopCompose",
+  "postCreateCommand": "azd config set auth.useAzCliAuth true"
 }

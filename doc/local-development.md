@@ -15,9 +15,11 @@ The repository includes a feature-based [development container](../.devcontainer
 Microsoft-maintained Dev Container features provide Azure CLI and Azure Developer CLI; the .NET image already includes PowerShell. Azure Functions Core Tools uses a community feature because Microsoft does not currently publish an equivalent feature. The Compose-based environment runs Microsoft's official Azurite image in the development container's network namespace, so `UseDevelopmentStorage=true` continues to resolve its services on `localhost`, and it exposes the Functions host and Azurite ports. Authenticate inside the container before using Azure-backed local settings:
 
 ```sh
+azd config set auth.useAzCliAuth true
 az login
-azd auth login
 ```
+
+The Dev Container runs the azd configuration command automatically after creation. Azure CLI owns the single interactive sign-in, and azd delegates authentication to that session.
 
 The container does not include credentials, `local.settings.json`, an HMAC key, or Azure resource configuration. Copy `src/KeyVaultSync.Function/local.settings.example.json` to ignored `src/KeyVaultSync.Function/local.settings.json` and provide approved disposable values privately.
 

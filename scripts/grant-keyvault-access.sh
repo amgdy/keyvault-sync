@@ -9,7 +9,8 @@ set -euo pipefail
 # Print the operator contract; preview is intentionally the default.
 usage() {
     printf '%s\n' \
-        "Usage: bash $0 --identity-id <uami-resource-id> --target-vault-id <target-vault-resource-id> [--apply]" \
+        "Usage: bash $0 --target-vault-id <target-vault-resource-id> [--identity-id <uami-resource-id>] [--apply]" \
+        'When --identity-id is omitted, the script uses KEYVAULTSYNC_IDENTITY_RESOURCE_ID or the current azd environment output.' \
         'The target must declare sync-source-keyvault-id. Source and target may be in different subscriptions in the same tenant.' \
         'Preview is the default. --apply creates only missing direct built-in role assignments.'
 }
@@ -41,6 +42,42 @@ for dependency in az jq; do
     command -v "$dependency" >/dev/null 2>&1 || fail "$dependency is required."
 done
 
+# Normalize a scalar emitted by azd, including values wrapped in matching quotes.
+normalize_scalar() {
+    jq -rn --arg value "$1" '
+        $value | gsub("^\\s+|\\s+$"; "")
+        | if length >= 2 and
+            (((.[0:1] == "\"") and (.[-1:] == "\"")) or
+             ((.[0:1] == "\u0027") and (.[-1:] == "\u0027")))
+          then .[1:-1]
+          else .
+          end'
+}
+
+# Prefer an explicit argument, then the hook environment, then the selected azd environment.
+resolve_identity_id() {
+    local resolved="$identity_id"
+    if [[ -z "$resolved" ]]; then
+        resolved="${KEYVAULTSYNC_IDENTITY_RESOURCE_ID:-}"
+    fi
+    if [[ -z "$resolved" ]]; then
+        command -v azd >/dev/null 2>&1 \
+            || fail 'azd is required when --identity-id and KEYVAULTSYNC_IDENTITY_RESOURCE_ID are not supplied.'
+        local azd_arguments=(env get-value KEYVAULTSYNC_IDENTITY_RESOURCE_ID)
+        if [[ -n "${AZURE_ENV_NAME:-}" ]]; then
+            azd_arguments+=(--environment "$AZURE_ENV_NAME")
+        fi
+        resolved=$(azd "${azd_arguments[@]}" 2>/dev/null) \
+            || fail 'Could not read KEYVAULTSYNC_IDENTITY_RESOURCE_ID from the current azd environment.'
+    fi
+    resolved=$(normalize_scalar "$resolved")
+    [[ -n "$resolved" ]] \
+        || fail 'No managed identity was resolved. Supply --identity-id or set KEYVAULTSYNC_IDENTITY_RESOURCE_ID in the current azd environment.'
+    printf '%s' "$resolved"
+}
+
+identity_id=$(resolve_identity_id)
+
 guid_pattern='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 identity_pattern="^/subscriptions/$guid_pattern/resourceGroups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[^/]+$"
 vault_pattern="^/subscriptions/$guid_pattern/resourceGroups/[^/]+/providers/Microsoft.KeyVault/vaults/[^/]+$"
@@ -48,6 +85,10 @@ jq -en --arg id "$identity_id" --arg pattern "$identity_pattern" '$id | test($pa
     || fail '--identity-id must be a user-assigned managed identity ARM resource ID.'
 jq -en --arg id "$target_id" --arg pattern "$vault_pattern" '$id | test($pattern; "i")' >/dev/null \
     || fail '--target-vault-id must be a Key Vault ARM resource ID.'
+
+if ! az account show --only-show-errors --output none >/dev/null 2>&1; then
+    fail 'Azure CLI is not authenticated. Run az login once; azd must be configured with auth.useAzCliAuth=true so both tools share that session.'
+fi
 
 printf '[KeyVaultSync][vault-access] Starting %s for one target-declared mapping.\n' \
     "$([[ "$apply" == true ]] && printf 'apply' || printf 'read-only preview')"
@@ -86,11 +127,15 @@ show_vault() {
 identity_subscription=$(subscription_from_id "$identity_id")
 if ! identity=$(az identity show --ids "$identity_id" --subscription "$identity_subscription" --only-show-errors --output json 2>/dev/null); then
     identity=$(az resource show --ids "$identity_id" --subscription "$identity_subscription" --api-version 2023-01-31 --only-show-errors --output json)
-    identity=$(jq '{principalId: .properties.principalId}' <<<"$identity")
+    identity=$(jq '{principalId: .properties.principalId, tenantId: .properties.tenantId}' <<<"$identity")
 fi
 principal_id=$(jq -er --arg pattern "$guid_pattern" '.principalId | select(test("^" + $pattern + "$"; "i")) | ascii_downcase' <<<"$identity")
+identity_tenant_id=$(jq -er '.tenantId | select(type == "string" and length > 0) | ascii_downcase' <<<"$identity")
 account=$(az account show --subscription "$identity_subscription" --only-show-errors --output json)
-tenant_id=$(jq -er '.tenantId | ascii_downcase' <<<"$account")
+account_tenant_id=$(jq -er '.tenantId | ascii_downcase' <<<"$account")
+[[ "$account_tenant_id" == "$identity_tenant_id" ]] \
+    || fail 'The signed-in operator and runtime identity must belong to the same tenant.'
+tenant_id="$identity_tenant_id"
 
 current_principal_id() {
     local principal=''
@@ -118,15 +163,17 @@ assert_principal_can_manage_keyvault_rbac() {
     local current_principal="$3"
     local vault_role="$4"
     local assignments
-    assignments=$(az role assignment list \
-        --scope "$scope" \
-        --assignee-object-id "$current_principal" \
-        --subscription "$subscription_id" \
-        --include-inherited \
-        --include-groups \
-        --all \
-        --only-show-errors \
-        --output json 2>/dev/null || printf '[]')
+    if ! assignments=$(az role assignment list \
+            --scope "$scope" \
+            --assignee-object-id "$current_principal" \
+            --subscription "$subscription_id" \
+            --include-inherited \
+            --include-groups \
+            --all \
+            --only-show-errors \
+            --output json 2>&1); then
+        fail "Azure CLI could not read effective RBAC assignments on the $vault_role vault. Verify the Azure CLI session and roleAssignments/read access. Azure CLI output: $assignments"
+    fi
     if ! jq -e '
         any(.[];
             ((.roleDefinitionName // "") | ascii_downcase) as $role
@@ -174,8 +221,8 @@ current_principal=$(current_principal_id || true)
 if [[ -z "$current_principal" ]]; then
     fail 'Could not resolve the current Azure user or service principal. Sign in with an account that can assign Key Vault RBAC roles before onboarding.'
 fi
-assert_principal_can_manage_keyvault_rbac "$source_id" "$source_subscription" "$current_principal" 'source'
 assert_principal_can_manage_keyvault_rbac "$target_id" "$target_subscription" "$current_principal" 'target'
+assert_principal_can_manage_keyvault_rbac "$source_id" "$source_subscription" "$current_principal" 'source'
 
 # Build the full supported object-replication onboarding plan. The source
 # administrator role is intentionally broad because backup/restore of all Key Vault
