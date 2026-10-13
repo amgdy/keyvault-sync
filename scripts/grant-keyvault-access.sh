@@ -49,6 +49,9 @@ jq -en --arg id "$identity_id" --arg pattern "$identity_pattern" '$id | test($pa
 jq -en --arg id "$target_id" --arg pattern "$vault_pattern" '$id | test($pattern; "i")' >/dev/null \
     || fail '--target-vault-id must be a Key Vault ARM resource ID.'
 
+printf '[KeyVaultSync][vault-access] Starting %s for one target-declared mapping.\n' \
+    "$([[ "$apply" == true ]] && printf 'apply' || printf 'read-only preview')"
+
 # Extract the subscription segment from a validated ARM resource ID.
 subscription_from_id() {
     jq -rn --arg id "$1" '$id | split("/")[2] | ascii_downcase'
@@ -89,6 +92,52 @@ principal_id=$(jq -er --arg pattern "$guid_pattern" '.principalId | select(test(
 account=$(az account show --subscription "$identity_subscription" --only-show-errors --output json)
 tenant_id=$(jq -er '.tenantId | ascii_downcase' <<<"$account")
 
+current_principal_id() {
+    local principal=''
+    if principal=$(az ad signed-in-user show --query id -o tsv 2>/dev/null); then
+        printf '%s' "$principal"
+        return 0
+    fi
+
+    local app_id=''
+    app_id=$(az account show --query user.name -o tsv 2>/dev/null || true)
+    if [[ -n "$app_id" ]]; then
+        principal=$(az ad sp show --id "$app_id" --query id -o tsv 2>/dev/null || true)
+        if [[ -n "$principal" ]]; then
+            printf '%s' "$principal"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+assert_principal_can_manage_keyvault_rbac() {
+    local scope="$1"
+    local subscription_id="$2"
+    local current_principal="$3"
+    local vault_role="$4"
+    local assignments
+    assignments=$(az role assignment list \
+        --scope "$scope" \
+        --assignee-object-id "$current_principal" \
+        --subscription "$subscription_id" \
+        --include-inherited \
+        --include-groups \
+        --all \
+        --only-show-errors \
+        --output json 2>/dev/null || printf '[]')
+    if ! jq -e '
+        any(.[];
+            ((.roleDefinitionName // "") | ascii_downcase) as $role
+            | $role == "owner"
+                or $role == "user access administrator"
+                or $role == "role based access control administrator")' <<<"$assignments" >/dev/null; then
+        fail "The current signed-in principal does not have Owner, User Access Administrator, or Role Based Access Control Administrator effective on the $vault_role vault. Sign in with a principal that can assign Key Vault RBAC roles before onboarding."
+    fi
+    printf 'Verified the current Azure principal can manage role assignments on the %s vault.\n' "$vault_role"
+}
+
 # Resolve the target-declared mapping and reject paused, cross-tenant, or access-policy vaults.
 target=$(show_vault "$target_id")
 jq -e --arg id "$(normalized_id "$target_id")" --arg tenant "$tenant_id" '
@@ -116,6 +165,17 @@ source_id=$(jq -r '.id' <<<"$source")
 target_id=$(jq -r '.id' <<<"$target")
 source_subscription=$(subscription_from_id "$source_id")
 target_subscription=$(subscription_from_id "$target_id")
+
+# Preflight the operator's effective inherited/group RBAC assignments before the
+# plan is approved. This remains read-only and prevents a later pair from failing
+# after earlier pairs have already been onboarded.
+printf 'Checking whether the current Azure principal can assign Key Vault RBAC permissions on both vaults.\n'
+current_principal=$(current_principal_id || true)
+if [[ -z "$current_principal" ]]; then
+    fail 'Could not resolve the current Azure user or service principal. Sign in with an account that can assign Key Vault RBAC roles before onboarding.'
+fi
+assert_principal_can_manage_keyvault_rbac "$source_id" "$source_subscription" "$current_principal" 'source'
+assert_principal_can_manage_keyvault_rbac "$target_id" "$target_subscription" "$current_principal" 'target'
 
 # Build the full supported object-replication onboarding plan. The source
 # administrator role is intentionally broad because backup/restore of all Key Vault
@@ -147,7 +207,7 @@ while IFS= read -r plan; do
         --only-show-errors --output json)
     exists=$(jq -r --arg role "$role_id" '
         any(.[]; ((.roleDefinitionId // "") | split("/")[-1] | ascii_downcase) == ($role | ascii_downcase)
-            and ((.scope // "") | ascii_downcase | gsub("/+$"; "")) == ($ARGS.named.scope | ascii_downcase | gsub("/+$"; "")))' \
+            and ((.scope // "") | ascii_downcase | gsub("/+$"; "")) == ($scope | ascii_downcase | gsub("/+$"; "")))' \
         --arg scope "$scope" <<<"$assignments")
     if [[ "$exists" != 'true' ]]; then
         missing=$(jq -c --argjson plan "$plan" '. + [$plan]' <<<"$missing")

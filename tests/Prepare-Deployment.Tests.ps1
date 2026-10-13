@@ -506,6 +506,21 @@ try {
     Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'an invalid supplied HMAC key must not be persisted'
     Write-Host 'PASS PowerShell invalid HMAC input is rejected before persistence'
 
+    $null = $global:KeyVaultSyncPersistedTags.Remove('KEYVAULTSYNC_HMAC_KEY')
+    $global:KeyVaultSyncTagTestAnswers.Clear()
+    $global:KeyVaultSyncTagTestAnswers.Enqueue($testHmacKey)
+    $message = ''
+    try {
+        & $hook deploy 6>&1 | Out-Null
+    }
+    catch {
+        $message = $_.Exception.Message
+    }
+    Assert-True ($message.Contains('deploy never generates or replaces it')) 'deploy must fail rather than prompting for missing HMAC material'
+    Assert-True ($global:KeyVaultSyncTagTestAnswers.Count -eq 1) 'deploy must not consume an HMAC prompt response'
+    Assert-True ($global:KeyVaultSyncTagTestCalls.Count -eq 0) 'deploy must not persist replacement HMAC material'
+    Write-Host 'PASS PowerShell deploy never prompts for or replaces a missing HMAC key'
+
     $global:KeyVaultSyncPersistedTags['KEYVAULTSYNC_HMAC_KEY'] = $testHmacKey
     $env:AZURE_SUBSCRIPTION_ID = '11111111-1111-1111-1111-111111111111'
     $env:AZURE_RESOURCE_GROUP = 'example-resource-group'
@@ -515,6 +530,7 @@ try {
     $global:KeyVaultSyncStorageDataPlaneReachable = $true
     $output = & $hook deploy 6>&1 | Out-String
     Assert-True ($output.Contains('Verified deployment storage example')) 'direct deploy should validate accessible storage'
+    Assert-True ($output.Contains('[KeyVaultSync][deploy] Predeploy validation completed successfully.')) 'deploy should emit a terminal success step'
     Write-Host 'PASS PowerShell direct deploy revalidates the HMAC key and accessible deployment storage'
 
     $env:KEYVAULTSYNC_NETWORK_PROFILE = 'private-managed'

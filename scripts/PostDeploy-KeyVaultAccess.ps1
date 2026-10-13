@@ -74,8 +74,9 @@ $identityId = $env:KEYVAULTSYNC_IDENTITY_RESOURCE_ID
 if ([string]::IsNullOrWhiteSpace($identityId)) {
     throw 'KEYVAULTSYNC_IDENTITY_RESOURCE_ID was not provided by the deployment outputs.'
 }
+Write-Host '[KeyVaultSync][postdeploy] Starting optional vault-access onboarding.'
 if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
-    Write-Host 'Skipping optional Key Vault access onboarding because azd is running non-interactively.'
+    Write-Host '[KeyVaultSync][postdeploy] Skipping optional onboarding because azd is running non-interactively.'
     return
 }
 
@@ -105,6 +106,7 @@ if (-not (Confirm-Step 'Have you finished tagging target vaults and want to prev
 # Discover value-free Key Vault ARM metadata from every configured subscription.
 $vaults = [System.Collections.Generic.List[object]]::new()
 foreach ($subscription in $subscriptions) {
+    Write-Host "[KeyVaultSync][postdeploy] Discovering Key Vaults in subscription $subscription."
     $json = & az keyvault list --subscription $subscription --resource-type vault --only-show-errors --output json
     if ($LASTEXITCODE -ne 0) {
         throw "Key Vault discovery failed for subscription $subscription with Azure CLI exit code $LASTEXITCODE."
@@ -146,6 +148,7 @@ Write-Host "`nPreflighting every pair; this phase performs reads only."
 
 # Preview every pair first; no IAM write occurs in this phase.
 foreach ($target in $targets) {
+    Write-Host "[KeyVaultSync][postdeploy] Preflighting target vault $($target.Id)."
     & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $target.Id
 }
 
@@ -158,7 +161,8 @@ if (-not (Confirm-Step "Apply the displayed access grants for all $($targets.Cou
 # Apply the already reviewed pairs sequentially. Rerunning is safe if a later pair fails.
 Write-Host 'Applying reviewed grants. A failure can leave earlier pairs applied; rerun to converge safely.'
 foreach ($target in $targets) {
+    Write-Host "[KeyVaultSync][postdeploy] Applying reviewed grants for target vault $($target.Id)."
     & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $target.Id -Apply -Confirm:$false
 }
 
-Write-Host "Key Vault access onboarding completed for $($targets.Count) mapping(s)."
+Write-Host "[KeyVaultSync][postdeploy] Key Vault access onboarding completed for $($targets.Count) mapping(s)."

@@ -23,6 +23,11 @@ fail() {
     exit 1
 }
 
+# Emit one visible, secret-free hook progress line for the deployment transcript.
+log_step() {
+    printf '[KeyVaultSync][%s] %s\n' "$phase" "$*"
+}
+
 # Render a numbered menu and resolve the chosen option into SELECTED_OPTION.
 # Each option is "value|label|alias,alias"; the first option answers empty input.
 # A global is used instead of stdout capture so fail() stops the hook, not a subshell.
@@ -142,6 +147,7 @@ generate_hmac_key() {
 
 # Reuse, import, or interactively generate the stable per-environment HMAC key.
 ensure_hmac_key() {
+    local allow_prompt="${1:-false}"
     local environment_name=''
     local environment_key=''
     local process_key=''
@@ -166,7 +172,7 @@ ensure_hmac_key() {
             return
         fi
 
-        if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
+        if [[ "$allow_prompt" != 'true' || "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
             fail 'KEYVAULTSYNC_HMAC_KEY is invalid. Provide Base64 for exactly 32 bytes through protected pipeline configuration.'
         fi
 
@@ -180,6 +186,9 @@ EOF
         hmac_key=''
     fi
 
+    if [[ "$allow_prompt" != 'true' ]]; then
+        fail 'KEYVAULTSYNC_HMAC_KEY is missing before package deployment. Run azd provision first or restore the environment key; deploy never generates or replaces it.'
+    fi
     if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
         fail 'KEYVAULTSYNC_HMAC_KEY is required for non-interactive deployment. Provide it through protected pipeline configuration or run azd interactively to supply or generate it.'
     fi
@@ -342,14 +351,17 @@ is_valid_subscription_list() {
 # Resolve and persist the complete subscription discovery list.
 ensure_subscription_list() {
     local configured=''
+
     configured=$(normalize_scalar "${KEYVAULTSYNC_SUBSCRIPTIONS:-$(get_azd_value KEYVAULTSYNC_SUBSCRIPTIONS)}")
-    configured="${configured:-$(normalize_scalar "${AZURE_SUBSCRIPTION_ID:-$(get_azd_value AZURE_SUBSCRIPTION_ID)}")}"
-    [[ -n "$configured" ]] || fail 'KEYVAULTSYNC_SUBSCRIPTIONS is required. Supply one or more Azure subscription IDs.'
+    if [[ -z "$configured" ]]; then
+        configured=$(normalize_scalar "${AZURE_SUBSCRIPTION_ID:-$(get_azd_value AZURE_SUBSCRIPTION_ID)}")
+    fi
+    [[ -n "$configured" ]] || fail 'KEYVAULTSYNC_SUBSCRIPTIONS is required. Select an azd deployment subscription or supply one or more Azure subscription IDs.'
     is_valid_subscription_list "$configured" || fail 'KEYVAULTSYNC_SUBSCRIPTIONS must contain Azure subscription GUIDs separated by commas, semicolons, or whitespace.'
     if [[ -z "$(get_azd_value KEYVAULTSYNC_SUBSCRIPTIONS)" ]]; then
         set_azd_value KEYVAULTSYNC_SUBSCRIPTIONS "$configured" >/dev/null
     fi
-    printf 'Configured %s subscription list for KeyVaultSync discovery.\n' "${AZURE_ENV_NAME:-current}"
+    printf 'Configured %s subscription list for KeyVaultSync discovery: %s\n' "${AZURE_ENV_NAME:-current}" "$configured"
 }
 
 # Preserve an existing resource-group name or configure the CAF-style name azd will create.
@@ -583,18 +595,27 @@ ensure_network_configuration() {
 
 command -v azd >/dev/null 2>&1 || fail 'azd is required.'
 
-# Both phases must establish the same protected HMAC key before any Azure deployment step.
-ensure_hmac_key
+log_step "Starting azd $phase hook for environment ${AZURE_ENV_NAME:-current}."
 
 if [[ "$phase" == 'deploy' ]]; then
-    # Predeploy performs no configuration prompts; it only validates the package-deployment path.
+    # Predeploy never prompts for protected material. It validates the key established
+    # during preprovision and the package-deployment path.
+    log_step 'Validating the HMAC key saved during provisioning; no prompt will be shown.'
+    ensure_hmac_key false
+    log_step 'Validating deployment-storage configuration and reachability.'
     verify_deployment_storage
+    log_step 'Predeploy validation completed successfully.'
     exit 0
 fi
 
 # Preprovision validates deployment naming and runtime discovery scope before Bicep receives parameters.
+log_step 'Resolving the stable HMAC key. This is the only hook phase that can prompt for it.'
+ensure_hmac_key true
+log_step 'Resolving the discovery subscription list.'
 ensure_subscription_list
+log_step 'Resolving deployment resource-group naming.'
 ensure_resource_group_name
+log_step 'Resolving the networking profile and required topology values.'
 ensure_network_configuration
 
 current_name="${KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME:-$(get_azd_value KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME)}"
@@ -609,6 +630,7 @@ if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
     else
         printf 'No optional deployment tag is configured; continuing without one.\n'
     fi
+    log_step 'Preprovision configuration completed successfully.'
     exit 0
 fi
 
@@ -625,6 +647,7 @@ if [[ -n "$current_name" && -n "$current_value" ]]; then
         'keep|Keep the configured tag|k' \
         'replace|Replace the configured tag|r'
     if [[ "$SELECTED_OPTION" == 'keep' ]]; then
+        log_step 'Preprovision configuration completed successfully.'
         exit 0
     fi
 elif [[ -z "$current_name" && -z "$current_value" ]]; then
@@ -633,6 +656,7 @@ elif [[ -z "$current_name" && -z "$current_value" ]]; then
         'add|Add an optional tag|y,yes'
     if [[ "$SELECTED_OPTION" == 'skip' ]]; then
         printf 'Continuing without an optional deployment tag.\n'
+        log_step 'Preprovision configuration completed successfully.'
         exit 0
     fi
 else
@@ -656,9 +680,11 @@ select_option "Save optional deployment tag $tag_name=$tag_value?" \
     'cancel|Do not change the optional tag|n,no'
 if [[ "$SELECTED_OPTION" == 'cancel' ]]; then
     printf 'Optional deployment tag was not changed.\n'
+    log_step 'Preprovision configuration completed successfully.'
     exit 0
 fi
 
 set_azd_value KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME "$tag_name"
 set_azd_value KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE "$tag_value"
 printf 'Configured the optional deployment tag for azd environment %s.\n' "${AZURE_ENV_NAME:-current}"
+log_step 'Preprovision configuration completed successfully.'

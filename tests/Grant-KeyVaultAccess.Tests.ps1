@@ -44,6 +44,8 @@ function Reset-Fixture {
         Calls = [System.Collections.Generic.List[object]]::new()
         Drift = $false
         TargetReads = 0
+        OperatorRbacDenied = $false
+        OperatorRoleName = 'Owner'
     }
 }
 
@@ -57,7 +59,10 @@ function az {
             return To-Json $global:Fixture.Identity
         }
         '^account show ' {
-            return To-Json ([pscustomobject]@{ tenantId = $tenantId })
+            return To-Json ([pscustomobject]@{ tenantId = $tenantId; user = [pscustomobject]@{ name = $principalId } })
+        }
+        '^ad signed-in-user show$' {
+            return $principalId
         }
         '^keyvault show ' {
             $id = Get-Argument $argumentsList '--ids'
@@ -76,6 +81,16 @@ function az {
         }
         '^role assignment list$' {
             $scope = Get-Argument $argumentsList '--scope'
+            if ($argumentsList -contains '--include-inherited') {
+                if ($global:Fixture.OperatorRbacDenied) {
+                    return '[]'
+                }
+                return To-Json -Value @([pscustomobject]@{
+                    scope = $scope
+                    principalId = $principalId
+                    roleDefinitionName = $global:Fixture.OperatorRoleName
+                })
+            }
             return To-Json -Value @($global:Fixture.Assignments | Where-Object {
                 $_.scope -ieq $scope -and $_.principalId -ieq $principalId
             })
@@ -126,6 +141,16 @@ $expectedGrants = @(
 Reset-Fixture
 & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId
 Assert-True ((Get-WriteCount) -eq 0) 'preview must not write'
+$operatorChecks = @($global:Fixture.Calls | Where-Object {
+    $_.Count -ge 3 -and $_[0] -eq 'role' -and $_[1] -eq 'assignment' -and $_[2] -eq 'list' -and
+    $_ -contains '--include-inherited' -and $_ -contains '--include-groups'
+})
+Assert-True ($operatorChecks.Count -eq 2) 'preview should check inherited and group RBAC on both vaults'
+
+Reset-Fixture
+$global:Fixture.OperatorRoleName = 'Role Based Access Control Administrator'
+& $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId
+Assert-True ((Get-WriteCount) -eq 0) 'RBAC Administrator authority check should remain read-only'
 
 Reset-Fixture
 & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -Apply -Confirm:$false
@@ -158,5 +183,16 @@ catch {
     Assert-True ($_.Exception.Message -like '*mapping changed*') 'mapping drift should fail closed'
 }
 Assert-True ((Get-WriteCount) -eq 0) 'mapping drift must happen before writes'
+
+Reset-Fixture
+$global:Fixture.OperatorRbacDenied = $true
+try {
+    & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId
+    throw 'Expected missing operator RBAC authority failure.'
+}
+catch {
+    Assert-True ($_.Exception.Message -like '*does not have Owner, User Access Administrator, or Role Based Access Control Administrator*') 'operator RBAC authority should be required during preview'
+}
+Assert-True ((Get-WriteCount) -eq 0) 'operator RBAC validation must remain read-only'
 
 Write-Host 'Grant-KeyVaultAccess.ps1 offline tests passed.'

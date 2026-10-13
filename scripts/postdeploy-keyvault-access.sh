@@ -31,8 +31,9 @@ identity_id="${KEYVAULTSYNC_IDENTITY_RESOURCE_ID:-}"
 [[ -n "$subscriptions" ]] || fail 'KEYVAULTSYNC_SUBSCRIPTIONS was not provided by azd.'
 [[ -n "$identity_id" ]] || fail 'KEYVAULTSYNC_IDENTITY_RESOURCE_ID was not provided by the deployment outputs.'
 
+printf '[KeyVaultSync][postdeploy] Starting optional vault-access onboarding.\n'
 if [[ "${AZD_NON_INTERACTIVE:-false}" == 'true' ]]; then
-    printf 'Skipping optional Key Vault access onboarding because azd is running non-interactively.\n'
+    printf '[KeyVaultSync][postdeploy] Skipping optional onboarding because azd is running non-interactively.\n'
     exit 0
 fi
 
@@ -65,6 +66,7 @@ fi
 vault_list='[]'
 while IFS= read -r subscription_id; do
     [[ -n "$subscription_id" ]] || continue
+    printf '[KeyVaultSync][postdeploy] Discovering Key Vaults in subscription %s.\n' "$subscription_id"
     subscription_vaults=$(az keyvault list --subscription "$subscription_id" --resource-type vault --only-show-errors --output json)
     vault_list=$(jq -cn --argjson current "$vault_list" --argjson added "$subscription_vaults" '$current + $added')
 done < <(tr ',;' '\n\n' <<<"$subscriptions" | tr -s '[:space:]' '\n')
@@ -127,6 +129,7 @@ printf '\nPreflighting every pair; this phase performs reads only.\n'
 # Preview every pair first; no IAM write occurs in this phase.
 while IFS= read -r pair; do
     vault_id=$(jq -r '.targetId' <<<"$pair")
+    printf '[KeyVaultSync][postdeploy] Preflighting target vault %s.\n' "$vault_id"
     bash "$grant_script" --identity-id "$identity_id" --target-vault-id "$vault_id"
 done < <(jq -c '.[]' <<<"$pairs")
 
@@ -140,7 +143,8 @@ fi
 printf 'Applying reviewed grants. A failure can leave earlier pairs applied; rerun to converge safely.\n'
 while IFS= read -r pair; do
     vault_id=$(jq -r '.targetId' <<<"$pair")
+    printf '[KeyVaultSync][postdeploy] Applying reviewed grants for target vault %s.\n' "$vault_id"
     bash "$grant_script" --identity-id "$identity_id" --target-vault-id "$vault_id" --apply
 done < <(jq -c '.[]' <<<"$pairs")
 
-printf 'Key Vault access onboarding completed for %s mapping pair(s).\n' "$pair_count"
+printf '[KeyVaultSync][postdeploy] Key Vault access onboarding completed for %s mapping pair(s).\n' "$pair_count"

@@ -490,6 +490,16 @@ grep -F 'The HMAC key must be Base64 for exactly 32 bytes' "$fixture_directory/i
 [[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
 printf 'PASS invalid HMAC input fails before persistence\n'
 
+unset MOCK_AZD_HMAC_KEY
+: >"$fixture_directory/azd-calls.jsonl"
+if printf '%s\n' "$test_hmac_key" | bash "$hook" deploy >"$fixture_directory/deploy-missing-hmac.out" 2>&1; then
+    printf 'Expected deploy without the saved HMAC key to fail without prompting.\n' >&2
+    exit 1
+fi
+grep -F 'deploy never generates or replaces it' "$fixture_directory/deploy-missing-hmac.out" >/dev/null
+[[ ! -s "$fixture_directory/azd-calls.jsonl" ]]
+printf 'PASS deploy never prompts for or replaces a missing HMAC key\n'
+
 export MOCK_AZD_HMAC_KEY="$test_hmac_key"
 export AZURE_SUBSCRIPTION_ID='11111111-1111-1111-1111-111111111111'
 export AZURE_RESOURCE_GROUP='example-resource-group'
@@ -497,6 +507,7 @@ export KEYVAULTSYNC_STORAGE_ACCOUNT_URI='https://example.blob.core.windows.net/'
 
 MOCK_PUBLIC_NETWORK_ACCESS='Enabled' bash "$hook" deploy >"$fixture_directory/deploy-enabled.out"
 grep -F 'Verified deployment storage example' "$fixture_directory/deploy-enabled.out" >/dev/null
+grep -F '[KeyVaultSync][deploy] Predeploy validation completed successfully.' "$fixture_directory/deploy-enabled.out" >/dev/null
 printf 'PASS direct deploy revalidates the HMAC key and accessible deployment storage\n'
 
 KEYVAULTSYNC_NETWORK_PROFILE='private-managed' MOCK_PUBLIC_NETWORK_ACCESS='Disabled' \

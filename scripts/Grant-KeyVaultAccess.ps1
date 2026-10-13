@@ -27,6 +27,7 @@ if ($IdentityResourceId -notmatch $identityPattern) {
 if ($TargetVaultResourceId -notmatch $vaultPattern) {
     throw 'TargetVaultResourceId must be a Key Vault ARM resource ID.'
 }
+Write-Host "[KeyVaultSync][vault-access] Starting $(if ($Apply) { 'apply' } else { 'read-only preview' }) for one target-declared mapping."
 
 # Execute Azure CLI for one read or mutation and require parseable JSON.
 function Invoke-AzJson {
@@ -111,6 +112,52 @@ if ($account.tenantId -ine $tenantId) {
     throw 'The signed-in operator and runtime identity must belong to the same tenant.'
 }
 
+# Resolve the current signed-in principal and require a role assignment path that can grant Key Vault RBAC.
+function Get-SignedInPrincipalId {
+    $signedIn = & az ad signed-in-user show --query id -o tsv 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($signedIn)) {
+        return $signedIn.Trim()
+    }
+
+    $accountInfo = Invoke-AzJson -Arguments @('account', 'show', '--subscription', $identitySubscription)
+    $userName = [string] $accountInfo.user.name
+    if ([string]::IsNullOrWhiteSpace($userName)) {
+        throw 'Could not resolve the current Azure user or service principal for RBAC assignment checks.'
+    }
+
+    $servicePrincipal = & az ad sp show --id $userName --query id -o tsv 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($servicePrincipal)) {
+        return $servicePrincipal.Trim()
+    }
+
+    throw 'The current Azure sign-in context cannot assign Key Vault RBAC roles. Sign in with an account that has Owner or User Access Administrator on the vaults.'
+}
+
+function Assert-CanManageRbacOnScope {
+    param(
+        [Parameter(Mandatory = $true)][string] $Scope,
+        [Parameter(Mandatory = $true)][string] $SubscriptionId,
+        [Parameter(Mandatory = $true)][string] $PrincipalId
+    )
+
+    $assignments = @(Invoke-AzJson -Arguments @(
+        'role', 'assignment', 'list',
+        '--scope', $Scope,
+        '--assignee-object-id', $PrincipalId,
+        '--subscription', $SubscriptionId,
+        '--include-inherited',
+        '--include-groups',
+        '--all'
+    ))
+    $canGrant = @($assignments | Where-Object {
+        $name = ([string] $_.roleDefinitionName).ToLowerInvariant()
+        $name -in @('owner', 'user access administrator', 'role based access control administrator')
+    }).Count -gt 0
+    if (-not $canGrant) {
+        throw "The current signed-in principal does not have Owner, User Access Administrator, or Role Based Access Control Administrator effective on $Scope. Sign in with a principal that can assign Key Vault RBAC roles before onboarding."
+    }
+}
+
 # Resolve the target-declared mapping before building any role-assignment plan.
 $target = Get-Vault $TargetVaultResourceId
 Assert-EligibleVault $target $TargetVaultResourceId $tenantId 'target'
@@ -128,6 +175,19 @@ Assert-EligibleVault $source $sourceId $tenantId 'source'
 # role-assignment management; the runtime never writes assignments at source scope.
 $sourceId = [string] $source.id
 $targetId = [string] $target.id
+$sourceSubscriptionId = Get-SubscriptionId $sourceId
+$targetSubscriptionId = Get-SubscriptionId $targetId
+
+# Preflight effective inherited/group RBAC assignments before the plan is approved.
+# This remains read-only and prevents a later pair from failing after earlier pairs
+# have already been onboarded.
+Write-Host 'Checking whether the current Azure principal can assign Key Vault RBAC permissions on both vaults.'
+$currentPrincipalId = Get-SignedInPrincipalId
+Assert-CanManageRbacOnScope -Scope $sourceId -SubscriptionId $sourceSubscriptionId -PrincipalId $currentPrincipalId
+Write-Host 'Verified the current Azure principal can manage role assignments on the source vault.'
+Assert-CanManageRbacOnScope -Scope $targetId -SubscriptionId $targetSubscriptionId -PrincipalId $currentPrincipalId
+Write-Host 'Verified the current Azure principal can manage role assignments on the target vault.'
+
 $plans = @(
     # Key Vault Administrator (source backup/read access)
     [pscustomobject]@{

@@ -44,14 +44,14 @@ The azd environment must supply:
 
 - deployment subscription and location;
 - either an existing `AZURE_RESOURCE_GROUP` or a three-letter `KEYVAULTSYNC_REGION_CODE` for generated resource-group naming;
-- `KEYVAULTSYNC_SUBSCRIPTIONS`;
+- `KEYVAULTSYNC_SUBSCRIPTIONS`, unless the selected azd deployment subscription is the complete discovery scope;
 - the HMAC key;
 - one networking profile (`public`, `private-managed`, or `private-existing`);
 - profile-specific private-network inputs when required;
 - optional adopted resource-name overrides;
 - optional deployment tags.
 
-Every subscription in `KEYVAULTSYNC_SUBSCRIPTIONS` is scanned as part of one mapping graph. Main Bicep grants the runtime identity Reader in each one. The provisioning identity therefore needs role-assignment permission at every listed subscription.
+Every subscription in `KEYVAULTSYNC_SUBSCRIPTIONS` is scanned as part of one mapping graph. When the setting is absent, the preprovision hook persists the selected azd deployment subscription from `AZURE_SUBSCRIPTION_ID` as the default discovery list. Main Bicep grants the runtime identity Reader in each configured subscription. The provisioning identity therefore needs role-assignment permission at every listed subscription.
 
 Each target vault declares its source with `sync-source-keyvault-id`. Cross-subscription pairs are supported when both endpoints are configured, use Azure RBAC, and share a tenant.
 
@@ -66,10 +66,10 @@ azd up
 
 Review the preview before applying. One deployment-preparation script serves both azd phases:
 
-- before provisioning, it validates and persists multi-subscription configuration, establishes the deployment resource-group name, collects missing private-network details, obtains or preserves the HMAC key, and optionally configures one deployment tag;
-- before package deployment, it revalidates the HMAC key and confirms that Flex deployment storage is reachable through the expected public or private Blob path.
+- before provisioning, it validates and persists multi-subscription configuration, defaults an omitted discovery list to the selected deployment subscription, establishes the deployment resource-group name, collects missing private-network details, obtains or preserves the HMAC key, and optionally configures one deployment tag;
+- before package deployment, it validates the already saved HMAC key without prompting and confirms that Flex deployment storage is reachable through the expected public or private Blob path.
 
-`azd` defers subscription-list and HMAC initialization to the preprovision hook, so it does not collect those Bicep parameters before the preparation logic runs. If no key exists, an interactive run shows one hidden prompt: paste an existing Base64-encoded 32-byte key, or press Enter to generate one cryptographically. The key is saved once in the active azd environment; the later predeploy hook reuses it without asking again. Valid existing keys are never displayed or rotated. An invalid saved value can be interactively replaced after warning the operator, but the replacement is persisted only after it validates as Base64 for exactly 32 bytes. Non-interactive pipelines must provide valid protected HMAC material.
+`azd` defers subscription-list and HMAC initialization to the preprovision hook, so it does not collect those Bicep parameters before the preparation logic runs. If no key exists, an interactive run shows one hidden prompt: paste an existing Base64-encoded 32-byte key, or press Enter to generate one cryptographically. The key is saved once in the active azd environment. The later predeploy hook never prompts, generates, or replaces HMAC material; it reuses a valid saved key or fails with recovery guidance. Valid existing keys are never displayed or rotated. An invalid saved value can be interactively replaced during preprovision after warning the operator, but the replacement is persisted only after it validates as Base64 for exactly 32 bytes. Non-interactive pipelines must provide valid protected HMAC material.
 
 When `AZURE_RESOURCE_GROUP` is absent, an interactive run asks for exactly three ASCII letters representing the Azure region abbreviation, normalizes them to lowercase, and persists:
 
@@ -124,7 +124,7 @@ The operator-facing automation is three responsibilities, each implemented for B
 
 - `prepare-deployment.*` runs only as the azd preprovision/predeploy guard;
 - `postdeploy-keyvault-access.*` discovers enabled mappings, lists each pair's source and target subscription, resource group, and vault name in a table, then coordinates optional onboarding;
-- `grant-keyvault-access.*` previews or applies the three required per-pair grants.
+- `grant-keyvault-access.*` verifies the current operator's inherited/group RBAC assignment path, then previews or applies the four required per-pair grants.
 
 There are no separate HMAC, storage-validation, backup/restore, or vault-mutation deployment scripts.
 
@@ -144,7 +144,9 @@ bash scripts/grant-keyvault-access.sh \
   -TargetVaultResourceId "<target-vault-resource-id>"
 ```
 
-Preview is the default. `--apply`/`-Apply` is required for IAM changes. The scripts resolve the source from the target tag, support cross-subscription pairs, and require Azure RBAC on both vaults.
+Preview is the default. `--apply`/`-Apply` is required for IAM changes. The scripts resolve the source from the target tag, support cross-subscription pairs, and require Azure RBAC on both vaults. Before any pair is approved, the read-only preflight verifies that the current signed-in user or service principal has an effective inherited, group, or direct `Owner`, `User Access Administrator`, or `Role Based Access Control Administrator` assignment on both source and target vault scopes. Azure still makes the authoritative authorization decision when an assignment is created; deny assignments, role conditions, or propagation can cause that mutation to fail.
+
+All azd hooks emit phase-prefixed progress to stdout so the deployment transcript shows configuration resolution, subscription discovery, permission preflight, storage validation, and each reviewed/apply pair. Protected HMAC values are never printed.
 
 Interactive azd deployments can run the optional post-deploy hook. It discovers target-declared mappings in all configured subscriptions, previews every grant, and asks separately before applying. Non-interactive runs skip it.
 

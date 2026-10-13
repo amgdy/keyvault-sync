@@ -33,7 +33,17 @@ az() {
                 '{principalId:$principal,tenantId:$tenant}'
             ;;
         'account show')
-            jq -n --arg tenant "$tenant_id" '{tenantId:$tenant}'
+            if [[ "$*" == *'--query user.name'* ]]; then
+                printf '%s\n' "$principal_id"
+                return 0
+            fi
+            jq -n --arg tenant "$tenant_id" --arg user "$principal_id" '{tenantId:$tenant,user:{name:$user}}'
+            ;;
+        'ad signed-in-user')
+            printf '%s\n' "$principal_id"
+            ;;
+        'ad sp')
+            printf '%s\n' "$principal_id"
             ;;
         'keyvault show')
             id=$(argument --ids "$@")
@@ -57,8 +67,18 @@ az() {
             case "$3" in
                 list)
                     scope=$(argument --scope "$@")
-                    jq --arg scope "$scope" --arg principal "$principal_id" \
-                        '[.[] | select(.scope == $scope and .principalId == $principal)]' \
+                    if [[ "$*" == *'--include-inherited'* ]]; then
+                        if [[ "${MOCK_OPERATOR_RBAC_DENIED:-false}" == true ]]; then
+                            printf '[]\n'
+                        else
+                            jq -n --arg scope "$scope" --arg principal "$principal_id" \
+                                --arg role "${MOCK_OPERATOR_ROLE_NAME:-Owner}" \
+                                '[{scope:$scope,principalId:$principal,roleDefinitionName:$role}]'
+                        fi
+                        return 0
+                    fi
+                    jq --arg scope "$scope" --arg principal "$principal_id" '
+                        map(select(.scope == $scope and .principalId == $principal))' \
                         "$fixture_directory/assignments.json"
                     ;;
                 create)
@@ -122,7 +142,18 @@ expected_grants=$(printf '%s\n' \
 reset_fixture
 preview=$(run_script)
 grep -q 'Preview only' <<<"$preview"
+grep -q 'Verified the current Azure principal can manage role assignments on the source vault' <<<"$preview"
+grep -q 'Verified the current Azure principal can manage role assignments on the target vault' <<<"$preview"
+jq -se '
+  [.[] | select(.[0:3] == ["role","assignment","list"])
+    | select(index("--include-inherited") != null and index("--include-groups") != null)]
+  | length == 2' "$fixture_directory/calls.jsonl" >/dev/null
 [[ "$(write_count)" == 0 ]]
+
+reset_fixture
+export MOCK_OPERATOR_ROLE_NAME='Role Based Access Control Administrator'
+run_script >/dev/null
+unset MOCK_OPERATOR_ROLE_NAME
 
 reset_fixture
 apply_output=$(run_script --apply)
@@ -170,5 +201,16 @@ if run_script --apply >/dev/null 2>&1; then
     exit 1
 fi
 [[ "$(write_count)" == 0 ]]
+
+reset_fixture
+export MOCK_OPERATOR_RBAC_DENIED=true
+if run_script >"$fixture_directory/operator-denied.out" 2>&1; then
+    echo 'Expected missing operator RBAC authority to fail during preview.' >&2
+    exit 1
+fi
+grep -q 'does not have Owner, User Access Administrator, or Role Based Access Control Administrator' \
+    "$fixture_directory/operator-denied.out"
+[[ "$(write_count)" == 0 ]]
+unset MOCK_OPERATOR_RBAC_DENIED
 
 printf 'grant-keyvault-access.sh offline tests passed.\n'

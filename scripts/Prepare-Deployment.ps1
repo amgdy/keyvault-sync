@@ -16,6 +16,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Emit one visible, secret-free hook progress line for the deployment transcript.
+function Write-HookStep {
+    param([Parameter(Mandatory = $true)][string] $Message)
+    Write-Host "[KeyVaultSync][$Phase] $Message"
+}
+
 # Render a numbered menu and return the selected option value.
 # Each option supplies Value, Label, and optional Aliases; the first option answers empty input.
 function Read-Choice {
@@ -166,6 +172,8 @@ function Read-HmacKey {
 
 # Reuse, import, or interactively generate the stable per-environment HMAC key.
 function Ensure-HmacKey {
+    param([switch] $AllowPrompt)
+
     $environmentName = ConvertFrom-AzdScalar $env:AZURE_ENV_NAME
     if ([string]::IsNullOrWhiteSpace($environmentName)) {
         $environmentName = Get-AzdValue 'AZURE_ENV_NAME'
@@ -192,7 +200,7 @@ function Ensure-HmacKey {
             return
         }
 
-        if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
+        if (-not $AllowPrompt -or $env:AZD_NON_INTERACTIVE -ieq 'true') {
             throw 'KEYVAULTSYNC_HMAC_KEY is invalid. Provide Base64 for exactly 32 bytes through protected pipeline configuration.'
         }
 
@@ -206,6 +214,9 @@ passes validation.
         $hmacKey = ''
     }
 
+    if (-not $AllowPrompt) {
+        throw 'KEYVAULTSYNC_HMAC_KEY is missing before package deployment. Run azd provision first or restore the environment key; deploy never generates or replaces it.'
+    }
     if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
         throw 'KEYVAULTSYNC_HMAC_KEY is required for non-interactive deployment. Provide it through protected pipeline configuration or run azd interactively to supply or generate it.'
     }
@@ -246,7 +257,7 @@ function Ensure-SubscriptionList {
         $configured = Get-AzdValue 'AZURE_SUBSCRIPTION_ID'
     }
     if ([string]::IsNullOrWhiteSpace($configured)) {
-        throw 'KEYVAULTSYNC_SUBSCRIPTIONS is required. Supply one or more comma-separated Azure subscription IDs.'
+        throw 'KEYVAULTSYNC_SUBSCRIPTIONS is required. Select an azd deployment subscription or supply one or more Azure subscription IDs.'
     }
 
     $subscriptionIds = $configured -split '[,;\s]+' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
@@ -260,7 +271,7 @@ function Ensure-SubscriptionList {
     if ([string]::IsNullOrWhiteSpace((Get-AzdValue 'KEYVAULTSYNC_SUBSCRIPTIONS'))) {
         Set-AzdValue -Name 'KEYVAULTSYNC_SUBSCRIPTIONS' -Value $configured | Out-Null
     }
-    Write-Host "Configured $($subscriptionIds.Count) subscription(s) for KeyVaultSync discovery."
+    Write-Host "Configured $($subscriptionIds.Count) subscription(s) for KeyVaultSync discovery: $configured"
 }
 
 # Preserve an existing resource-group name or configure the CAF-style name azd will create.
@@ -592,18 +603,27 @@ if (-not (Get-Command azd -ErrorAction SilentlyContinue)) {
     throw 'azd is required.'
 }
 
-# Both phases must establish the same protected HMAC key before any Azure deployment step.
-Ensure-HmacKey
+Write-HookStep "Starting azd $Phase hook for environment $(if ([string]::IsNullOrWhiteSpace($env:AZURE_ENV_NAME)) { 'current' } else { $env:AZURE_ENV_NAME })."
 
 if ($Phase -eq 'deploy') {
-    # Predeploy performs no configuration prompts; it only validates the package-deployment path.
+    # Predeploy never prompts for protected material. It validates the key established
+    # during preprovision and the package-deployment path.
+    Write-HookStep 'Validating the HMAC key saved during provisioning; no prompt will be shown.'
+    Ensure-HmacKey
+    Write-HookStep 'Validating deployment-storage configuration and reachability.'
     Test-DeploymentStorage
+    Write-HookStep 'Predeploy validation completed successfully.'
     return
 }
 
 # Preprovision validates deployment naming and runtime discovery scope before Bicep receives parameters.
+Write-HookStep 'Resolving the stable HMAC key. This is the only hook phase that can prompt for it.'
+Ensure-HmacKey -AllowPrompt
+Write-HookStep 'Resolving the discovery subscription list.'
 Ensure-SubscriptionList
+Write-HookStep 'Resolving deployment resource-group naming.'
 Ensure-ResourceGroupName
+Write-HookStep 'Resolving the networking profile and required topology values.'
 Ensure-NetworkConfiguration
 
 $currentName = $env:KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME
@@ -626,6 +646,7 @@ if ($env:AZD_NON_INTERACTIVE -ieq 'true') {
     else {
         Write-Host 'No optional deployment tag is configured; continuing without one.'
     }
+    Write-HookStep 'Preprovision configuration completed successfully.'
     return
 }
 
@@ -645,6 +666,7 @@ if (-not [string]::IsNullOrWhiteSpace($currentName) -and -not [string]::IsNullOr
             @{ Value = 'replace'; Label = 'Replace the configured tag'; Aliases = @('r') }
         )
     if ($tagAction -eq 'keep') {
+        Write-HookStep 'Preprovision configuration completed successfully.'
         return
     }
 }
@@ -657,6 +679,7 @@ elseif ([string]::IsNullOrWhiteSpace($currentName) -and [string]::IsNullOrWhiteS
         )
     if ($tagAction -eq 'skip') {
         Write-Host 'Continuing without an optional deployment tag.'
+        Write-HookStep 'Preprovision configuration completed successfully.'
         return
     }
 }
@@ -688,9 +711,11 @@ $tagAction = Read-Choice `
     )
 if ($tagAction -eq 'cancel') {
     Write-Host 'Optional deployment tag was not changed.'
+    Write-HookStep 'Preprovision configuration completed successfully.'
     return
 }
 
 Set-AzdValue KEYVAULTSYNC_RESOURCE_GROUP_TAG_NAME $tagName
 Set-AzdValue KEYVAULTSYNC_RESOURCE_GROUP_TAG_VALUE $tagValue
 Write-Host "Configured the optional deployment tag for azd environment $($env:AZURE_ENV_NAME)."
+Write-HookStep 'Preprovision configuration completed successfully.'
