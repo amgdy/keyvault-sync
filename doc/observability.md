@@ -2,9 +2,78 @@
 
 KeyVaultSync emits structured logs, W3C activities, Azure SDK dependencies, low-cardinality metrics, and durable private run reports.
 
+## Tracking an Invocation
+
+Each timer invocation writes one start record (`6000`) and exactly one completion record (`6001`). Start from the completion record: it states the invocation outcome, the aggregate run status, value-free counts, and the location of the run's durable JSON record.
+
+Because `host.json` sets `telemetryMode` to `OpenTelemetry`, the portal's **Function Invocations** page and log streaming do not show these traces. Use Application Insights **Transaction search**, its end-to-end transaction view, or the [invocation queries](#querying-invocations-and-runs).
+
+### Correlation Keys
+
+Every record from one invocation can be grouped by these keys:
+
+| Key | Present on | Groups |
+|---|---|---|
+| `OperationId` | Every request, dependency, trace, and exception row of the invocation; `traceId` in the run record | The complete invocation: host request, worker, runner, and Azure SDK calls |
+| `FunctionInvocationId`, `FunctionName` | Logger scope on every log written during the invocation | Worker logs for the host-assigned invocation ID |
+| `RunId` | Logger scope from run start; `sync.run_id` span tag; `runId` in the run record | One synchronization cycle |
+| `RunRecordContainer`, `RunRecordBlobName` | Logger scope from run start; `sync.run_record.*` span tags | The cycle's durable JSON record |
+| `PairId`, `SourceVaultName`, `TargetVaultName`, `PairNumber` | Logger scope during pair scanning and execution; `sync.pair_id` span tag | One source/target pair |
+| `ExecutionPhase` | Logger scope and `sync.phase` span tag during an execution phase | One ordered execution phase of one pair |
+
+### Span Hierarchy
+
+```mermaid
+flowchart TD
+    Request["Host request<br/>KeyVaultSyncTimerFunction"] --> Invocation["Worker invocation span<br/>events 6000 and 6001"]
+    Invocation --> Run["sync.run<br/>events 3004 and 3005"]
+    Run --> Discovery["sync.discover-vault-pairs"]
+    Run --> Scan["sync.scan-pair<br/>one per enabled pair"]
+    Run --> Execute["sync.execute-pair<br/>one per prepared pair"]
+    Execute --> Phase["sync.execute-phase<br/>one per non-empty phase, event 3006"]
+    Run --> RunRecord["blob.write-run-record<br/>event 4001"]
+    Discovery --> Dependencies["ARM, Key Vault, and Blob<br/>dependency calls"]
+    Scan --> Dependencies
+    Phase --> Dependencies
+```
+
+`sync.run` is an internal span, so the host request remains the only request row; the run, pair, and phase spans appear as in-process dependency rows. A phase span's display name includes its phase, such as `sync.execute-phase ObjectCreateReconcile`.
+
+### Invocation and Run Events
+
+| Event ID | Event name | Level | Records |
+|---:|---|---|---|
+| `6000` | `TimerInvocationStarted` | Information; Warning when past due | Invocation ID, function name, app version, past-due flag, schedule, and timer-monitor timestamps |
+| `6001` | `TimerInvocationCompleted` | By outcome, below | Outcome, duration, RunId, run status, discovery/pair/plan counts, verified object and RBAC changes, and run-record URI; the exception type when the runner raised |
+| `3004` | `RunStarted` | Information | RunId, mode, subscription count, trace ID, and run-record URI |
+| `3005` | `RunCompleted` | Information; Warning; Critical for `Failed` | Duration, discovery and pair counts, pair-status distribution, plan and verified-change counts, and run-record URI |
+| `3006` | `ExecutionPhaseCompleted` | Information; Warning when items need attention or the phase was cancelled; Error when it failed | Per-pair phase outcome, duration, and item, verified-change, no-change, and attention counts |
+| `4001` | `RunRecordPersisted` | Information | Each run-record snapshot write, with its container and blob name |
+
+### Invocation Outcomes
+
+| Runner result | `InvocationOutcome` | `6001` level | Invocation |
+|---|---|---|---|
+| `Complete` or `NoConfiguredPairs` | `Succeeded` | Information | Succeeds |
+| `Partial` or any other status | `CompletedWithWarnings` | Warning | Succeeds; review the run record |
+| `Failed` | `Failed` | Critical | Fails with the RunId and run-record URI in the error |
+| `Cancelled` | `Cancelled` | Warning | Fails as cancelled |
+| Runner exception | `Failed` | Error, with the exception attached | The original exception propagates |
+| Host cancellation | `Cancelled` | Warning, without an exception | Cancellation propagates |
+
+An exception raised after the run started carries its RunId, status, and run-record location, so its `6001` record names the run record. A failure before the run starts, such as `KVS-CONFIG-HMAC-INVALID` or `KVS-STORAGE-INITIALIZE`, ends with `No run record was created for this invocation.` A record with an attached exception is exported to `AppExceptions` instead of `AppTraces`.
+
+### Run Record Location
+
+The run record is `runs/<yyyy>/<MM>/<dd>/<RunId>.json` in the runs container (`keyvaultsync-runs` by default), partitioned by the run's UTC start date. Events `3004`, `3005`, and `6001` and the `sync.run_record.uri` tag carry its Blob URI without a query string, so they never contain a SAS token; reading the blob still requires Blob data-plane authorization. The record's `traceId` equals the Application Insights `OperationId` of the invocation that wrote it. See [troubleshooting](troubleshooting.md#find-an-invocations-run-record) to download one.
+
+### Invocation Span Tags
+
+The invocation handler adds string-valued tags to the worker invocation span: `timer.is_past_due`, `sync.invocation.outcome`, `sync.run_id`, `sync.status`, `sync.run_record.container`, `sync.run_record.blob`, `sync.run_record.uri`, the value-free `sync.pair.*`, `sync.plan.*`, `sync.object.verified_change_count`, and `sync.rbac.verified_change_count` counts, and `error.type` when the runner raised. Newer Functions host versions can copy string-valued worker tags onto the host request record, which makes them filterable on `AppRequests`. That propagation depends on the host version and has not been verified live for this repository. The `sync.run` span carries the same counts.
+
 ## Implemented Signals
 
-Structured logs cover run start/completion, discovery, pair lease and planning progress, inventory stages, plan persistence, object mutation intent and verification, RBAC execution, and pair completion. Logger scopes carry the run and pair correlation context through child services.
+Structured logs cover timer invocation start/completion, run start/completion, discovery, pair lease and planning progress, inventory stages, plan persistence, execution phases, object mutation intent and verification, RBAC execution, and pair completion. Logger scopes carry the invocation, run, pair, and phase correlation context through child services.
 
 Administrator-facing events use stable IDs and `KVS-*` diagnostic codes:
 
@@ -31,9 +100,9 @@ Every administrator diagnostic uses the same bounded decision fields:
 - `Confidence` (`High` for cataloged outcomes and `Low` for unknown fallbacks);
 - `AdminAction` for the identifier-free inferred recommendation.
 
-Logger scopes provide `RunId` and, during pair work, `PairId`. Object events add `ObjectType` and `ObjectAction`; authorization events add bounded `ScopeKind` and `ObjectAction`. Raw object names, principal IDs, and complete authorization scopes are intentionally excluded from these new correlation fields. Use the protected durable record when exact subject identity is required.
+Logger scopes provide the [correlation keys](#correlation-keys). Object events add `ObjectType` and `ObjectAction`; authorization events add bounded `ScopeKind` and `ObjectAction`. Raw object names, principal IDs, and complete authorization scopes are intentionally excluded from these new correlation fields. Use the protected durable record when exact subject identity is required.
 
-W3C activities cover the run, discovery, pair scanning/execution, ARM reads, Key Vault inventory, Blob state operations, and Azure SDK dependencies.
+W3C activities cover the run, discovery, pair scanning/execution, execution phases, ARM reads, Key Vault inventory, Blob state operations, and Azure SDK dependencies.
 
 The `KeyVaultSync.Runner` meter emits:
 
@@ -61,7 +130,7 @@ Never export:
 
 Persisted private Blob reports may contain operational identifiers needed for review. Exported telemetry must never include object values or cryptographic material. Keep metric dimensions low-cardinality and do not add names, ARM IDs, subscription IDs, or principal IDs to metrics.
 
-Current application logs and activities can include raw operational identifiers for diagnosis. Restrict telemetry access and retention accordingly; a future keyed-correlation sanitization pass would be required before treating exported telemetry as identifier-free.
+Current application logs and activities can include raw operational identifiers for diagnosis, including the storage account, container, and run-record path. Run-record URIs never include a query string or SAS token. Restrict telemetry access and retention accordingly; a future keyed-correlation sanitization pass would be required before treating exported telemetry as identifier-free.
 
 The [offline log analyzer](../tools/keyvaultsync-log-analyzer.html) redacts common ARM IDs, GUIDs, run IDs, service hosts, and labeled vault/object names by default. It visibly separates parsed evidence from inferred recommendations, derives a `Healthy`, `Needs review`, `Partial`, or `Blocked` assessment, and ranks actions from P1 through P4. `KVS-RBAC-403`, ambiguous object outcomes, unresolved intents, pair-state persistence failures, and lease-renewal failures are P1. Inventory warnings always produce at least a `Partial` assessment.
 
@@ -85,13 +154,72 @@ IaC configures workspace-based Application Insights with managed-identity ingest
 Recommended production controls that are not created by the current IaC:
 
 - retention and daily-cap policy appropriate to the environment;
-- alert on timer silence;
-- alert on failed/ambiguous runs;
+- alert on timer silence, such as no `6000` record within two schedule intervals;
+- alert on failed/ambiguous runs, such as a `6001` record whose `InvocationOutcome` is not `Succeeded`;
 - alert on unresolved intents;
 - alert on an open deletion circuit breaker;
 - workbook views for run health, pair health, action outcomes, and latency.
 
 Alerts and workbooks are not a substitute for durable private reports or explicit intent-resolution tooling.
+
+## Querying Invocations and Runs
+
+Invocation history, one row per invocation. Add `| where InvocationOutcome != "Succeeded"` to list only invocations that need review:
+
+```kusto
+union AppTraces, AppExceptions
+| where TimeGenerated > ago(7d)
+| where tostring(Properties["EventId"]) == "6001"
+| project TimeGenerated, OperationId,
+    FunctionInvocationId = tostring(Properties["FunctionInvocationId"]),
+    InvocationOutcome = tostring(Properties["InvocationOutcome"]),
+    DurationMs = tolong(Properties["DurationMs"]),
+    RunId = tostring(Properties["RunId"]),
+    RunStatus = tostring(Properties["RunStatus"]),
+    AttemptedPairs = toint(Properties["AttemptedPairCount"]),
+    FailedPairs = toint(Properties["FailedPairCount"]),
+    AttentionItems = toint(Properties["AttentionItemCount"]),
+    VerifiedObjectChanges = toint(Properties["VerifiedObjectChangeCount"]),
+    VerifiedRbacChanges = toint(Properties["VerifiedRbacChangeCount"]),
+    ErrorType = tostring(Properties["ErrorType"]),
+    RunRecordUri = tostring(Properties["RunRecordUri"])
+| order by TimeGenerated desc
+```
+
+Complete timeline of one invocation, using an `OperationId` from the history or the run record's `traceId`:
+
+```kusto
+let operationId = "<operation-id>";
+union AppRequests, AppDependencies, AppTraces, AppExceptions
+| where TimeGenerated > ago(7d)
+| where OperationId == operationId
+| project TimeGenerated, Type, Name, Message, SeverityLevel, DurationMs, Success,
+    EventName = tostring(Properties["EventName"]),
+    PairId = tostring(Properties["PairId"]),
+    ExecutionPhase = tostring(Properties["ExecutionPhase"]),
+    DiagnosticCode = tostring(Properties["DiagnosticCode"])
+| order by TimeGenerated asc
+```
+
+Execution phases of one run:
+
+```kusto
+AppTraces
+| where TimeGenerated > ago(7d)
+| where tostring(Properties["EventId"]) == "3006"
+| where tostring(Properties["RunId"]) == "<run-id>"
+| project TimeGenerated,
+    PairId = tostring(Properties["PairId"]),
+    ExecutionPhase = tostring(Properties["ExecutionPhase"]),
+    PhaseOutcome = tostring(Properties["PhaseOutcome"]),
+    DurationMs = tolong(Properties["DurationMs"]),
+    Items = toint(Properties["PhaseItemCount"]),
+    VerifiedChanges = toint(Properties["PhaseVerifiedChangeCount"]),
+    NoChange = toint(Properties["PhaseNoChangeCount"]),
+    Attention = toint(Properties["PhaseAttentionCount"]),
+    ErrorType = tostring(Properties["ErrorType"])
+| order by TimeGenerated asc
+```
 
 ## Querying Diagnostic Codes
 

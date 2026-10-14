@@ -4,7 +4,8 @@
 
 ```mermaid
 flowchart TD
-    Symptom([Synchronization problem]) --> RunRecord{Durable run record exists?}
+    Symptom([Synchronization problem]) --> Invocation["Find the invocation's<br/>6001 completion record"]
+    Invocation --> RunRecord{Durable run record exists?}
     RunRecord -- No --> Startup["Check Function startup,<br/>configuration, identity, and Blob access"]
     RunRecord -- Yes --> PairStatus{Pair admitted and planned?}
     PairStatus -- No --> Discovery["Check mapping tag, pause tag,<br/>tenant, RBAC mode, and ARM access"]
@@ -15,7 +16,27 @@ flowchart TD
     Outcome -->|APPLIED or IN SYNC| Telemetry["If telemetry is missing,<br/>check Application Insights ingestion"]
 ```
 
-Start with the durable Blob run record. Telemetry helps locate a failure, but it is not the authoritative mutation record.
+Start with the invocation's `6001` completion record, which names the durable Blob run record, then read that record. Telemetry helps locate a failure, but it is not the authoritative mutation record.
+
+## Find an Invocation's Run Record
+
+1. Run the invocation history query in [observability](observability.md#querying-invocations-and-runs). Each `6001` row gives the invocation outcome, run status, `RunId`, value-free counts, and run-record URI. Rows with an attached exception are in `AppExceptions`.
+2. If the row ends with `No run record was created for this invocation.`, the runner failed before the cycle started. Check the attached exception and the `KVS-CONFIG-HMAC-INVALID` or `KVS-STORAGE-INITIALIZE` diagnostic, then the Function configuration, identity, and Blob access.
+3. If neither `6000` nor `6001` exists for the expected time, the invocation did not reach the runner. Check host startup, the timer schedule, runner configuration, and telemetry export.
+4. Otherwise, download the record with an identity that has Blob data read access, such as `Storage Blob Data Reader`, on the runs container. The `6001` run-record URI gives the exact storage account, container, and blob name; the container is `keyvaultsync-runs` unless `KEYVAULTSYNC_RUNS_CONTAINER` overrides it:
+
+   ```sh
+   az storage blob download --auth-mode login \
+     --account-name <storage-account> \
+     --container-name keyvaultsync-runs \
+     --name runs/<yyyy>/<MM>/<dd>/<run-id>.json \
+     --file ./run-record.json
+   ```
+
+   Private network profiles also require a network path to the storage account's private endpoint.
+5. To go from a run record back to telemetry, use its `traceId` as the `OperationId` in the invocation timeline query. It shows every request, span, log, and exception of the invocation that wrote the record.
+
+The run record is private operational data. Keep downloaded copies out of tickets and source control; share the analyzer's sanitized summary instead.
 
 ## Offline Log Analyzer
 
@@ -43,7 +64,7 @@ GitHub Pages serves the HTML and JavaScript, but selected log files are still re
 
 GitHub Pages is configured for this repository with **GitHub Actions** as its build source and HTTPS enforcement enabled. The workflow publishes changes to `main`; it does not require an external hosting account or repository secret.
 
-Identifier display is disabled by default. The JSON and HTML downloads replace the source filename, redact evidence independently of the display toggle, and preserve only bounded codes, priorities, recommendations, timestamps, and redacted evidence. The original export and run record remain private operational data, and automated redaction is not a declassification guarantee. Review the downloaded summary before sharing it.
+Identifier display is disabled by default. The summary shows the run-record locator and Operation ID found in the input, redacted until identifier display is enabled. The JSON and HTML downloads omit both locators, replace the source filename, redact evidence independently of the display toggle, and preserve only bounded codes, priorities, recommendations, timestamps, and redacted evidence. The original export and run record remain private operational data, and automated redaction is not a declassification guarantee. Review the downloaded summary before sharing it.
 
 Use CSV for a timeline and HTTP/error evidence. Use the durable JSON when you need the exact inventory warning, affected plan item, or persisted mutation outcome; those details are intentionally not duplicated into general telemetry.
 
@@ -53,7 +74,8 @@ Use CSV for a timeline and HTTP/error evidence. Use the durable JSON when you ne
 2. Confirm `APPLICATIONINSIGHTS_CONNECTION_STRING` points to the intended workspace-based Application Insights component; never print the value into terminal logs or tickets.
 3. Confirm the app identity can get an Entra token and has `Monitoring Metrics Publisher` on that component.
 4. Confirm the component has ingestion enabled and that the app can reach its ingestion endpoint.
-5. Query `AppTraces`, `AppDependencies`, and `AppMetrics` in the component's linked Log Analytics workspace. Ingestion may take several minutes.
+5. Query `AppRequests`, `AppDependencies`, `AppTraces`, `AppExceptions`, and `AppMetrics` in the component's linked Log Analytics workspace. Ingestion may take several minutes.
+6. Do not rely on the portal's **Function Invocations** page or log streaming: neither shows invocation traces when the host uses OpenTelemetry. Query Application Insights instead.
 
 ## Missing Blob Access
 

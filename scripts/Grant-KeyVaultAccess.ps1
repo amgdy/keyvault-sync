@@ -184,6 +184,8 @@ function Assert-CanManageRbacOnScope {
         [Parameter(Mandatory = $true)][string] $PrincipalId
     )
 
+    # --include-inherited returns the vault scope and every parent scope, so --all
+    # (which the CLI rejects when combined with --scope) is not needed.
     $assignments = @(Invoke-AzJson -Arguments @(
         'role', 'assignment', 'list',
         '--scope', $Scope,
@@ -191,7 +193,7 @@ function Assert-CanManageRbacOnScope {
         '--subscription', $SubscriptionId,
         '--include-inherited',
         '--include-groups',
-        '--all'
+        '--fill-principal-name', 'false'
     ))
     $canGrant = @($assignments | Where-Object {
         $name = ([string] $_.roleDefinitionName).ToLowerInvariant()

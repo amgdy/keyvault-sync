@@ -8,7 +8,7 @@ Use neutral product terminology. Runtime discovery uses target-side `sync-source
 
 ## Current Boundaries
 
-- `KeyVaultSync.Function` is a thin timer/host adapter; `RunnerApplication` owns run and pair orchestration.
+- `KeyVaultSync.Function` is a thin timer/host adapter; `TimerInvocationHandler` owns invocation telemetry and outcome mapping; `RunnerApplication` owns run and pair orchestration.
 - `ArmResourceClient` owns subscription discovery and declared-authorization inventory.
 - `VaultInventoryScanner` performs value-free inventory; `ReplicationPlanner` is pure; `ObjectExecutor` owns guarded secret/certificate writes and soft deletes; `RbacExecutor` owns allowlisted direct Key Vault RBAC reconciliation.
 - An enabled, unpaused mapping is the runtime opt-in for supported operations. Secrets and exportable PFX certificates are supported. Standalone private/symmetric keys and non-exportable certificate material remain blocked. Purge is never supported.

@@ -227,6 +227,23 @@ public sealed class AdminDiagnosticsTests
         Assert.DoesNotContain("sourceFile: state.name", analyzer, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Analyzer_ReportsRedactableRunRecordAndOperationLocators()
+    {
+        var analyzerPath = Path.GetFullPath(Path.Combine(
+            AppContext.BaseDirectory,
+            "..", "..", "..", "..", "..",
+            "tools", "keyvaultsync-log-analyzer.html"));
+        var analyzer = File.ReadAllText(analyzerPath);
+
+        Assert.Contains("function runRecordFromTelemetry(", analyzer, StringComparison.Ordinal);
+        Assert.Contains("function runRecordBlobName(", analyzer, StringComparison.Ordinal);
+        Assert.Contains("function isTraceId(", analyzer, StringComparison.Ordinal);
+        Assert.Contains("metric(\"Run record\", state.meta.runRecord ? displayEvidence(", analyzer, StringComparison.Ordinal);
+        Assert.Contains("metric(\"Operation ID\", state.meta.operationId ? displayEvidence(", analyzer, StringComparison.Ordinal);
+        Assert.Contains("(?:completed|ended) with status", analyzer, StringComparison.Ordinal);
+    }
+
     private static PlanItem PlanItem(string status) => new()
     {
         ObjectType = "Authorization",

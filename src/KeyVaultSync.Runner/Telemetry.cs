@@ -211,7 +211,7 @@ internal static class RunnerTelemetry
     public static readonly Meter Meter = new(MeterName);
     /// <summary>Counts cycle starts, including cycles that later fail or discover no configured pairs.</summary>
     public static readonly Counter<long> RunsStarted = Meter.CreateCounter<long>("keyvaultsync.runs.started", "{run}");
-    /// <summary>Counts cycles reaching the final summary; propagated cancellation can bypass this counter.</summary>
+    /// <summary>Counts cycles reaching the final summary, including cancelled cycles; prerequisite failures before a run exists are not counted.</summary>
     public static readonly Counter<long> RunsCompleted = Meter.CreateCounter<long>("keyvaultsync.runs.completed", "{run}");
     /// <summary>Counts processed pair attempts, with outcome supplied by the orchestration call site.</summary>
     public static readonly Counter<long> PairsProcessed = Meter.CreateCounter<long>("keyvaultsync.pairs.processed", "{pair}");

@@ -163,13 +163,15 @@ assert_principal_can_manage_keyvault_rbac() {
     local current_principal="$3"
     local vault_role="$4"
     local assignments
+    # --include-inherited returns the vault scope and every parent scope, so --all
+    # (which the CLI rejects when combined with --scope) is not needed.
     if ! assignments=$(az role assignment list \
             --scope "$scope" \
             --assignee-object-id "$current_principal" \
             --subscription "$subscription_id" \
             --include-inherited \
             --include-groups \
-            --all \
+            --fill-principal-name false \
             --only-show-errors \
             --output json 2>&1); then
         fail "Azure CLI could not read effective RBAC assignments on the $vault_role vault. Verify the Azure CLI session and roleAssignments/read access. Azure CLI output: $assignments"

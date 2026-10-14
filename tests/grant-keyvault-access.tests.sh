@@ -70,6 +70,18 @@ az() {
         'role assignment')
             case "$3" in
                 list)
+                    # Mirror the real CLI: --all lists the whole subscription and cannot be scoped.
+                    local list_argument has_all=false has_scope=false
+                    for list_argument in "$@"; do
+                        case "$list_argument" in
+                            --all) has_all=true ;;
+                            --scope | --resource-group | -g) has_scope=true ;;
+                        esac
+                    done
+                    if [[ "$has_all" == true && "$has_scope" == true ]]; then
+                        printf 'ERROR: group or scope are not required when --all is used\n' >&2
+                        return 1
+                    fi
                     scope=$(argument --scope "$@")
                     if [[ "$*" == *'--include-inherited'* ]]; then
                         if [[ "${MOCK_OPERATOR_RBAC_READ_FAILURE_SCOPE:-}" == "$scope" ]]; then

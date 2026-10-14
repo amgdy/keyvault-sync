@@ -4,8 +4,9 @@
 
 ```mermaid
 flowchart TD
-    Trigger["KeyVaultSyncTimerFunction.RunAsync"]
-    Run["RunnerApplication.RunOnceAsync"]
+    Trigger["KeyVaultSyncTimerFunction.Run"]
+    Invocation["TimerInvocationHandler.ExecuteAsync<br/>event 6000"]
+    Run["RunnerApplication.ExecuteScheduledRunAsync"]
     Discovery["ArmResourceClient.DiscoverVaultPairsAsync"]
     Inventory["VaultInventoryScanner.ScanAsync"]
     Planning["ReplicationPlanner.CreatePlan"]
@@ -19,17 +20,26 @@ flowchart TD
     ObjectDelete["Guarded object soft delete"]
     VaultRbacDelete["Delete vault-scope RBAC"]
     RunReport["BlobStateStore.WriteRunRecordAsync"]
+    Completion["Invocation completion record<br/>event 6001 with run-record URI"]
 
-    Trigger --> Run --> Discovery --> Inventory --> Planning --> PersistPlan --> Gate
+    Trigger --> Invocation --> Run --> Discovery --> Inventory --> Planning --> PersistPlan --> Gate
     Gate -- No --> RunReport
     Gate -- Yes --> ExecutePair
     ExecutePair --> VaultRbacCreate --> ObjectUpsert --> ObjectRbacCreate
     ObjectRbacCreate --> ObjectRbacDelete --> ObjectDelete --> VaultRbacDelete --> RunReport
+    RunReport --> Completion
 ```
 
 ## Timer Entry
 
-`KeyVaultSync.Function` creates `RunnerApplication` and invokes it from the timer trigger. Runtime configuration is environment-only.
+`KeyVaultSyncTimerFunction.Run` captures the timer binding metadata and passes it, with `RunnerApplication.ExecuteScheduledRunAsync`, to `TimerInvocationHandler.ExecuteAsync`. The handler:
+
+1. opens the `FunctionName` and `FunctionInvocationId` logger scope and writes the `6000` start record;
+2. runs one cycle, whose run scope adds `RunId` and the run-record blob name to every runner log;
+3. classifies the aggregate run status, tags the worker invocation span with string values, and writes exactly one `6001` completion record with the run-record URI;
+4. fails the invocation for `Failed` or `Cancelled` and returns normally for every other status.
+
+An exception that escapes the runner is logged once in `6001`, with its run context when the cycle had started, and rethrown unchanged. Runtime configuration is environment-only. See [observability](observability.md#tracking-an-invocation) for the event and correlation contract.
 
 ## Discovery
 
@@ -116,7 +126,7 @@ The runtime identity's assignment is excluded from deletion. Object-scope RBAC w
 - deletion approval state;
 - the last complete inventory checkpoint.
 
-Run reports and persisted plans are separate durable records. Incompatible non-empty state fails closed instead of being silently adopted.
+Run reports and persisted plans are separate durable records. Each run report is `runs/<yyyy>/<MM>/<dd>/<RunId>.json` in the runs container, partitioned by the run's UTC start date. Incompatible non-empty state fails closed instead of being silently adopted.
 
 ## Failure Boundaries
 

@@ -90,6 +90,12 @@ function az {
             return '{"error":"not found"}'
         }
         '^role assignment list$' {
+            # Mirror the real CLI: --all lists the whole subscription and cannot be scoped.
+            if ($argumentsList -contains '--all' -and
+                ($argumentsList -contains '--scope' -or $argumentsList -contains '--resource-group' -or $argumentsList -contains '-g')) {
+                $global:LASTEXITCODE = 1
+                return 'ERROR: group or scope are not required when --all is used'
+            }
             $scope = Get-Argument $argumentsList '--scope'
             if ($argumentsList -contains '--include-inherited') {
                 if ($global:Fixture.OperatorRbacReadFailureScope -ieq $scope) {

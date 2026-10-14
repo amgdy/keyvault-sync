@@ -124,6 +124,8 @@ html[data-theme="dark"] {
     .metric { padding: 16px; background: var(--cp-surface); border: 1px solid var(--cp-border); border-radius: 0.625rem; }
     .metric span { display: block; color: var(--cp-text-muted); font-size: .8rem; }
     .metric strong { display: block; font-size: 1.55rem; margin-top: 2px; }
+    .metric.locator { grid-column: 1 / -1; }
+    .metric.locator strong { font-family: Consolas, "Courier New", Courier, monospace; font-size: .9rem; overflow-wrap: anywhere; }
     .layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(280px, .75fr); gap: 16px; }
     .stack { display: grid; gap: 12px; }
     .finding { border: 1px solid var(--cp-border); border-left-width: 5px; padding: 16px; border-radius: 0.625rem; background: var(--cp-bg-elevated); }
@@ -430,6 +432,11 @@ function parseCsv(text) {
     if (message) state.timeline.push({ timestamp, message, level: pick(row, "severitylevel", "level", "loglevel") });
     const runStatus = dimensions.RunStatus || dimensions.runStatus || statusFromMessage(message);
     if (runStatus) state.meta.status = runStatus;
+    const runRecord = runRecordFromTelemetry(dimensions, message);
+    // Prefer a full blob URI (events 3004/3005/6001) over the container-relative name carried by every scoped record.
+    if (runRecord && (!state.meta.runRecord || /^https?:\/\//i.test(runRecord))) state.meta.runRecord = runRecord;
+    const operationId = pick(row, "operationid") || dimensions.TraceId || dimensions.traceId || "";
+    if (isTraceId(operationId)) state.meta.operationId = operationId;
   }
   state.meta.records = state.rows.length;
   const times = state.timeline.map(item => Date.parse(item.timestamp)).filter(Number.isFinite).sort((a, b) => a - b);
@@ -442,6 +449,8 @@ function parseRunRecord(record) {
   state.meta.status = record.status || "Unknown";
   state.meta.records = 1;
   state.meta.duration = durationBetween(record.startedAt, record.completedAt);
+  state.meta.runRecord = runRecordBlobName(record);
+  state.meta.operationId = isTraceId(record.traceId) ? record.traceId : "";
   const pairs = Array.isArray(record.pairs) ? record.pairs : [];
   state.meta.pairs = pairs.length;
   (record.discoveryIssues || []).forEach(issue =>
@@ -535,7 +544,9 @@ function render() {
     metric("Run status", state.meta.status || "Not present"),
     metric("Assessment", `${statusSymbol(state.meta.assessment)} ${state.meta.assessment}`),
     metric("Priority findings", priorityFindings),
-    metric("Observed duration", state.meta.duration ? formatDuration(state.meta.duration) : "Not available")
+    metric("Observed duration", state.meta.duration ? formatDuration(state.meta.duration) : "Not available"),
+    metric("Run record", state.meta.runRecord ? displayEvidence(state.meta.runRecord) : "Not present", "locator"),
+    metric("Operation ID", state.meta.operationId ? displayEvidence(state.meta.operationId) : "Not present", "locator")
   ].join("");
   $("findings").innerHTML = state.findings.map(renderFinding).join("");
   $("assessment").textContent = `${statusSymbol(state.meta.assessment)} ${state.meta.assessment}. Recommendations are inferences ranked from the observed evidence.`;
@@ -559,7 +570,7 @@ function renderFinding(finding) {
   </article>`;
 }
 
-function metric(label, value) { return `<div class="metric"><span>${escapeHtml(String(label))}</span><strong>${escapeHtml(String(value))}</strong></div>`; }
+function metric(label, value, variant = "") { return `<div class="metric${variant ? ` ${variant}` : ""}"><span>${escapeHtml(String(label))}</span><strong>${escapeHtml(String(value))}</strong></div>`; }
 function severityRank(value) { return ({ high: 0, medium: 1, low: 2, ok: 3 })[value] ?? 2; }
 function priorityForFinding(finding) {
   if (["KVS-RBAC-403", "KVS-OBJECT-AMBIGUOUS", "KVS-PLAN-UNRESOLVED-INTENT", "KVS-STORAGE-PAIR-STATE", "KVS-STORAGE-LEASE-RENEW"].includes(finding.code)) return { rank: 1, label: "P1 · Stop and investigate" };
@@ -692,7 +703,26 @@ function normalizeHeader(value) { return value.trim().toLowerCase().replace(/[^a
 function pick(row, ...keys) { for (const key of keys) if (row[key]) return row[key]; return ""; }
 function parseDimensions(value) { try { return value ? JSON.parse(value) : {}; } catch { return {}; } }
 function codeFromMessage(message) { return message.match(/\b(KVS-[A-Z0-9-]+)\b/)?.[1] || ""; }
-function statusFromMessage(message) { return message.match(/run (?:completed|ended).+?status\s+([A-Za-z]+)/i)?.[1] || ""; }
+function statusFromMessage(message) {
+  return message.match(/\bRun \S+ (?:completed|ended) with status\s+([A-Za-z]+)/i)?.[1]
+    || message.match(/run (?:completed|ended).+?status\s+([A-Za-z]+)/i)?.[1]
+    || "";
+}
+// Run-history blobs are named runs/yyyy/MM/dd/<RunId>.json from the run's UTC start date.
+function runRecordBlobName(record) {
+  const started = new Date(record.startedAt);
+  if (typeof record.runId !== "string" || !record.runId || Number.isNaN(started.valueOf())) return "";
+  return `runs/${started.toISOString().slice(0, 10).replace(/-/g, "/")}/${record.runId}.json`;
+}
+function runRecordFromTelemetry(dimensions, message) {
+  const uri = dimensions.RunRecordUri || dimensions.runRecordUri || message.match(/\brun record (\S+?\.json)\b/i)?.[1] || "";
+  if (uri && uri !== "unavailable") return uri;
+  const blobName = dimensions.RunRecordBlobName || dimensions.runRecordBlobName || "";
+  if (!blobName || blobName === "unavailable") return "";
+  const container = dimensions.RunRecordContainer || dimensions.runRecordContainer || "";
+  return container && container !== "unavailable" ? `${container}/${blobName}` : blobName;
+}
+function isTraceId(value) { return typeof value === "string" && /^[0-9a-f]{32}$/i.test(value) && !/^0+$/.test(value); }
 function durationBetween(start, end) { const value = Date.parse(end) - Date.parse(start); return Number.isFinite(value) && value >= 0 ? value : 0; }
 function formatDuration(milliseconds) {
   const seconds = Math.round(milliseconds / 1000);

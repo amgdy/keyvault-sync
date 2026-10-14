@@ -34,6 +34,7 @@ The arrows show runtime dependencies, not resource ownership. In particular, app
 ## Components
 
 - **KeyVaultSync.Function** is a thin .NET 10 isolated timer host.
+- **TimerInvocationHandler** owns the invocation start/completion records, invocation span tags, and the mapping from aggregate run status to invocation result.
 - **RunnerApplication** owns discovery, admission, planning, execution, reporting, and pair coordination.
 - **ArmResourceClient** performs read-only multi-subscription discovery and declared-authorization inventory.
 - **VaultInventoryScanner** produces value-free active and soft-deleted object inventories.

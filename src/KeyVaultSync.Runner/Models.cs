@@ -324,6 +324,8 @@ internal sealed record RunRecord
     public DateTimeOffset? CompletedAt { get; set; }
     /// <summary>Gets the execution model used for this cycle, currently <c>AutomaticSync</c>.</summary>
     public required string Mode { get; init; }
+    /// <summary>Gets or sets the W3C trace ID, equal to the Application Insights operation ID; null when no trace was active.</summary>
+    public string? TraceId { get; set; }
     /// <summary>Gets or sets Running, Complete, NoConfiguredPairs, Partial, Failed, or Cancelled.</summary>
     public required string Status { get; set; }
     /// <summary>Gets or sets subscription-wide discovered vault count, before source filtering.</summary>

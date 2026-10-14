@@ -26,6 +26,18 @@ public sealed class RunnerApplication
     private static readonly EventId PairProgressEventId = new(3001, "PairProgress");
     private static readonly EventId PlanningProgressEventId = new(3002, "PlanningProgress");
     private static readonly EventId SecretSyncProgressEventId = new(3003, "SecretSyncProgress");
+    internal static readonly EventId RunStartedEventId = new(3004, "RunStarted");
+    internal static readonly EventId RunCompletedEventId = new(3005, "RunCompleted");
+    internal static readonly EventId ExecutionPhaseCompletedEventId = new(3006, "ExecutionPhaseCompleted");
+
+    // Stable phase names for the ExecutionPhase scope, 3006 records, and sync.phase trace tags.
+    // Declaration order mirrors the dependency-safe order used by ExecutePreparedPairAsync.
+    internal const string VaultRbacCreatePhase = "VaultRbacCreate";
+    internal const string ObjectCreateReconcilePhase = "ObjectCreateReconcile";
+    internal const string ObjectRbacCreatePhase = "ObjectRbacCreate";
+    internal const string ObjectRbacDeletePhase = "ObjectRbacDelete";
+    internal const string ObjectDeletePhase = "ObjectDelete";
+    internal const string VaultRbacDeletePhase = "VaultRbacDelete";
 
     private readonly RunnerOptions _options;
     private readonly TokenCredential _credential;
@@ -84,6 +96,8 @@ public sealed class RunnerApplication
     /// Final history persistence is outside the run catch block and can itself throw.</para>
     /// <para>Complete means each admitted pair finished with no unapplied work, not that every planned resource type
     /// was synchronized. Inspect pair statuses and plan items, not just the presence of a persisted run record.</para>
+    /// <para>An exception that escapes after the run is created carries its RunId, status, and run-record location in
+    /// <see cref="Exception.Data"/> so the timer invocation can report where the detailed record lives.</para>
     /// </remarks>
     internal async Task<RunRecord> RunOnceAsync(CancellationToken cancellationToken)
     {
@@ -112,20 +126,39 @@ public sealed class RunnerApplication
             Mode = "AutomaticSync",
             Status = "Running",
         };
-        using var runActivity = RunnerTelemetry.ActivitySource.StartActivity("sync.run", ActivityKind.Server);
+        var runRecordLocation = _stateStore.GetRunRecordLocation(run);
+        try
+        {
+            return await ExecuteRunAsync(run, runRecordLocation, hmac, cancellationToken);
+        }
+        catch (Exception exception) when (AttachRunContext(exception, run, runRecordLocation))
+        {
+            // Unreachable: the filter annotates the exception and returns false, so it propagates unchanged.
+            throw;
+        }
+    }
+
+    private async Task<RunRecord> ExecuteRunAsync(
+        RunRecord run,
+        RunRecordLocation runRecordLocation,
+        ObjectSignatureService? hmac,
+        CancellationToken cancellationToken)
+    {
+        using var runActivity = StartRunActivity(run, runRecordLocation);
         var runTimer = Stopwatch.StartNew();
-        runActivity?.SetTag("sync.run_id", run.RunId);
-        runActivity?.SetTag("sync.mode", run.Mode);
-        runActivity?.SetTag("azure.subscription_count", run.SubscriptionIds.Count);
+        run.TraceId = GetTraceId(Activity.Current);
         RunnerTelemetry.RunsStarted.Add(1, new KeyValuePair<string, object?>("sync.mode", run.Mode));
+        // Every runner and child-service log in this cycle inherits these keys, so one RunId or blob name
+        // groups the complete cycle even when the Application Insights operation ID is not at hand.
         using var runScope = _logger.BeginScope(new Dictionary<string, object?>
         {
             ["RunId"] = run.RunId,
             ["SubscriptionCount"] = run.SubscriptionIds.Count,
             ["Mode"] = run.Mode,
+            ["RunRecordContainer"] = runRecordLocation.ContainerName,
+            ["RunRecordBlobName"] = runRecordLocation.BlobName,
         });
-        _logger.LogInformation("Run {RunId} started in mapping-driven synchronization mode {Mode} across {SubscriptionCount} subscriptions.",
-            run.RunId, run.Mode, run.SubscriptionIds.Count);
+        LogRunStarted(_logger, run, runRecordLocation);
         AdminDiagnostics.LogLifecycle(_logger, "Run", "Started");
 
         try
@@ -385,9 +418,10 @@ public sealed class RunnerApplication
             run.CompletedAt = DateTimeOffset.UtcNow;
             run.Status = "Cancelled";
             run.DiscoveryIssues.Add("Function host requested cancellation.");
+            // Report before the diagnostic write so a storage failure cannot hide the cancellation summary.
+            // The Function observes the exception instead of a RunnerExecutionResult with this status.
+            ReportRunCompletion(run, runActivity, runTimer, runRecordLocation);
             await _stateStore.WriteRunRecordAsync(run, CancellationToken.None);
-            // Cancellation bypasses the final summary/metrics below; the Function observes the
-            // exception instead of receiving a normal RunnerExecutionResult with this status.
             throw;
         }
         catch (Exception exception)
@@ -402,20 +436,19 @@ public sealed class RunnerApplication
             _logger.LogError(exception, "Run {RunId} failed during discovery or orchestration.", run.RunId);
         }
 
-        runTimer.Stop();
-        runActivity?.SetTag("sync.status", run.Status);
-        runActivity?.SetTag("sync.pair_count", run.TaggedPairCount);
-        runActivity?.SetTag("sync.disabled_pair_count", run.DisabledPairCount);
-        runActivity?.SetTag("sync.discovered_vault_count", run.DiscoveredVaultCount);
-        if (run.Status == "Complete")
-        {
-            runActivity?.SetStatus(ActivityStatusCode.Ok);
-        }
-        else if (run.Status != "Failed")
-        {
-            runActivity?.SetStatus(ActivityStatusCode.Error, run.Status);
-        }
+        ReportRunCompletion(run, runActivity, runTimer, runRecordLocation);
+        // Do not return a finalized report until the final persistence attempt succeeds. Metrics
+        // above may already have been recorded if this write fails, so they are not durability proof.
+        await _stateStore.WriteRunRecordAsync(run, CancellationToken.None);
+        return run;
+    }
 
+    /// <summary>Emits the final metrics, run diagnostic, lifecycle transition, and value-free run summary once per cycle.</summary>
+    private void ReportRunCompletion(RunRecord run, Activity? runActivity, Stopwatch runTimer, RunRecordLocation runRecordLocation)
+    {
+        runTimer.Stop();
+        var summary = RunExecutionSummary.Create(run);
+        CompleteRunActivity(runActivity, run, summary);
         RunnerTelemetry.RunsCompleted.Add(1, new KeyValuePair<string, object?>("sync.status", run.Status));
         RunnerTelemetry.RunDuration.Record(runTimer.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("sync.status", run.Status));
         var runDiagnostic = AdminDiagnostics.ClassifyRunStatus(run.Status);
@@ -442,34 +475,127 @@ public sealed class RunnerApplication
             "Run",
             run.Status,
             run.Status is "Complete" or "NoConfiguredPairs" ? "NoActionRequired" : "ReviewRequired");
-        var runMessage = "Run {RunId} completed with status {Status} in {DurationMs} ms.";
-        if (run.Status is "Partial" or "Cancelled")
+        LogRunCompleted(_logger, run, summary, runTimer.Elapsed, runRecordLocation);
+    }
+
+    /// <summary>Starts the cycle span as an in-process child of the Function invocation span.</summary>
+    /// <remarks>Internal kind keeps the cycle out of the host-owned request list; the host invocation is the request.</remarks>
+    internal static Activity? StartRunActivity(RunRecord run, RunRecordLocation runRecordLocation)
+    {
+        var activity = RunnerTelemetry.ActivitySource.StartActivity("sync.run", ActivityKind.Internal);
+        activity?.SetTag("sync.run_id", run.RunId);
+        activity?.SetTag("sync.mode", run.Mode);
+        activity?.SetTag("azure.subscription_count", run.SubscriptionIds.Count);
+        activity?.SetTag("sync.run_record.container", runRecordLocation.ContainerName);
+        activity?.SetTag("sync.run_record.blob", runRecordLocation.BlobName);
+        return activity;
+    }
+
+    /// <summary>Adds final value-free counts and sets Ok only for successful aggregate statuses.</summary>
+    /// <remarks>An Error status already set with an exception type is preserved for failed cycles.</remarks>
+    internal static void CompleteRunActivity(Activity? runActivity, RunRecord run, RunExecutionSummary summary)
+    {
+        if (runActivity is null)
         {
-            _logger.LogWarning(runMessage, run.RunId, run.Status, runTimer.Elapsed.TotalMilliseconds);
+            return;
         }
-        else if (run.Status == "Failed")
+
+        runActivity.SetTag("sync.status", run.Status);
+        runActivity.SetTag("sync.pair_count", run.TaggedPairCount);
+        runActivity.SetTag("sync.disabled_pair_count", run.DisabledPairCount);
+        runActivity.SetTag("sync.discovered_vault_count", run.DiscoveredVaultCount);
+        runActivity.SetTag("sync.discovery_issue_count", summary.DiscoveryIssueCount);
+        runActivity.SetTag("sync.pair.attempted_count", summary.AttemptedPairCount);
+        runActivity.SetTag("sync.pair.completed_count", summary.CompletedPairCount);
+        runActivity.SetTag("sync.pair.attention_count", summary.AttentionPairCount);
+        runActivity.SetTag("sync.pair.failed_count", summary.FailedPairCount);
+        runActivity.SetTag("sync.plan.item_count", summary.PlanItemCount);
+        runActivity.SetTag("sync.plan.attention_item_count", summary.AttentionItemCount);
+        runActivity.SetTag("sync.object.verified_change_count", summary.VerifiedObjectChangeCount);
+        runActivity.SetTag("sync.rbac.verified_change_count", summary.VerifiedRbacChangeCount);
+        if (run.Status is "Complete" or "NoConfiguredPairs")
         {
-            _logger.LogCritical(runMessage, run.RunId, run.Status, runTimer.Elapsed.TotalMilliseconds);
+            runActivity.SetStatus(ActivityStatusCode.Ok);
         }
-        else
+        else if (runActivity.Status != ActivityStatusCode.Error)
         {
-            _logger.LogInformation(runMessage, run.RunId, run.Status, runTimer.Elapsed.TotalMilliseconds);
+            runActivity.SetStatus(ActivityStatusCode.Error, run.Status);
         }
-        // Do not return a finalized report until the final persistence attempt succeeds. Metrics
-        // above may already have been recorded if this write fails, so they are not durability proof.
-        await _stateStore.WriteRunRecordAsync(run, CancellationToken.None);
-        return run;
+    }
+
+    /// <summary>Returns the W3C trace ID that Application Insights stores as the operation ID.</summary>
+    internal static string? GetTraceId(Activity? activity) =>
+        activity?.IdFormat == ActivityIdFormat.W3C ? activity.TraceId.ToHexString() : null;
+
+    internal static void LogRunStarted(ILogger logger, RunRecord run, RunRecordLocation runRecordLocation)
+    {
+        logger.LogInformation(
+            RunStartedEventId,
+            "Run {RunId} started in mapping-driven synchronization mode {Mode} across {SubscriptionCount} subscriptions. Trace {TraceId}; run record {RunRecordUri}.",
+            run.RunId,
+            run.Mode,
+            run.SubscriptionIds.Count,
+            run.TraceId ?? "unavailable",
+            runRecordLocation.BlobUri);
+    }
+
+    // Keep the "Run {RunId} completed with status" prefix: the log analyzer reads legacy exports by that wording.
+    internal static void LogRunCompleted(
+        ILogger logger,
+        RunRecord run,
+        RunExecutionSummary summary,
+        TimeSpan elapsed,
+        RunRecordLocation runRecordLocation)
+    {
+        logger.Log(
+            run.Status switch
+            {
+                "Complete" or "NoConfiguredPairs" => LogLevel.Information,
+                "Failed" => LogLevel.Critical,
+                _ => LogLevel.Warning,
+            },
+            RunCompletedEventId,
+            "Run {RunId} completed with status {RunStatus} in {DurationMs} ms. Discovered vaults {DiscoveredVaultCount}; enabled pairs {EnabledPairCount}; disabled pairs {DisabledPairCount}; unmapped vaults {UnmappedVaultCount}; discovery issues {DiscoveryIssueCount}; attempted pairs {AttemptedPairCount}; completed pairs {CompletedPairCount}; pairs needing attention {AttentionPairCount}; failed pairs {FailedPairCount}; pair statuses {PairStatusCounts}; plan items {PlanItemCount}; attention items {AttentionItemCount}; verified object changes {VerifiedObjectChangeCount}; verified RBAC changes {VerifiedRbacChangeCount}; run record {RunRecordUri}.",
+            run.RunId,
+            run.Status,
+            (long)Math.Round(elapsed.TotalMilliseconds),
+            summary.DiscoveredVaultCount,
+            summary.EnabledPairCount,
+            summary.DisabledPairCount,
+            summary.UnmappedVaultCount,
+            summary.DiscoveryIssueCount,
+            summary.AttemptedPairCount,
+            summary.CompletedPairCount,
+            summary.AttentionPairCount,
+            summary.FailedPairCount,
+            summary.PairStatusCounts,
+            summary.PlanItemCount,
+            summary.AttentionItemCount,
+            summary.VerifiedObjectChangeCount,
+            summary.VerifiedRbacChangeCount,
+            runRecordLocation.BlobUri);
     }
 
     /// <summary>Runs one scheduled cycle and exposes a small host-facing result instead of the internal inventory model.</summary>
     /// <param name="cancellationToken">The Function invocation's shutdown/cancellation token.</param>
-    /// <returns>The run ID and aggregate status after the runner's final persistence attempt succeeds.</returns>
+    /// <returns>The run ID, aggregate status, run-record location, and value-free summary after final persistence succeeds.</returns>
     /// <exception cref="OperationCanceledException">Cancellation propagates after an attempt to persist its outcome.</exception>
     /// <remarks>No scheduling or retry policy is implemented here. The Function maps the result to invocation behavior.</remarks>
     public async Task<RunnerExecutionResult> ExecuteScheduledRunAsync(CancellationToken cancellationToken)
     {
         var run = await RunOnceAsync(cancellationToken);
-        return new RunnerExecutionResult(run.RunId, run.Status);
+        return new RunnerExecutionResult(run.RunId, run.Status)
+        {
+            RunRecordLocation = _stateStore.GetRunRecordLocation(run),
+            Summary = RunExecutionSummary.Create(run),
+        };
+    }
+
+    // Exception filter helper: annotating inside the filter preserves the original throw site and stack.
+    private static bool AttachRunContext(Exception exception, RunRecord run, RunRecordLocation runRecordLocation)
+    {
+        RunExceptionContext.Attach(exception, run, runRecordLocation);
+        return false;
     }
 
     private async Task ExecutePreparedPairAsync(
@@ -501,13 +627,14 @@ public sealed class RunnerApplication
             prepared.Lease.EnsureLeaseHeld();
             AdminDiagnostics.LogLifecycle(_logger, "Execution", "Started");
 
-            await ApplyRbacPhaseAsync(report.Plan, item =>
+            await ApplyRbacPhaseAsync(VaultRbacCreatePhase, report.Plan, item =>
                 item.Action == "CreateRoleAssignment" && !IsObjectScope(item.TargetScope),
                 cancellationToken);
 
             if (signatures is not null)
             {
                 await ApplyObjectPhaseAsync(
+                    ObjectCreateReconcilePhase,
                     pair,
                     prepared.Lease,
                     runId,
@@ -518,16 +645,17 @@ public sealed class RunnerApplication
             }
 
             BlockDependentObjectRbac(report.Plan, signatures is not null);
-            await ApplyRbacPhaseAsync(report.Plan, item =>
+            await ApplyRbacPhaseAsync(ObjectRbacCreatePhase, report.Plan, item =>
                 item.Action == "CreateRoleAssignment" && IsObjectScope(item.TargetScope),
                 cancellationToken);
-            await ApplyRbacPhaseAsync(report.Plan, item =>
+            await ApplyRbacPhaseAsync(ObjectRbacDeletePhase, report.Plan, item =>
                 item.Action == "DeleteRoleAssignment" && IsObjectScope(item.TargetScope),
                 cancellationToken);
 
             if (signatures is not null)
             {
                 await ApplyObjectPhaseAsync(
+                    ObjectDeletePhase,
                     pair,
                     prepared.Lease,
                     runId,
@@ -537,7 +665,7 @@ public sealed class RunnerApplication
                     cancellationToken);
             }
 
-            await ApplyRbacPhaseAsync(report.Plan, item =>
+            await ApplyRbacPhaseAsync(VaultRbacDeletePhase, report.Plan, item =>
                 item.Action == "DeleteRoleAssignment" && !IsObjectScope(item.TargetScope),
                 cancellationToken);
 
@@ -618,34 +746,166 @@ public sealed class RunnerApplication
         }
     }
 
-    private async Task ApplyObjectPhaseAsync(
+    private Task ApplyObjectPhaseAsync(
+        string phase,
         VaultPair pair,
         IPairStateLease pairLease,
         string runId,
         List<PlanItem> plan,
         ObjectSignatureService signatures,
         Func<PlanItem, bool> predicate,
-        CancellationToken cancellationToken)
-    {
-        var selected = plan.Where(predicate).ToArray();
-        var results = await _objectExecutor.ApplyAsync(
-            pair,
-            pairLease,
-            runId,
-            selected,
-            signatures,
+        CancellationToken cancellationToken) =>
+        RunExecutionPhaseAsync(
+            phase,
+            plan,
+            predicate,
+            selected => _objectExecutor.ApplyAsync(pair, pairLease, runId, selected, signatures, cancellationToken),
             cancellationToken);
-        ReplaceResults(plan, results);
-    }
 
-    private async Task ApplyRbacPhaseAsync(
+    private Task ApplyRbacPhaseAsync(
+        string phase,
         List<PlanItem> plan,
         Func<PlanItem, bool> predicate,
+        CancellationToken cancellationToken) =>
+        RunExecutionPhaseAsync(
+            phase,
+            plan,
+            predicate,
+            selected => _rbacExecutor.ApplyAsync(selected, cancellationToken),
+            cancellationToken);
+
+    // One span and one 3006 record per phase show where a pair's execution time and failures occur
+    // without logging per-object identifiers beyond what the executors already report.
+    private async Task RunExecutionPhaseAsync(
+        string phase,
+        List<PlanItem> plan,
+        Func<PlanItem, bool> predicate,
+        Func<PlanItem[], Task<IReadOnlyList<PlanItem>>> executePhase,
         CancellationToken cancellationToken)
     {
         var selected = plan.Where(predicate).ToArray();
-        var results = await _rbacExecutor.ApplyAsync(selected, cancellationToken);
+        using var phaseScope = _logger.BeginScope(new Dictionary<string, object?> { ["ExecutionPhase"] = phase });
+        using var phaseActivity = StartExecutionPhaseActivity(phase, selected.Length);
+        var phaseTimer = Stopwatch.StartNew();
+        IReadOnlyList<PlanItem> results;
+        try
+        {
+            results = await executePhase(selected);
+        }
+        catch (Exception exception)
+        {
+            phaseTimer.Stop();
+            ReportExecutionPhaseInterrupted(
+                _logger,
+                phaseActivity,
+                phase,
+                selected.Length,
+                exception,
+                exception is OperationCanceledException && cancellationToken.IsCancellationRequested,
+                phaseTimer.Elapsed);
+            throw;
+        }
+
+        phaseTimer.Stop();
         ReplaceResults(plan, results);
+        ReportExecutionPhaseCompleted(_logger, phaseActivity, phase, selected.Length, results, phaseTimer.Elapsed);
+    }
+
+    /// <summary>Starts a phase span only when the phase has work, keeping empty phases out of trace timelines.</summary>
+    internal static Activity? StartExecutionPhaseActivity(string phase, int itemCount)
+    {
+        if (itemCount == 0)
+        {
+            return null;
+        }
+
+        var activity = RunnerTelemetry.ActivitySource.StartActivity("sync.execute-phase");
+        if (activity is not null)
+        {
+            // The phase set is fixed and small, so a phase-specific display name stays low-cardinality.
+            activity.DisplayName = $"sync.execute-phase {phase}";
+            activity.SetTag("sync.phase", phase);
+            activity.SetTag("sync.phase.item_count", itemCount);
+        }
+
+        return activity;
+    }
+
+    /// <summary>Reports a finished phase with verified-change, no-change, and attention counts.</summary>
+    internal static void ReportExecutionPhaseCompleted(
+        ILogger logger,
+        Activity? phaseActivity,
+        string phase,
+        int itemCount,
+        IReadOnlyList<PlanItem> results,
+        TimeSpan elapsed)
+    {
+        var verifiedChangeCount = RunExecutionSummary.CountVerifiedObjectChanges(results)
+            + RunExecutionSummary.CountVerifiedRbacChanges(results);
+        var attentionCount = results.Count(item => AdminDiagnostics.RequiresAdminAttention(item.Status));
+        var noChangeCount = Math.Max(0, results.Count - verifiedChangeCount - attentionCount);
+        var outcome = itemCount == 0 ? "NoItems" : attentionCount > 0 ? "CompletedWithAttention" : "Completed";
+        if (phaseActivity is not null)
+        {
+            phaseActivity.SetTag("sync.phase.outcome", outcome);
+            phaseActivity.SetTag("sync.phase.verified_change_count", verifiedChangeCount);
+            phaseActivity.SetTag("sync.phase.attention_count", attentionCount);
+            if (attentionCount > 0)
+            {
+                phaseActivity.SetStatus(ActivityStatusCode.Error, outcome);
+            }
+            else
+            {
+                phaseActivity.SetStatus(ActivityStatusCode.Ok);
+            }
+        }
+
+        logger.Log(
+            itemCount == 0 ? LogLevel.Debug : attentionCount > 0 ? LogLevel.Warning : LogLevel.Information,
+            ExecutionPhaseCompletedEventId,
+            "Execution phase {ExecutionPhase} finished with outcome {PhaseOutcome} in {DurationMs} ms: {PhaseItemCount} items; {PhaseVerifiedChangeCount} verified changes; {PhaseNoChangeCount} needed no change; {PhaseAttentionCount} need attention.",
+            phase,
+            outcome,
+            (long)Math.Round(elapsed.TotalMilliseconds),
+            itemCount,
+            verifiedChangeCount,
+            noChangeCount,
+            attentionCount);
+    }
+
+    /// <summary>Reports a phase that ended with an exception; the pair-level handler logs the exception itself.</summary>
+    internal static void ReportExecutionPhaseInterrupted(
+        ILogger logger,
+        Activity? phaseActivity,
+        string phase,
+        int itemCount,
+        Exception exception,
+        bool cancelled,
+        TimeSpan elapsed)
+    {
+        var outcome = cancelled ? "Cancelled" : "Failed";
+        var errorType = exception.GetType().Name;
+        if (phaseActivity is not null)
+        {
+            if (!cancelled)
+            {
+                RunnerTelemetry.RecordException(phaseActivity, exception);
+            }
+
+            phaseActivity.SetTag("sync.phase.outcome", outcome);
+            phaseActivity.SetTag("error.type", errorType);
+            phaseActivity.SetStatus(ActivityStatusCode.Error, errorType);
+        }
+
+        logger.Log(
+            cancelled ? LogLevel.Warning : LogLevel.Error,
+            ExecutionPhaseCompletedEventId,
+            "Execution phase {ExecutionPhase} finished with outcome {PhaseOutcome} in {DurationMs} ms after the executor raised {ErrorType}: {PhaseItemCount} items were selected.",
+            phase,
+            outcome,
+            (long)Math.Round(elapsed.TotalMilliseconds),
+            errorType,
+            itemCount);
     }
 
     private static void ReplaceResults(List<PlanItem> plan, IReadOnlyList<PlanItem> results)
@@ -775,4 +1035,11 @@ public sealed class RunnerApplication
 /// <summary>The host-facing identity and aggregate outcome of a cycle whose report was returned by the runner.</summary>
 /// <param name="RunId">Correlation key used by logs, activities, and the dated run-history blob.</param>
 /// <param name="Status">Aggregate result such as Complete, NoConfiguredPairs, Partial, or Failed; not a per-secret result.</param>
-public sealed record RunnerExecutionResult(string RunId, string Status);
+public sealed record RunnerExecutionResult(string RunId, string Status)
+{
+    /// <summary>Gets the private run-history blob that holds the detailed pair and plan-item report.</summary>
+    public required RunRecordLocation RunRecordLocation { get; init; }
+
+    /// <summary>Gets value-free aggregate counts for invocation logging and trace tags.</summary>
+    public required RunExecutionSummary Summary { get; init; }
+}

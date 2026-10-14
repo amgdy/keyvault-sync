@@ -62,6 +62,23 @@ internal sealed class BlobStateStore
             state is not null, runs is not null);
     }
 
+    /// <summary>Describes where <see cref="WriteRunRecordAsync"/> stores a run's JSON document, without contacting storage.</summary>
+    /// <param name="record">Run whose UTC start date and RunId determine the blob name.</param>
+    /// <returns>The account, container, blob name, and credential-free blob endpoint for logs and host results.</returns>
+    public RunRecordLocation GetRunRecordLocation(RunRecord record)
+    {
+        var blobName = GetRunRecordBlobName(record);
+        return new RunRecordLocation(
+            _runsContainer.AccountName,
+            _runsContainer.Name,
+            blobName,
+            RunRecordLocation.SanitizeUri(_runsContainer.GetBlobClient(blobName).Uri));
+    }
+
+    /// <summary>Returns the container-relative run-history name, partitioned by the run's UTC start date.</summary>
+    internal static string GetRunRecordBlobName(RunRecord record) =>
+        $"runs/{record.StartedAt.UtcDateTime.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture)}/{record.RunId}.json";
+
     /// <summary>Replaces the run's diagnostic JSON blob with the latest accumulated progress snapshot.</summary>
     /// <param name="record">Run record whose UTC start determines the yyyy/MM/dd partition and whose RunId is the filename.</param>
     /// <param name="cancellationToken">Cancellation for upload; callers may use None for a final failure/cancellation report.</param>
@@ -73,19 +90,19 @@ internal sealed class BlobStateStore
     public async Task WriteRunRecordAsync(RunRecord record, CancellationToken cancellationToken)
     {
         using var activity = RunnerTelemetry.ActivitySource.StartActivity("blob.write-run-record");
-        var partition = record.StartedAt.UtcDateTime.ToString("yyyy/MM/dd", CultureInfo.InvariantCulture);
-        var path = $"runs/{partition}/{record.RunId}.json";
+        var path = GetRunRecordBlobName(record);
         var blob = _runsContainer.GetBlobClient(path);
         var content = BinaryData.FromObjectAsJson(record, JsonOptions);
         activity?.SetTag("sync.run_id", record.RunId);
         activity?.SetTag("storage.container", _runsContainer.Name);
+        activity?.SetTag("storage.blob", path);
         try
         {
             await blob.UploadAsync(content, overwrite: true, cancellationToken);
             activity?.SetStatus(ActivityStatusCode.Ok);
             _logger.LogInformation(RunRecordPersistedEventId,
-                "Run progress record persisted. {RunId}; {Status}; {PairCount} pair records; container {ContainerName}.",
-                record.RunId, record.Status, record.Pairs.Count, _runsContainer.Name);
+                "Run progress record persisted. {RunId}; {Status}; {PairCount} pair records; container {ContainerName}; blob {RunRecordBlobName}.",
+                record.RunId, record.Status, record.Pairs.Count, _runsContainer.Name, path);
         }
         catch (Exception exception)
         {
