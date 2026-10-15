@@ -27,11 +27,13 @@ public sealed class ObjectReplicationTests
             Pair(),
             lease,
             "run-1",
-            [ObjectPlan("CreateObject", "s1")],
+            [ObjectPlan("CreateObject", null)],
             signatures,
             CancellationToken.None);
 
-        Assert.Equal("OBJECT_REPLICATED_AND_VERIFIED", Assert.Single(results).Status);
+        var result = Assert.Single(results);
+        Assert.Equal("OBJECT_REPLICATED_AND_VERIFIED", result.Status);
+        Assert.Equal("s1", result.SourceVersion);
         Assert.Equal(2, lease.SaveCount);
         Assert.True(targetClient.IntentObservedBeforeWrite);
         Assert.Empty(lease.State.PendingObjectMutations);
@@ -166,7 +168,7 @@ public sealed class ObjectReplicationTests
         {
             var name = $"secret-{index:D2}";
             state.ObjectBaselines[$"Secret/{name}"] = Baseline(name);
-            targetSecrets.Add(Secret(name, "t1"));
+            targetSecrets.Add(Secret(name));
         }
 
         var plan = ReplicationPlanner.CreatePlan(
@@ -254,7 +256,7 @@ public sealed class ObjectReplicationTests
         var plan = ReplicationPlanner.CreatePlan(
             Pair(),
             NewState(),
-            Inventory([Secret("demo", "s1")], []),
+            Inventory([Secret("demo")], []),
             Inventory([], []),
             false,
             Guid.NewGuid().ToString(),
@@ -265,13 +267,227 @@ public sealed class ObjectReplicationTests
     }
 
     [Fact]
+    public void Planner_blocks_only_the_object_named_by_an_object_scoped_warning()
+    {
+        const string message = "Certificate metadata/backing references could not be read for ambiguous: HTTP 403.";
+        var source = Inventory([Secret("ambiguous"), Secret("healthy")], []) with
+        {
+            Warnings = [message],
+            ObjectWarnings = [new ObjectInventoryWarning("ambiguous", message)],
+        };
+
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), NewState(), source, Inventory([], []), true, Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.Name == "ambiguous" && item.Status == "BLOCKED_INCOMPLETE_INVENTORY");
+        Assert.Contains(plan, item => item.Name == "healthy" && item.Action == "CreateObject");
+    }
+
+    [Fact]
+    public void Planner_blocks_deletion_of_a_target_object_with_an_object_scoped_warning()
+    {
+        const string message = "Certificate metadata/backing references could not be read for managed: HTTP 403.";
+        var state = NewState();
+        state.ObjectBaselines["Secret/managed"] = Baseline("managed");
+        var target = Inventory([Secret("managed")], []) with
+        {
+            Warnings = [message],
+            ObjectWarnings = [new ObjectInventoryWarning("managed", message)],
+        };
+
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), state, Inventory([], []), target, true, Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.Name == "managed" && item.Status == "BLOCKED_INCOMPLETE_INVENTORY");
+        Assert.DoesNotContain(plan, item => item.Action == "DeleteObject");
+    }
+
+    [Fact]
+    public void Planner_blocks_all_objects_for_a_vault_level_warning()
+    {
+        var target = Inventory([], []) with { Warnings = ["Deleted-secret inventory is incomplete: HTTP 403."] };
+
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), NewState(), Inventory([Secret("healthy")], []), target, true,
+            Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.Name == "healthy" && item.Status == "BLOCKED_INCOMPLETE_INVENTORY");
+        Assert.DoesNotContain(plan, item => item.Action == "CreateObject");
+    }
+
+    [Fact]
+    public void Planner_keeps_object_sync_when_only_authorization_inventory_is_incomplete()
+    {
+        const string message = "Object role-assignment inventory is incomplete: RequestFailedException.";
+        var source = Inventory([Secret("healthy")], []);
+        source = source with
+        {
+            Warnings = [message],
+            Authorization = source.Authorization with { Warnings = [message] },
+        };
+
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), NewState(), source, Inventory([], []), true, Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.Name == "healthy" && item.Action == "CreateObject");
+        Assert.Contains(plan, item => item.Status == "BLOCKED_AUTHORIZATION_INVENTORY_INCOMPLETE");
+    }
+
+    [Fact]
+    public void Planner_reports_unreadable_certificate_metadata_as_incomplete_inventory_not_reissuance()
+    {
+        const string message = "Certificate metadata/backing references could not be read for cert: HTTP 403.";
+        var source = Inventory([], [new CertificateSummary { Name = "cert", CurrentVersion = "c1", Exportable = null }]) with
+        {
+            Warnings = [message],
+            ObjectWarnings = [new ObjectInventoryWarning("cert", message)],
+        };
+
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), NewState(), source, Inventory([], []), true, Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.Name == "cert" && item.Status == "BLOCKED_INCOMPLETE_INVENTORY");
+        Assert.DoesNotContain(plan, item => item.Status == "BLOCKED_CERTIFICATE_REISSUANCE_REQUIRED");
+    }
+
+    [Fact]
+    public void Planner_does_not_report_a_target_only_certificate_backing_secret_as_a_separate_secret()
+    {
+        var target = Inventory(
+            [Secret("target-cert"), Secret("plain-collision")],
+            [
+                new CertificateSummary { Name = "target-cert", CurrentVersion = "c1", Exportable = true },
+                new CertificateSummary { Name = "plain-collision", CurrentVersion = "c2", Exportable = true },
+            ]);
+
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), NewState(), Inventory([Secret("plain-collision")], []), target, true,
+            Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.ObjectType == "Certificate" && item.Name == "target-cert"
+            && item.Status == "CONFLICT_UNMANAGED_TARGET_ONLY");
+        Assert.DoesNotContain(plan, item => item.ObjectType == "Secret" && item.Name == "target-cert");
+        // A plain source secret colliding with a target certificate stays visible as a secret conflict.
+        Assert.Contains(plan, item => item.ObjectType == "Secret" && item.Name == "plain-collision");
+    }
+
+    [Fact]
+    public async Task Executor_skips_only_the_object_whose_pre_mutation_read_fails()
+    {
+        var source = Snapshot("source://secrets/demo", "s1", "value");
+        var sourceClient = new FakeObjectClient("source://secrets", source)
+        {
+            ReadFailureName = "disabled",
+        };
+        var targetClient = new FakeObjectClient("target://secrets");
+        var lease = new FakeLease(NewState());
+        targetClient.State = lease.State;
+        var executor = new ObjectExecutor(new FakeObjectFactory(sourceClient, targetClient), NullLogger<ObjectExecutor>.Instance);
+        using var signatures = LoadSignatures();
+
+        var results = await executor.ApplyAsync(
+            Pair(), lease, "run-1",
+            [ObjectPlan("CreateObject", null) with { Name = "disabled" }, ObjectPlan("CreateObject", null)],
+            signatures, CancellationToken.None);
+
+        Assert.Equal("READ_FAILED_BEFORE_MUTATION", results[0].Status);
+        Assert.Contains("HTTP 403", results[0].Detail);
+        Assert.Equal("OBJECT_REPLICATED_AND_VERIFIED", results[1].Status);
+        Assert.Equal(1, targetClient.WriteCount);
+        Assert.Empty(lease.State.PendingObjectMutations);
+    }
+
+    [Fact]
+    public async Task Executor_skips_only_the_object_whose_certificate_payload_is_invalid()
+    {
+        var targetClient = new FakeObjectClient("target://secrets");
+        var lease = new FakeLease(NewState());
+        var sourceClient = new FakeObjectClient("source://secrets", Snapshot("source://secrets/demo", "s1", "value"))
+        {
+            ReadFailureName = "broken",
+            ReadFailure = new InvalidDataException("Certificate DER encoding is missing."),
+        };
+        var executor = new ObjectExecutor(new FakeObjectFactory(sourceClient, targetClient), NullLogger<ObjectExecutor>.Instance);
+        using var signatures = LoadSignatures();
+
+        var results = await executor.ApplyAsync(
+            Pair(), lease, "run-1",
+            [ObjectPlan("CreateObject", null) with { Name = "broken" }, ObjectPlan("CreateObject", null)],
+            signatures, CancellationToken.None);
+
+        Assert.Equal("READ_FAILED_BEFORE_MUTATION", results[0].Status);
+        Assert.Equal("OBJECT_REPLICATED_AND_VERIFIED", results[1].Status);
+        Assert.Empty(lease.State.PendingObjectMutations);
+    }
+
+    [Fact]
+    public async Task Executor_reads_the_current_source_version_instead_of_the_planned_one()
+    {
+        var source = Snapshot("source://secrets/demo", "s2", "rotated");
+        var targetClient = new FakeObjectClient("target://secrets");
+        var lease = new FakeLease(NewState());
+        var executor = new ObjectExecutor(
+            new FakeObjectFactory(new FakeObjectClient("source://secrets", source), targetClient),
+            NullLogger<ObjectExecutor>.Instance);
+        using var signatures = LoadSignatures();
+
+        var result = Assert.Single(await executor.ApplyAsync(
+            Pair(), lease, "run-1", [ObjectPlan("CreateObject", "s1")], signatures, CancellationToken.None));
+
+        Assert.Equal("OBJECT_REPLICATED_AND_VERIFIED", result.Status);
+        Assert.Equal("s2", Assert.Single(lease.State.ObjectBaselines).Value.SourceVersion);
+    }
+
+    [Fact]
+    public async Task Executor_reports_a_source_that_disappeared_after_planning()
+    {
+        var targetClient = new FakeObjectClient("target://secrets");
+        var executor = new ObjectExecutor(
+            new FakeObjectFactory(new FakeObjectClient("source://secrets"), targetClient),
+            NullLogger<ObjectExecutor>.Instance);
+        using var signatures = LoadSignatures();
+
+        var result = Assert.Single(await executor.ApplyAsync(
+            Pair(), new FakeLease(NewState()), "run-1", [ObjectPlan("CreateObject", null)], signatures, CancellationToken.None));
+
+        Assert.Equal("STALE_PLAN_SOURCE_VERSION_UNAVAILABLE", result.Status);
+        Assert.Equal(0, targetClient.WriteCount);
+    }
+
+    [Fact]
+    public void Planner_blocks_a_source_whose_current_version_is_disabled()
+    {
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), NewState(), Inventory([Secret("disabled", enabled: false), Secret("healthy")], []), Inventory([], []),
+            true, Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.Name == "disabled" && item.Status == "BLOCKED_SOURCE_VERSION_DISABLED");
+        Assert.Contains(plan, item => item.Name == "healthy" && item.Action == "CreateObject");
+        Assert.DoesNotContain(plan, item => item.Name == "disabled" && item.Action != "None");
+    }
+
+    [Fact]
+    public void Planner_treats_a_disabled_managed_target_as_externally_modified()
+    {
+        var state = NewState();
+        state.ObjectBaselines["Secret/demo"] = Baseline("demo");
+
+        var plan = ReplicationPlanner.CreatePlan(
+            Pair(), state, Inventory([Secret("demo")], []), Inventory([Secret("demo", enabled: false)], []),
+            true, Guid.NewGuid().ToString(), DateTimeOffset.UtcNow);
+
+        Assert.Contains(plan, item => item.Name == "demo" && item.Status == "CONFLICT_EXTERNALLY_MODIFIED");
+        Assert.DoesNotContain(plan, item => item.Action == "ReconcileObject");
+    }
+
+    [Fact]
     public void Planner_never_adopts_an_unmanaged_existing_target()
     {
         var plan = ReplicationPlanner.CreatePlan(
             Pair(),
             NewState(),
-            Inventory([Secret("demo", "s1")], []),
-            Inventory([Secret("demo", "t1")], []),
+            Inventory([Secret("demo")], []),
+            Inventory([Secret("demo")], []),
             true,
             Guid.NewGuid().ToString(),
             DateTimeOffset.UtcNow);
@@ -286,14 +502,12 @@ public sealed class ObjectReplicationTests
         {
             Name = "certificate",
             CurrentVersion = "c1",
-            Versions = [new ObjectVersionSummary { Version = "c1" }],
             Exportable = false,
         };
         var key = new KeySummary
         {
             Name = "key",
             CurrentVersion = "k1",
-            Versions = [new ObjectVersionSummary { Version = "k1" }],
         };
         var plan = ReplicationPlanner.CreatePlan(
             Pair(),
@@ -322,13 +536,11 @@ public sealed class ObjectReplicationTests
         {
             Name = "key",
             CurrentVersion = "source-version",
-            Versions = [new ObjectVersionSummary { Version = "source-version" }],
         };
         var targetKey = new KeySummary
         {
             Name = "key",
             CurrentVersion = "target-version",
-            Versions = [new ObjectVersionSummary { Version = "target-version" }],
         };
         var sourceAssignment = RoleAssignment(
             pair.Source.Id + "/keys/key",
@@ -364,7 +576,6 @@ public sealed class ObjectReplicationTests
         {
             Name = "key",
             CurrentVersion = "source-version",
-            Versions = [new ObjectVersionSummary { Version = "source-version" }],
         };
         var sourceAssignment = RoleAssignment(
             pair.Source.Id + "/keys/key",
@@ -554,11 +765,10 @@ public sealed class ObjectReplicationTests
         TargetVaultId = Pair().Target.Id,
     };
 
-    private static SecretSummary Secret(string name, string version) => new()
+    private static SecretSummary Secret(string name, bool? enabled = true) => new()
     {
         Name = name,
-        CurrentVersion = version,
-        Versions = [new ObjectVersionSummary { Version = version }],
+        Enabled = enabled,
     };
 
     private static VaultInventory Inventory(
@@ -598,6 +808,8 @@ public sealed class ObjectReplicationTests
         ReplicatedObject? current = null) : IObjectReplicationVaultClient
     {
         public Exception? WriteException { get; init; }
+        public string? ReadFailureName { get; init; }
+        public Exception? ReadFailure { get; init; }
         public PairState? State { get; set; }
         public int WriteCount { get; private set; }
         public int DeleteCount { get; private set; }
@@ -611,6 +823,11 @@ public sealed class ObjectReplicationTests
             string? version,
             CancellationToken cancellationToken)
         {
+            if (name == ReadFailureName)
+            {
+                throw ReadFailure ?? new global::Azure.RequestFailedException(403, "Operation get is not allowed on a disabled secret.");
+            }
+
             if (current is null || (version is not null && current.Version != version))
             {
                 return Task.FromResult<ReplicatedObject?>(null);

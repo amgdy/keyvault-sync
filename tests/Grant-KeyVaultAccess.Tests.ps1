@@ -8,6 +8,9 @@ $principalId = '44444444-4444-4444-4444-444444444444'
 $identityId = "/subscriptions/$sourceSubscription/resourceGroups/identity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/keyvaultsync"
 $sourceId = "/subscriptions/$sourceSubscription/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/source-vault"
 $targetId = "/subscriptions/$targetSubscription/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/target-vault"
+$operatorId = '55555555-5555-5555-5555-555555555555'
+$fixtureStorageUri = 'https://kvsstate.blob.core.windows.net/'
+$fixtureStorageId = "/subscriptions/$sourceSubscription/resourceGroups/identity/providers/Microsoft.Storage/storageAccounts/kvsstate"
 
 function Assert-True {
     param([bool] $Condition, [string] $Message)
@@ -52,6 +55,9 @@ function Reset-Fixture {
         AzdIdentity = $null
         AzdFailure = $false
         AzdCalls = [System.Collections.Generic.List[object]]::new()
+        OperatorId = $principalId
+        OperatorIsServicePrincipal = $false
+        StorageBlobEndpoint = $fixtureStorageUri
     }
 }
 
@@ -69,10 +75,24 @@ function az {
                 $global:LASTEXITCODE = 1
                 return 'Please run az login.'
             }
-            return To-Json ([pscustomobject]@{ tenantId = $global:Fixture.AccountTenantId; user = [pscustomobject]@{ name = $principalId } })
+            return To-Json ([pscustomobject]@{ tenantId = $global:Fixture.AccountTenantId; user = [pscustomobject]@{ name = 'operator-app-id' } })
         }
         '^ad signed-in-user show$' {
-            return $principalId
+            if ($global:Fixture.OperatorIsServicePrincipal) {
+                $global:LASTEXITCODE = 1
+                return
+            }
+            return $global:Fixture.OperatorId
+        }
+        '^ad sp show$' {
+            return $global:Fixture.OperatorId
+        }
+        '^storage account show$' {
+            if ((Get-Argument $argumentsList '--name') -ne 'kvsstate') {
+                $global:LASTEXITCODE = 3
+                return '{"error":"not found"}'
+            }
+            return To-Json ([pscustomobject]@{ id = $fixtureStorageId; primaryEndpoints = [pscustomobject]@{ blob = $global:Fixture.StorageBlobEndpoint } })
         }
         '^keyvault show ' {
             $id = Get-Argument $argumentsList '--ids'
@@ -111,8 +131,9 @@ function az {
                     roleDefinitionName = $global:Fixture.OperatorRoleName
                 })
             }
+            $assignee = Get-Argument $argumentsList '--assignee-object-id'
             return To-Json -Value @($global:Fixture.Assignments | Where-Object {
-                $_.scope -ieq $scope -and $_.principalId -ieq $principalId
+                $_.scope -ieq $scope -and $_.principalId -ieq $assignee
             })
         }
         '^role assignment create$' {
@@ -120,7 +141,7 @@ function az {
             $role = Get-Argument $argumentsList '--role'
             $assignment = [pscustomobject]@{
                 scope = $scope
-                principalId = $principalId
+                principalId = Get-Argument $argumentsList '--assignee-object-id'
                 roleDefinitionId = "/providers/Microsoft.Authorization/roleDefinitions/$role"
             }
             $global:Fixture.Assignments = @($global:Fixture.Assignments) + @($assignment)
@@ -299,5 +320,83 @@ catch {
     Assert-True ($_.Exception.Message -like '*does not have Owner, User Access Administrator, or Role Based Access Control Administrator*') 'operator RBAC authority should be required during preview'
 }
 Assert-True ((Get-WriteCount) -eq 0) 'operator RBAC validation must remain read-only'
+
+# Signed-in operator grants: same vault roles plus Storage Blob Data Contributor on the state account.
+function Get-CreatedPrincipalGrants {
+    param([string] $AssigneeId)
+    return @($global:Fixture.Calls | Where-Object {
+        $_.Count -ge 3 -and $_[0] -eq 'role' -and $_[1] -eq 'assignment' -and $_[2] -eq 'create' -and
+        (Get-Argument $_ '--assignee-object-id') -eq $AssigneeId
+    } | ForEach-Object {
+        "$(Get-Argument $_ '--scope') $(Get-Argument $_ '--role') $(Get-Argument $_ '--assignee-principal-type')"
+    } | Sort-Object)
+}
+$storageBlobDataContributor = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+
+Reset-Fixture
+$global:Fixture.OperatorId = $operatorId
+$signedInPreview = & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -IncludeSignedInUser -StorageAccountUri $fixtureStorageUri 6>&1 | Out-String
+Assert-True ($signedInPreview -like "*Storage Blob Data Contributor at $fixtureStorageId for signed-in user ``[create``]*") 'preview should list the storage grant for the signed-in user'
+Assert-True ($signedInPreview -like '*on the state storage account*') 'preview should check operator authority on the state storage account'
+Assert-True ((Get-WriteCount) -eq 0) 'signed-in preview must not write'
+
+Reset-Fixture
+$global:Fixture.OperatorId = $operatorId
+$env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI = "`"$fixtureStorageUri`""
+& $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -IncludeSignedInUser -Apply -Confirm:$false
+Remove-Item Env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI
+Assert-True ((Get-WriteCount) -eq 9) 'signed-in apply should create runtime and operator assignments'
+$runtimeGrants = @(Get-CreatedPrincipalGrants $principalId)
+Assert-True ((Compare-Object @($runtimeGrants | ForEach-Object { ($_ -split ' ')[0..1] -join ' ' }) $expectedGrants) -eq $null) 'runtime grants should be unchanged'
+Assert-True (@($runtimeGrants | Where-Object { $_ -notlike '* ServicePrincipal' }).Count -eq 0) 'runtime grants use ServicePrincipal'
+$expectedOperatorGrants = @($expectedGrants + "$fixtureStorageId $storageBlobDataContributor") | Sort-Object
+$operatorGrants = @(Get-CreatedPrincipalGrants $operatorId)
+Assert-True ((Compare-Object @($operatorGrants | ForEach-Object { ($_ -split ' ')[0..1] -join ' ' }) $expectedOperatorGrants) -eq $null) 'operator should receive vault roles and the storage role'
+Assert-True (@($operatorGrants | Where-Object { $_ -notlike '* User' }).Count -eq 0) 'operator grants use the User principal type'
+
+Reset-Fixture
+$global:Fixture.OperatorId = $operatorId
+$global:Fixture.OperatorIsServicePrincipal = $true
+& $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -IncludeSignedInUser -StorageAccountUri $fixtureStorageUri -Apply -Confirm:$false
+Assert-True (@(Get-CreatedPrincipalGrants $operatorId | Where-Object { $_ -notlike '* ServicePrincipal' }).Count -eq 0) 'service principal operators use the ServicePrincipal type'
+
+Reset-Fixture
+& $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -IncludeSignedInUser -StorageAccountUri $fixtureStorageUri -Apply -Confirm:$false
+Assert-True ((Get-WriteCount) -eq 4) 'a signed-in runtime identity should not receive duplicate grants'
+
+Reset-Fixture
+$global:Fixture.OperatorId = $operatorId
+$global:Fixture.StorageBlobEndpoint = 'https://kvsstate.blob.example.net/'
+try {
+    & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -IncludeSignedInUser -StorageAccountUri $fixtureStorageUri -Apply -Confirm:$false
+    throw 'Expected storage endpoint mismatch failure.'
+}
+catch {
+    Assert-True ($_.Exception.Message -like '*does not match the configured state storage URI*') 'storage endpoint mismatch should fail closed'
+}
+Assert-True ((Get-WriteCount) -eq 0) 'storage mismatch must happen before writes'
+
+Reset-Fixture
+$global:Fixture.OperatorId = $operatorId
+try {
+    & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -IncludeSignedInUser -StorageAccountUri 'http://kvsstate.blob.core.windows.net/'
+    throw 'Expected non-HTTPS storage URI failure.'
+}
+catch {
+    Assert-True ($_.Exception.Message -like '*HTTPS Blob service URI*') 'non-HTTPS storage URI should fail validation'
+}
+Assert-True ($global:Fixture.Calls.Count -eq 0) 'storage URI validation should happen before Azure reads'
+
+Reset-Fixture
+$global:Fixture.OperatorId = $operatorId
+$global:Fixture.OperatorRbacDeniedScope = $fixtureStorageId
+try {
+    & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $targetId -IncludeSignedInUser -StorageAccountUri $fixtureStorageUri -Apply -Confirm:$false
+    throw 'Expected missing storage operator RBAC authority failure.'
+}
+catch {
+    Assert-True ($_.Exception.Message -like '*does not have Owner*') 'storage RBAC authority should be required'
+}
+Assert-True ((Get-WriteCount) -eq 0) 'storage RBAC validation must remain read-only'
 
 Write-Host 'Grant-KeyVaultAccess.ps1 offline tests passed.'

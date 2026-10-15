@@ -18,7 +18,7 @@ Every record from one invocation can be grouped by these keys:
 | `FunctionInvocationId`, `FunctionName` | Logger scope on every log written during the invocation | Worker logs for the host-assigned invocation ID |
 | `RunId` | Logger scope from run start; `sync.run_id` span tag; `runId` in the run record | One synchronization cycle |
 | `RunRecordContainer`, `RunRecordBlobName` | Logger scope from run start; `sync.run_record.*` span tags | The cycle's durable JSON record |
-| `PairId`, `SourceVaultName`, `TargetVaultName`, `PairNumber` | Logger scope during pair scanning and execution; `sync.pair_id` span tag | One source/target pair |
+| `SourceVaultName`, `SourceResourceGroup`, `SourceSubscriptionId`, matching `Target*` properties, `PairNumber` | Logger scope during pair scanning, execution, and lease release; the full `{sourceId}=>{targetId}` identity stays in the `sync.pair_id` span tag and the run record | One source/target pair |
 | `ExecutionPhase` | Logger scope and `sync.phase` span tag during an execution phase | One ordered execution phase of one pair |
 
 ### Span Hierarchy
@@ -195,7 +195,8 @@ union AppRequests, AppDependencies, AppTraces, AppExceptions
 | where OperationId == operationId
 | project TimeGenerated, Type, Name, Message, SeverityLevel, DurationMs, Success,
     EventName = tostring(Properties["EventName"]),
-    PairId = tostring(Properties["PairId"]),
+    SourceVault = tostring(Properties["SourceVaultName"]),
+    TargetVault = tostring(Properties["TargetVaultName"]),
     ExecutionPhase = tostring(Properties["ExecutionPhase"]),
     DiagnosticCode = tostring(Properties["DiagnosticCode"])
 | order by TimeGenerated asc
@@ -209,7 +210,8 @@ AppTraces
 | where tostring(Properties["EventId"]) == "3006"
 | where tostring(Properties["RunId"]) == "<run-id>"
 | project TimeGenerated,
-    PairId = tostring(Properties["PairId"]),
+    SourceVault = tostring(Properties["SourceVaultName"]),
+    TargetVault = tostring(Properties["TargetVaultName"]),
     ExecutionPhase = tostring(Properties["ExecutionPhase"]),
     PhaseOutcome = tostring(Properties["PhaseOutcome"]),
     DurationMs = tolong(Properties["DurationMs"]),

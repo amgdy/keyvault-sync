@@ -27,6 +27,8 @@ mono_crash.*
 **/local.settings.json
 .azure/
 untracked/
+# Terminal runner structured log files (contain resource identifiers)
+logs/
 .DS_Store
 
 [Dd]ebug/x64/

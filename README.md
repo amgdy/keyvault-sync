@@ -104,6 +104,15 @@ pwsh -NoProfile -File tests/PostDeploy-KeyVaultAccess.Tests.ps1
 
 In the Dev Container, use **Run and Debug** → **.NET: Attach to KeyVaultSync Function** to start the local Function host, select its isolated .NET worker, and attach the debugger; the Azurite sidecar is already running. Outside the container, start Azurite before launching the debugger. The repository verification task is available as **Tasks: Run Task** → **KeyVaultSync: Verify repository**.
 
+To run one cycle directly in a terminal and watch its logs live, use the console host. It runs as your signed-in identity, does not need the Function App, and performs a real synchronization of every enabled mapping. Run from the repository root, it reads runner settings from the default azd environment; `--azd-env`, `--settings`, or arguments such as `--subscriptions`, `--storage-account-uri`, and `--hmac-key-file` select other sources:
+
+```sh
+az login
+dotnet run --project src/KeyVaultSync.Cli
+```
+
+Logs stream to the console and to a structured compact JSON (CLEF) file under `logs/` (`--log-file`, `--no-log-file`, `--console-format json`). Your identity needs the vault roles below plus Storage Blob Data Contributor on the state storage account; the grant scripts add them with `--include-signed-in-user`/`-IncludeSignedInUser`.
+
 See [local development](doc/local-development.md) and [settings](doc/settings.md).
 
 ## Key Vault Access Setup
@@ -156,9 +165,11 @@ assignments:
   -Apply
 ```
 
+Add `--include-signed-in-user --storage-account-uri "<state-blob-endpoint>"` (Bash) or `-IncludeSignedInUser -StorageAccountUri "<state-blob-endpoint>"` (PowerShell) to also grant the signed-in operator the same four vault roles plus Storage Blob Data Contributor on the state storage account, so the terminal runner can run as that identity. The storage URI defaults to `KEYVAULTSYNC_STORAGE_ACCOUNT_URI` from the azd environment.
+
 The scripts never change mapping tags, access policies, authorization mode, role definitions, or vault objects. Bash requires `jq`; PowerShell uses built-in JSON parsing.
 
-Interactive `azd deploy`/`azd up` runs an optional post-deploy hook that discovers target-declared mappings across the configured subscriptions, previews every grant, and asks again before applying. Non-interactive deployments skip this optional workflow. Rerun it with `azd hooks run postdeploy`.
+Interactive `azd deploy`/`azd up` runs an optional post-deploy hook that discovers target-declared mappings across the configured subscriptions, optionally (default No) includes the signed-in identity's grants, previews every grant, and asks again before applying. Non-interactive deployments skip this optional workflow. Rerun it with `azd hooks run postdeploy`.
 
 See [identity and RBAC](doc/identity-and-rbac.md).
 

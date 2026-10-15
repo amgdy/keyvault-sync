@@ -4,13 +4,17 @@
 # administrator role is intentionally broad because backup/restore of all Key Vault
 # object types is not covered by the reader/user roles. This script never changes vaults, tags,
 # authorization mode, objects, role definitions, or existing assignments.
+# --include-signed-in-user also plans the same vault roles plus Storage Blob Data Contributor on the
+# state storage account for the signed-in operator, so the terminal runner can run as that identity.
 set -euo pipefail
 
 # Print the operator contract; preview is intentionally the default.
 usage() {
     printf '%s\n' \
-        "Usage: bash $0 --target-vault-id <target-vault-resource-id> [--identity-id <uami-resource-id>] [--apply]" \
+        "Usage: bash $0 --target-vault-id <target-vault-resource-id> [--identity-id <uami-resource-id>] [--include-signed-in-user [--storage-account-uri <blob-uri>]] [--apply]" \
         'When --identity-id is omitted, the script uses KEYVAULTSYNC_IDENTITY_RESOURCE_ID or the current azd environment output.' \
+        '--include-signed-in-user also grants the signed-in operator the same vault roles and Storage Blob Data Contributor on the' \
+        'state storage account (KEYVAULTSYNC_STORAGE_ACCOUNT_URI or the azd output) so the terminal runner can run as that identity.' \
         'The target must declare sync-source-keyvault-id. Source and target may be in different subscriptions in the same tenant.' \
         'Preview is the default. --apply creates only missing direct built-in role assignments.'
 }
@@ -24,14 +28,21 @@ fail() {
 # Parse and validate all input before resolving Azure resources.
 identity_id=''
 target_id=''
+storage_uri=''
+include_signed_in_user=false
 apply=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --identity-id|--target-vault-id)
+        --identity-id|--target-vault-id|--storage-account-uri)
             [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || fail "Missing value for $1."
-            if [[ "$1" == '--identity-id' ]]; then identity_id="$2"; else target_id="$2"; fi
+            case "$1" in
+                --identity-id) identity_id="$2" ;;
+                --target-vault-id) target_id="$2" ;;
+                *) storage_uri="$2" ;;
+            esac
             shift 2
             ;;
+        --include-signed-in-user) include_signed_in_user=true; shift ;;
         --apply) apply=true; shift ;;
         --help|-h) usage; exit 0 ;;
         *) usage >&2; fail "Unknown argument: $1" ;;
@@ -55,28 +66,34 @@ normalize_scalar() {
 }
 
 # Prefer an explicit argument, then the hook environment, then the selected azd environment.
-resolve_identity_id() {
-    local resolved="$identity_id"
+# Arguments: setting name, explicit argument value, hook environment value, argument flag name.
+resolve_azd_setting() {
+    local name="$1"
+    local resolved="$2"
     if [[ -z "$resolved" ]]; then
-        resolved="${KEYVAULTSYNC_IDENTITY_RESOURCE_ID:-}"
+        resolved="$3"
     fi
     if [[ -z "$resolved" ]]; then
         command -v azd >/dev/null 2>&1 \
-            || fail 'azd is required when --identity-id and KEYVAULTSYNC_IDENTITY_RESOURCE_ID are not supplied.'
-        local azd_arguments=(env get-value KEYVAULTSYNC_IDENTITY_RESOURCE_ID)
+            || fail "azd is required when $4 and $name are not supplied."
+        local azd_arguments=(env get-value "$name")
         if [[ -n "${AZURE_ENV_NAME:-}" ]]; then
             azd_arguments+=(--environment "$AZURE_ENV_NAME")
         fi
         resolved=$(azd "${azd_arguments[@]}" 2>/dev/null) \
-            || fail 'Could not read KEYVAULTSYNC_IDENTITY_RESOURCE_ID from the current azd environment.'
+            || fail "Could not read $name from the current azd environment."
     fi
-    resolved=$(normalize_scalar "$resolved")
-    [[ -n "$resolved" ]] \
-        || fail 'No managed identity was resolved. Supply --identity-id or set KEYVAULTSYNC_IDENTITY_RESOURCE_ID in the current azd environment.'
-    printf '%s' "$resolved"
+    normalize_scalar "$resolved"
 }
 
-identity_id=$(resolve_identity_id)
+identity_id=$(resolve_azd_setting KEYVAULTSYNC_IDENTITY_RESOURCE_ID "$identity_id" "${KEYVAULTSYNC_IDENTITY_RESOURCE_ID:-}" --identity-id)
+[[ -n "$identity_id" ]] \
+    || fail 'No managed identity was resolved. Supply --identity-id or set KEYVAULTSYNC_IDENTITY_RESOURCE_ID in the current azd environment.'
+if [[ "$include_signed_in_user" == true ]]; then
+    storage_uri=$(resolve_azd_setting KEYVAULTSYNC_STORAGE_ACCOUNT_URI "$storage_uri" "${KEYVAULTSYNC_STORAGE_ACCOUNT_URI:-}" --storage-account-uri)
+    [[ -n "$storage_uri" ]] \
+        || fail 'No state storage account was resolved. Supply --storage-account-uri or set KEYVAULTSYNC_STORAGE_ACCOUNT_URI in the current azd environment.'
+fi
 
 guid_pattern='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
 identity_pattern="^/subscriptions/$guid_pattern/resourceGroups/[^/]+/providers/Microsoft.ManagedIdentity/userAssignedIdentities/[^/]+$"
@@ -85,6 +102,13 @@ jq -en --arg id "$identity_id" --arg pattern "$identity_pattern" '$id | test($pa
     || fail '--identity-id must be a user-assigned managed identity ARM resource ID.'
 jq -en --arg id "$target_id" --arg pattern "$vault_pattern" '$id | test($pattern; "i")' >/dev/null \
     || fail '--target-vault-id must be a Key Vault ARM resource ID.'
+storage_account_name=''
+if [[ "$include_signed_in_user" == true ]]; then
+    storage_account_name=$(jq -rn --arg uri "$storage_uri" '
+        $uri | ascii_downcase | capture("^https://(?<name>[a-z0-9]{3,24})\\.blob\\.[^/]+/?$").name // ""')
+    [[ -n "$storage_account_name" ]] \
+        || fail '--storage-account-uri must be an HTTPS Blob service URI such as https://<account>.blob.core.windows.net/.'
+fi
 
 if ! az account show --only-show-errors --output none >/dev/null 2>&1; then
     fail 'Azure CLI is not authenticated. Run az login once; azd must be configured with auth.useAzCliAuth=true so both tools share that session.'
@@ -137,10 +161,12 @@ account_tenant_id=$(jq -er '.tenantId | ascii_downcase' <<<"$account")
     || fail 'The signed-in operator and runtime identity must belong to the same tenant.'
 tenant_id="$identity_tenant_id"
 
+# Print "<object-id> <principal-type>" for the signed-in operator; the type selects the
+# --assignee-principal-type used for any optional signed-in grant.
 current_principal_id() {
     local principal=''
     if principal=$(az ad signed-in-user show --query id -o tsv 2>/dev/null); then
-        printf '%s' "$principal"
+        printf '%s User' "$principal"
         return 0
     fi
 
@@ -149,7 +175,7 @@ current_principal_id() {
     if [[ -n "$app_id" ]]; then
         principal=$(az ad sp show --id "$app_id" --query id -o tsv 2>/dev/null || true)
         if [[ -n "$principal" ]]; then
-            printf '%s' "$principal"
+            printf '%s ServicePrincipal' "$principal"
             return 0
         fi
     fi
@@ -161,7 +187,7 @@ assert_principal_can_manage_keyvault_rbac() {
     local scope="$1"
     local subscription_id="$2"
     local current_principal="$3"
-    local vault_role="$4"
+    local resource_label="$4"
     local assignments
     # --include-inherited returns the vault scope and every parent scope, so --all
     # (which the CLI rejects when combined with --scope) is not needed.
@@ -174,7 +200,7 @@ assert_principal_can_manage_keyvault_rbac() {
             --fill-principal-name false \
             --only-show-errors \
             --output json 2>&1); then
-        fail "Azure CLI could not read effective RBAC assignments on the $vault_role vault. Verify the Azure CLI session and roleAssignments/read access. Azure CLI output: $assignments"
+        fail "Azure CLI could not read effective RBAC assignments on the $resource_label. Verify the Azure CLI session and roleAssignments/read access. Azure CLI output: $assignments"
     fi
     if ! jq -e '
         any(.[];
@@ -182,9 +208,9 @@ assert_principal_can_manage_keyvault_rbac() {
             | $role == "owner"
                 or $role == "user access administrator"
                 or $role == "role based access control administrator")' <<<"$assignments" >/dev/null; then
-        fail "The current signed-in principal does not have Owner, User Access Administrator, or Role Based Access Control Administrator effective on the $vault_role vault. Sign in with a principal that can assign Key Vault RBAC roles before onboarding."
+        fail "The current signed-in principal does not have Owner, User Access Administrator, or Role Based Access Control Administrator effective on the $resource_label. Sign in with a principal that can assign these RBAC roles before onboarding."
     fi
-    printf 'Verified the current Azure principal can manage role assignments on the %s vault.\n' "$vault_role"
+    printf 'Verified the current Azure principal can manage role assignments on the %s.\n' "$resource_label"
 }
 
 # Resolve the target-declared mapping and reject paused, cross-tenant, or access-policy vaults.
@@ -219,12 +245,31 @@ target_subscription=$(subscription_from_id "$target_id")
 # plan is approved. This remains read-only and prevents a later pair from failing
 # after earlier pairs have already been onboarded.
 printf 'Checking whether the current Azure principal can assign Key Vault RBAC permissions on both vaults.\n'
-current_principal=$(current_principal_id || true)
-if [[ -z "$current_principal" ]]; then
+current_principal_info=$(current_principal_id || true)
+if [[ -z "$current_principal_info" ]]; then
     fail 'Could not resolve the current Azure user or service principal. Sign in with an account that can assign Key Vault RBAC roles before onboarding.'
 fi
-assert_principal_can_manage_keyvault_rbac "$target_id" "$target_subscription" "$current_principal" 'target'
-assert_principal_can_manage_keyvault_rbac "$source_id" "$source_subscription" "$current_principal" 'source'
+read -r current_principal current_principal_type <<<"$current_principal_info"
+current_principal=$(tr '[:upper:]' '[:lower:]' <<<"$current_principal")
+assert_principal_can_manage_keyvault_rbac "$target_id" "$target_subscription" "$current_principal" 'target vault'
+assert_principal_can_manage_keyvault_rbac "$source_id" "$source_subscription" "$current_principal" 'source vault'
+
+# Resolve the state account in the deployment subscription and require its Blob endpoint to match
+# the configured URI so the grant cannot land on a same-named account elsewhere.
+storage_id=''
+storage_subscription=''
+if [[ "$include_signed_in_user" == true ]]; then
+    storage=$(az storage account show --name "$storage_account_name" --subscription "$identity_subscription" \
+        --only-show-errors --output json 2>/dev/null) \
+        || fail "State storage account $storage_account_name was not found in the runtime identity's subscription."
+    jq -e --arg uri "$storage_uri" '
+        ((.primaryEndpoints.blob // "") | ascii_downcase | rtrimstr("/")) == ($uri | ascii_downcase | rtrimstr("/"))' \
+        <<<"$storage" >/dev/null \
+        || fail 'The resolved storage account Blob endpoint does not match the configured state storage URI.'
+    storage_id=$(jq -r '.id' <<<"$storage")
+    storage_subscription=$(subscription_from_id "$storage_id")
+    assert_principal_can_manage_keyvault_rbac "$storage_id" "$storage_subscription" "$current_principal" 'state storage account'
+fi
 
 # Build the full supported object-replication onboarding plan. The source
 # administrator role is intentionally broad because backup/restore of all Key Vault
@@ -233,17 +278,37 @@ assert_principal_can_manage_keyvault_rbac "$source_id" "$source_subscription" "$
 # management; the runtime itself never writes role assignments at source scope.
 key_vault_administrator='00482a5a-887f-4fb3-b363-3b7fe8e74483'                # Key Vault Administrator
 key_vault_data_access_administrator='8b54135c-b56d-4d72-a534-26097cfdc8d8'    # Key Vault Data Access Administrator
+storage_blob_data_contributor='ba92f5b4-2d11-453d-a403-e96b0029c9fe'          # Storage Blob Data Contributor
 
-plans=$(jq -cn \
-    --arg source "$source_id" --arg sourceSub "$source_subscription" \
-    --arg target "$target_id" --arg targetSub "$target_subscription" \
-    --arg admin "$key_vault_administrator" --arg rbacAdmin "$key_vault_data_access_administrator" '
-    [
-      {scope:$source, subscription:$sourceSub, roleId:$admin, roleName:"Key Vault Administrator"},
-      {scope:$source, subscription:$sourceSub, roleId:$rbacAdmin, roleName:"Key Vault Data Access Administrator"},
-      {scope:$target, subscription:$targetSub, roleId:$admin, roleName:"Key Vault Administrator"},
-      {scope:$target, subscription:$targetSub, roleId:$rbacAdmin, roleName:"Key Vault Data Access Administrator"}
-    ]')
+vault_plans() {
+    jq -cn \
+        --arg principal "$1" --arg principalType "$2" --arg label "$3" \
+        --arg source "$source_id" --arg sourceSub "$source_subscription" \
+        --arg target "$target_id" --arg targetSub "$target_subscription" \
+        --arg admin "$key_vault_administrator" --arg rbacAdmin "$key_vault_data_access_administrator" '
+        [
+          {scope:$source, subscription:$sourceSub, roleId:$admin, roleName:"Key Vault Administrator"},
+          {scope:$source, subscription:$sourceSub, roleId:$rbacAdmin, roleName:"Key Vault Data Access Administrator"},
+          {scope:$target, subscription:$targetSub, roleId:$admin, roleName:"Key Vault Administrator"},
+          {scope:$target, subscription:$targetSub, roleId:$rbacAdmin, roleName:"Key Vault Data Access Administrator"}
+        ] | map(. + {principalId:$principal, principalType:$principalType, principalLabel:$label})'
+}
+
+plans=$(vault_plans "$principal_id" ServicePrincipal 'runtime identity')
+if [[ "$include_signed_in_user" == true ]]; then
+    signed_in_label="signed-in $(tr '[:upper:]' '[:lower:]' <<<"${current_principal_type/ServicePrincipal/service principal}")"
+    if [[ "$current_principal" == "$principal_id" ]]; then
+        printf 'The signed-in principal is the runtime identity; no separate signed-in grants are planned.\n'
+    else
+        signed_in_plans=$(vault_plans "$current_principal" "$current_principal_type" "$signed_in_label")
+        signed_in_plans=$(jq -c \
+            --arg scope "$storage_id" --arg subscription "$storage_subscription" --arg role "$storage_blob_data_contributor" \
+            --arg principal "$current_principal" --arg principalType "$current_principal_type" --arg label "$signed_in_label" '
+            . + [{scope:$scope, subscription:$subscription, roleId:$role, roleName:"Storage Blob Data Contributor",
+                  principalId:$principal, principalType:$principalType, principalLabel:$label}]' <<<"$signed_in_plans")
+        plans=$(jq -c --argjson more "$signed_in_plans" '. + $more' <<<"$plans")
+    fi
+fi
 
 # Preflight existing direct assignments without changing IAM.
 missing='[]'
@@ -251,7 +316,8 @@ while IFS= read -r plan; do
     scope=$(jq -r '.scope' <<<"$plan")
     subscription=$(jq -r '.subscription' <<<"$plan")
     role_id=$(jq -r '.roleId' <<<"$plan")
-    assignments=$(az role assignment list --scope "$scope" --assignee-object-id "$principal_id" \
+    assignee=$(jq -r '.principalId' <<<"$plan")
+    assignments=$(az role assignment list --scope "$scope" --assignee-object-id "$assignee" \
         --subscription "$subscription" --fill-principal-name false \
         --only-show-errors --output json)
     exists=$(jq -r --arg role "$role_id" '
@@ -267,8 +333,9 @@ printf 'KeyVaultSync vault access plan\n'
 printf '  Source subscription: %s\n' "$source_subscription"
 printf '  Target subscription: %s\n' "$target_subscription"
 jq -r --argjson missing "$missing" '
-    .[] as $plan | "  - " + $plan.roleName + " at " + $plan.scope
-    + (if any($missing[]; .scope == $plan.scope and .roleId == $plan.roleId) then " [create]" else " [existing]" end)' <<<"$plans"
+    .[] as $plan | "  - " + $plan.roleName + " at " + $plan.scope + " for " + $plan.principalLabel
+    + (if any($missing[]; .scope == $plan.scope and .roleId == $plan.roleId and .principalId == $plan.principalId)
+       then " [create]" else " [existing]" end)' <<<"$plans"
 
 if [[ "$apply" != true ]]; then
     printf 'Preview only; no role assignments were changed.\n'
@@ -294,8 +361,8 @@ done
 # The mutation phase creates only assignments proven missing during the reviewed preflight.
 while IFS= read -r plan; do
     az role assignment create \
-        --assignee-object-id "$principal_id" \
-        --assignee-principal-type ServicePrincipal \
+        --assignee-object-id "$(jq -r '.principalId' <<<"$plan")" \
+        --assignee-principal-type "$(jq -r '.principalType' <<<"$plan")" \
         --role "$(jq -r '.roleId' <<<"$plan")" \
         --scope "$(jq -r '.scope' <<<"$plan")" \
         --subscription "$(jq -r '.subscription' <<<"$plan")" \

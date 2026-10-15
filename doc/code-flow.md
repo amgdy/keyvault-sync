@@ -51,7 +51,7 @@ For each admitted pair, `RunnerApplication`:
 
 1. acquires the pair Blob lease;
 2. loads schema-compatible pair state;
-3. inventories source and target objects without reading values;
+3. inventories source and target objects by name and current-version metadata, without reading values or version history;
 4. inventories direct vault/secret/key RBAC declarations;
 5. invokes pure `ReplicationPlanner`;
 6. persists the complete plan.
@@ -75,7 +75,7 @@ Each item produces an explicit applied, skipped, blocked, conflict, failed, or a
 
 `ObjectExecutor`:
 
-1. reads the exact source version named by the plan;
+1. reads the source's current version by name and pins that exact version for the rest of the operation;
 2. computes the versioned source and expected-target signatures;
 3. reads the current target when present;
 4. requires its signature to match the committed baseline;
@@ -95,7 +95,7 @@ sequenceDiagram
     participant Target as Target Key Vault
 
     Runner->>Executor: Apply persisted object plan item
-    Executor->>Source: Read exact planned source version
+    Executor->>Source: Read current source version (pinned from here on)
     Source-->>Executor: Material and managed properties
     Executor->>Target: Read current target version
     Target-->>Executor: Current object or not found
@@ -134,4 +134,4 @@ Run reports and persisted plans are separate durable records. Each run report is
 - One pair execution failure: later already-planned pairs may continue.
 - Definitive pre-mutation client rejection: no ambiguous outcome.
 - Timeout, throttling, cancellation after intent, or verification uncertainty: retain intent.
-- Incomplete inventory: suppress deletion and other absence-based decisions.
+- Incomplete inventory: a warning about one object (unreadable certificate metadata or a missing key/certificate current version) blocks only that name, including its deletion. A vault-level listing warning, such as an incomplete soft-deleted list, blocks all object mutation and deletion for the pair. Authorization-inventory warnings block RBAC reconciliation only.

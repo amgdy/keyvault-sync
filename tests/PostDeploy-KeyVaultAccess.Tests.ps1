@@ -23,11 +23,15 @@ Copy-Item (Join-Path $repositoryRoot 'scripts/PostDeploy-KeyVaultAccess.ps1') $f
 param(
     [string] $IdentityResourceId,
     [string] $TargetVaultResourceId,
+    [switch] $IncludeSignedInUser,
+    [string] $StorageAccountUri,
     [switch] $Apply
 )
 @{
     identity = $IdentityResourceId
     target = $TargetVaultResourceId
+    signedIn = $IncludeSignedInUser.IsPresent
+    storage = $StorageAccountUri
     apply = $Apply.IsPresent
 } | ConvertTo-Json -Compress | Add-Content -LiteralPath $env:KEYVAULTSYNC_TEST_GRANT_LOG
 if ($env:KEYVAULTSYNC_TEST_PREVIEW_FAILURE -eq 'true' -and -not $Apply) {
@@ -90,6 +94,7 @@ try {
     $env:AZURE_SUBSCRIPTION_ID = $subscriptionId
     $env:KEYVAULTSYNC_IDENTITY_RESOURCE_ID = "/subscriptions/$subscriptionId/resourceGroups/identity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/keyvaultsync"
     $env:KEYVAULTSYNC_TEST_GRANT_LOG = $script:grantLog
+    $env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI = 'https://kvsstate.blob.core.windows.net/'
     $env:KEYVAULTSYNC_TEST_PREVIEW_FAILURE = 'false'
 
     Set-Content -LiteralPath $script:grantLog -Value ''
@@ -105,10 +110,11 @@ try {
     Write-Host 'PASS PowerShell declining tag confirmation performs no pair previews or writes'
 
     Set-Content -LiteralPath $script:grantLog -Value ''
-    $hookOutput = Invoke-Hook -Answers @('y', 'n') | Out-String
+    $hookOutput = Invoke-Hook -Answers @('y', 'n', 'n') | Out-String
     $calls = @(Get-Content $script:grantLog | Where-Object { $_ } | ForEach-Object { ConvertFrom-Json $_ })
     Assert-True ($calls.Count -eq 2) "both enabled tagged targets should be previewed; captured $($calls.Count): $($calls | ConvertTo-Json -Compress); output: $hookOutput"
     Assert-True (@($calls | Where-Object apply).Count -eq 0) 'declining apply must perform no apply calls'
+    Assert-True (@($calls | Where-Object signedIn).Count -eq 0) 'declining the signed-in question must not include signed-in grants'
     Assert-True ((@($calls.target | Sort-Object) -join ',') -eq (@($targetOne, $targetTwo | Sort-Object) -join ',')) 'the enabled target set should match'
     Write-Host 'PASS PowerShell previews every enabled tagged target before a declined apply'
 
@@ -118,17 +124,33 @@ try {
     Write-Host 'PASS PowerShell renders discovered mappings as an aligned source and target table'
 
     Set-Content -LiteralPath $script:grantLog -Value ''
-    Invoke-Hook -Answers @('y', 'y') | Out-Null
+    Invoke-Hook -Answers @('y', 'n', 'y') | Out-Null
     $calls = @(Get-Content $script:grantLog | Where-Object { $_ } | ForEach-Object { ConvertFrom-Json $_ })
     Assert-True ($calls.Count -eq 4) 'two previews and two apply calls are expected'
     Assert-True (@($calls | Where-Object apply).Count -eq 2) 'the second confirmation should apply both pairs'
     Write-Host 'PASS PowerShell explicit second confirmation applies every preflighted pair'
 
     Set-Content -LiteralPath $script:grantLog -Value ''
+    Invoke-Hook -Answers @('y', 'y', 'y') | Out-Null
+    $calls = @(Get-Content $script:grantLog | Where-Object { $_ } | ForEach-Object { ConvertFrom-Json $_ })
+    Assert-True ($calls.Count -eq 4) 'two previews and two apply calls are expected with signed-in grants'
+    Assert-True (@($calls | Where-Object { $_.signedIn -and $_.storage -eq $env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI }).Count -eq 4) 'every preview and apply should include the signed-in grants'
+    Write-Host 'PASS PowerShell accepting the signed-in identity question previews and applies its grants'
+
+    Set-Content -LiteralPath $script:grantLog -Value ''
+    $storageUri = $env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI
+    Remove-Item Env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI
+    Invoke-Hook -Answers @('y', 'y') | Out-Null
+    $env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI = $storageUri
+    $calls = @(Get-Content $script:grantLog | Where-Object { $_ } | ForEach-Object { ConvertFrom-Json $_ })
+    Assert-True ($calls.Count -eq 4 -and @($calls | Where-Object signedIn).Count -eq 0) 'a missing storage URI skips the signed-in question'
+    Write-Host 'PASS PowerShell missing state storage URI skips the signed-in identity question'
+
+    Set-Content -LiteralPath $script:grantLog -Value ''
     $env:KEYVAULTSYNC_TEST_PREVIEW_FAILURE = 'true'
     $failed = $false
     try {
-        Invoke-Hook -Answers @('y', 'y') | Out-Null
+        Invoke-Hook -Answers @('y', 'n', 'y') | Out-Null
     }
     catch {
         $failed = $true
@@ -142,6 +164,7 @@ try {
 }
 finally {
     Remove-Item Env:KEYVAULTSYNC_TEST_GRANT_LOG -ErrorAction SilentlyContinue
+    Remove-Item Env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI -ErrorAction SilentlyContinue
     Remove-Item Env:KEYVAULTSYNC_TEST_PREVIEW_FAILURE -ErrorAction SilentlyContinue
     Remove-Item Env:AZD_NON_INTERACTIVE -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $fixtureDirectory -Recurse -Force

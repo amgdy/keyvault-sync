@@ -10,6 +10,7 @@ public sealed class AdminDiagnosticsTests
     {
         { "INVENTORY_WARNING", "KVS-INV-PARTIAL" },
         { "BLOCKED_INCOMPLETE_INVENTORY", "KVS-PLAN-INCOMPLETE-INVENTORY" },
+        { "BLOCKED_SOURCE_VERSION_DISABLED", "KVS-PLAN-SOURCE-DISABLED" },
         { "BLOCKED_HMAC_KEY_NOT_CONFIGURED", "KVS-PLAN-HMAC-MISSING" },
         { "BLOCKED_UNRESOLVED_INTENT", "KVS-PLAN-UNRESOLVED-INTENT" },
         { "BLOCKED_SOFT_DELETED_TARGET", "KVS-PLAN-SOFT-DELETED-NAME" },
@@ -28,6 +29,7 @@ public sealed class AdminDiagnosticsTests
         { "CONFLICT_TARGET_APPEARED", "KVS-OBJECT-TARGET-APPEARED" },
         { "CONFLICT_EXTERNALLY_MODIFIED", "KVS-PLAN-EXTERNAL-MODIFICATION" },
         { "STALE_PLAN_SOURCE_VERSION_UNAVAILABLE", "KVS-OBJECT-STALE-SOURCE" },
+        { "READ_FAILED_BEFORE_MUTATION", "KVS-OBJECT-READ-FAILED" },
         { "WRITE_FAILED_DEFINITIVELY", "KVS-OBJECT-WRITE-DEFINITIVE" },
         { "DELETE_FAILED_DEFINITIVELY", "KVS-OBJECT-DELETE-DEFINITIVE" },
         { "AMBIGUOUS_OUTCOME_UNRESOLVED_INTENT", "KVS-OBJECT-AMBIGUOUS" },
@@ -57,7 +59,7 @@ public sealed class AdminDiagnosticsTests
     };
 
     [Theory]
-    [InlineData("Secret head version could not be determined for example.", "KVS-INV-SECRET-HEAD")]
+    [InlineData("Certificate head version could not be determined for example.", "KVS-INV-CERTIFICATE-HEAD")]
     [InlineData("Certificate metadata/backing references could not be read for example: HTTP 403.", "KVS-INV-CERTIFICATE-METADATA")]
     [InlineData("Deleted-secret inventory is incomplete: HTTP 403.", "KVS-INV-DELETED-SECRETS")]
     [InlineData("Object role-assignment inventory is incomplete: RequestFailedException.", "KVS-INV-OBJECT-RBAC")]
@@ -126,7 +128,7 @@ public sealed class AdminDiagnosticsTests
     [Theory]
     [InlineData("KVS-RBAC-403", "Critical")]
     [InlineData("KVS-OBJECT-AMBIGUOUS", "Critical")]
-    [InlineData("KVS-INV-SECRET-HEAD", "High")]
+    [InlineData("KVS-INV-CERTIFICATE-HEAD", "High")]
     [InlineData("KVS-PLAN-KEY-PROVISIONING", "Medium")]
     [InlineData("KVS-OBJECT-IN-SYNC", "None")]
     public void GetPriority_ReturnsBoundedOperatorPriority(string code, string expectedPriority)
@@ -183,7 +185,7 @@ public sealed class AdminDiagnosticsTests
             .Select(row => (string)row[1])
             .Concat(new[]
             {
-                "KVS-INV-SECRET-HEAD", "KVS-INV-CERTIFICATE-METADATA", "KVS-INV-DELETED-SECRETS",
+                "KVS-INV-CERTIFICATE-HEAD", "KVS-INV-CERTIFICATE-METADATA", "KVS-INV-DELETED-SECRETS",
                 "KVS-INV-OBJECT-RBAC", "KVS-INV-VAULT-RBAC", "KVS-INV-UNKNOWN",
                 "KVS-DISCOVERY-ENABLED", "KVS-DISCOVERY-SOURCE-DISABLED", "KVS-DISCOVERY-TARGET-DISABLED",
                 "KVS-DISCOVERY-INVALID-SOURCE-ID", "KVS-DISCOVERY-TARGET-UNREADABLE",

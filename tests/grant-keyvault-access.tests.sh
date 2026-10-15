@@ -13,6 +13,9 @@ export principal_id='44444444-4444-4444-4444-444444444444'
 export identity_id="/subscriptions/$source_subscription/resourceGroups/identity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/keyvaultsync"
 export source_id="/subscriptions/$source_subscription/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/source-vault"
 export target_id="/subscriptions/$target_subscription/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/target-vault"
+export operator_id='55555555-5555-5555-5555-555555555555'
+export fixture_storage_uri='https://kvsstate.blob.core.windows.net/'
+export fixture_storage_id="/subscriptions/$source_subscription/resourceGroups/identity/providers/Microsoft.Storage/storageAccounts/kvsstate"
 
 argument() {
     local name="$1"
@@ -38,16 +41,22 @@ az() {
                 return 1
             fi
             if [[ "$*" == *'--query user.name'* ]]; then
-                printf '%s\n' "$principal_id"
+                printf '%s\n' 'operator-app-id'
                 return 0
             fi
             jq -n --arg tenant "$tenant_id" --arg user "$principal_id" '{tenantId:$tenant,user:{name:$user}}'
             ;;
         'ad signed-in-user')
-            printf '%s\n' "$principal_id"
+            [[ "${MOCK_OPERATOR_IS_SERVICE_PRINCIPAL:-false}" != true ]] || return 1
+            printf '%s\n' "${MOCK_OPERATOR_ID:-$principal_id}"
             ;;
         'ad sp')
-            printf '%s\n' "$principal_id"
+            printf '%s\n' "${MOCK_OPERATOR_ID:-$principal_id}"
+            ;;
+        'storage account')
+            [[ "$3" == show && "$(argument --name "$@")" == kvsstate ]] || return 1
+            jq -n --arg id "$fixture_storage_id" --arg blob "${MOCK_STORAGE_BLOB_ENDPOINT:-$fixture_storage_uri}" \
+                '{id:$id,primaryEndpoints:{blob:$blob}}'
             ;;
         'keyvault show')
             id=$(argument --ids "$@")
@@ -97,14 +106,14 @@ az() {
                         fi
                         return 0
                     fi
-                    jq --arg scope "$scope" --arg principal "$principal_id" '
+                    jq --arg scope "$scope" --arg principal "$(argument --assignee-object-id "$@")" '
                         map(select(.scope == $scope and .principalId == $principal))' \
                         "$fixture_directory/assignments.json"
                     ;;
                 create)
                     scope=$(argument --scope "$@")
                     role=$(argument --role "$@")
-                    jq -n --arg scope "$scope" --arg principal "$principal_id" --arg role "$role" \
+                    jq -n --arg scope "$scope" --arg principal "$(argument --assignee-object-id "$@")" --arg role "$role" \
                         '{scope:$scope,principalId:$principal,roleDefinitionId:("/providers/Microsoft.Authorization/roleDefinitions/"+$role)}' \
                         >"$fixture_directory/new.json"
                     jq --slurpfile item "$fixture_directory/new.json" '. + $item' \
@@ -131,7 +140,8 @@ reset_fixture() {
     : >"$fixture_directory/azd-calls.txt"
     unset KEYVAULTSYNC_IDENTITY_RESOURCE_ID AZURE_ENV_NAME MOCK_AZD_IDENTITY_VALUE MOCK_AZD_FAILURE \
         MOCK_AZ_LOGIN_MISSING MOCK_IDENTITY_TENANT_ID MOCK_OPERATOR_RBAC_DENIED_SCOPE \
-        MOCK_OPERATOR_RBAC_READ_FAILURE_SCOPE
+        MOCK_OPERATOR_RBAC_READ_FAILURE_SCOPE MOCK_OPERATOR_ID MOCK_OPERATOR_IS_SERVICE_PRINCIPAL \
+        MOCK_STORAGE_BLOB_ENDPOINT KEYVAULTSYNC_STORAGE_ACCOUNT_URI
     printf '[]\n' >"$fixture_directory/assignments.json"
     jq -n --arg id "$source_id" --arg tenant "$tenant_id" \
         '{id:$id,tags:{},properties:{tenantId:$tenant,enableRbacAuthorization:true}}' \
@@ -309,6 +319,68 @@ if run_script >"$fixture_directory/operator-denied.out" 2>&1; then
 fi
 grep -q 'does not have Owner, User Access Administrator, or Role Based Access Control Administrator' \
     "$fixture_directory/operator-denied.out"
+[[ "$(write_count)" == 0 ]]
+
+# Signed-in operator grants: same vault roles plus Storage Blob Data Contributor on the state account.
+storage_blob_data_contributor='ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+created_principal_grants() {
+    jq -rs --arg principal "$1" '[.[] | select(.[0:3] == ["role","assignment","create"])
+        | select(.[index("--assignee-object-id") + 1] == $principal)
+        | (.[index("--scope") + 1]) + " " + (.[index("--role") + 1]) + " " + (.[index("--assignee-principal-type") + 1])]
+        | sort | .[]' "$fixture_directory/calls.jsonl"
+}
+
+reset_fixture
+export MOCK_OPERATOR_ID="$operator_id"
+signed_in_preview=$(run_script --include-signed-in-user --storage-account-uri "$fixture_storage_uri")
+grep -q 'Storage Blob Data Contributor at '"$fixture_storage_id"' for signed-in user \[create\]' <<<"$signed_in_preview"
+grep -q 'on the state storage account' <<<"$signed_in_preview"
+[[ "$(write_count)" == 0 ]]
+
+reset_fixture
+export MOCK_OPERATOR_ID="$operator_id"
+export KEYVAULTSYNC_STORAGE_ACCOUNT_URI="\"$fixture_storage_uri\""
+signed_in_apply=$(run_script --include-signed-in-user --apply)
+grep -q '9 role assignment(s) were created' <<<"$signed_in_apply"
+[[ "$(created_principal_grants "$principal_id" | awk '{print $1, $2}')" == "$expected_grants" ]]
+created_principal_grants "$principal_id" | awk '{print $3}' | sort -u | grep -qx ServicePrincipal
+expected_operator_grants=$(printf '%s\n' "$expected_grants" "$fixture_storage_id $storage_blob_data_contributor" | sort)
+[[ "$(created_principal_grants "$operator_id" | awk '{print $1, $2}')" == "$expected_operator_grants" ]]
+[[ "$(created_principal_grants "$operator_id" | awk '{print $3}' | sort -u)" == User ]]
+
+reset_fixture
+export MOCK_OPERATOR_ID="$operator_id" MOCK_OPERATOR_IS_SERVICE_PRINCIPAL=true
+run_script --include-signed-in-user --storage-account-uri "$fixture_storage_uri" --apply >/dev/null
+[[ "$(created_principal_grants "$operator_id" | awk '{print $3}' | sort -u)" == ServicePrincipal ]]
+
+reset_fixture
+signed_in_self=$(run_script --include-signed-in-user --storage-account-uri "$fixture_storage_uri" --apply)
+grep -q 'signed-in principal is the runtime identity' <<<"$signed_in_self"
+grep -q '4 role assignment(s) were created' <<<"$signed_in_self"
+
+reset_fixture
+export MOCK_OPERATOR_ID="$operator_id" MOCK_STORAGE_BLOB_ENDPOINT='https://kvsstate.blob.example.net/'
+if run_script --include-signed-in-user --storage-account-uri "$fixture_storage_uri" --apply >"$fixture_directory/storage-mismatch.out" 2>&1; then
+    echo 'Expected a mismatched storage endpoint to fail.' >&2
+    exit 1
+fi
+grep -q 'does not match the configured state storage URI' "$fixture_directory/storage-mismatch.out"
+[[ "$(write_count)" == 0 ]]
+
+reset_fixture
+export MOCK_OPERATOR_ID="$operator_id"
+if run_script --include-signed-in-user --storage-account-uri 'http://kvsstate.blob.core.windows.net/' >/dev/null 2>&1; then
+    echo 'Expected a non-HTTPS storage URI to fail.' >&2
+    exit 1
+fi
+[[ "$(write_count)" == 0 ]]
+
+reset_fixture
+export MOCK_OPERATOR_ID="$operator_id" MOCK_OPERATOR_RBAC_DENIED_SCOPE="$fixture_storage_id"
+if run_script --include-signed-in-user --storage-account-uri "$fixture_storage_uri" --apply >/dev/null 2>&1; then
+    echo 'Expected missing storage RBAC authority to fail before writes.' >&2
+    exit 1
+fi
 [[ "$(write_count)" == 0 ]]
 
 printf 'grant-keyvault-access.sh offline tests passed.\n'

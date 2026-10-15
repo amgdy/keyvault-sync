@@ -26,36 +26,47 @@ internal static class ReplicationPlanner
         DateTimeOffset now)
     {
         var plan = new List<PlanItem>();
-        var inventoriesAreComplete = sourceInventory.Warnings.Count == 0
-            && targetInventory.Warnings.Count == 0
-            && sourceInventory.Authorization.Warnings.Count == 0
-            && targetInventory.Authorization.Warnings.Count == 0;
+        var objectInventoriesAreComplete = HasCompleteObjectLists(sourceInventory)
+            && HasCompleteObjectLists(targetInventory);
+        var incompleteObjectNames = sourceInventory.ObjectWarnings.Concat(targetInventory.ObjectWarnings)
+            .Select(objectWarning => objectWarning.ObjectName)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var certificateNames = sourceInventory.Certificates.Select(certificate => certificate.Name)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        // A target-only certificate's backing secret is part of that certificate, not a separate target-only secret.
+        // A name that is a plain source secret stays visible so a cross-type collision is still reported.
+        var targetOnlyCertificateNames = targetInventory.Certificates.Select(certificate => certificate.Name)
+            .Where(name => !certificateNames.Contains(name)
+                && !sourceInventory.Secrets.Any(secret => secret.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         AddObjectPlans(
             plan,
             "Secret",
             sourceInventory.Secrets.Where(secret => !certificateNames.Contains(secret.Name))
-                .Select(secret => (secret.Name, secret.CurrentVersion, true)),
-            targetInventory.Secrets.Where(secret => !certificateNames.Contains(secret.Name))
-                .Select(secret => (secret.Name, secret.CurrentVersion)),
+                .Select(secret => (secret.Name, (string?)null, true, secret.Enabled)),
+            targetInventory.Secrets.Where(secret => !certificateNames.Contains(secret.Name)
+                    && !targetOnlyCertificateNames.Contains(secret.Name))
+                .Select(secret => (secret.Name, (string?)null, secret.Enabled)),
             targetInventory.DeletedSecretNames,
             pair,
             state,
-            inventoriesAreComplete,
+            objectInventoriesAreComplete,
+            incompleteObjectNames,
             hmacAvailable);
 
         AddObjectPlans(
             plan,
             "Certificate",
             sourceInventory.Certificates.Select(certificate =>
-                (certificate.Name, certificate.CurrentVersion, certificate.Exportable == true)),
-            targetInventory.Certificates.Select(certificate => (certificate.Name, certificate.CurrentVersion)),
+                (certificate.Name, (string?)certificate.CurrentVersion, certificate.Exportable == true, certificate.Enabled)),
+            targetInventory.Certificates.Select(certificate =>
+                (certificate.Name, (string?)certificate.CurrentVersion, certificate.Enabled)),
             targetInventory.DeletedCertificateNames,
             pair,
             state,
-            inventoriesAreComplete,
+            objectInventoriesAreComplete,
+            incompleteObjectNames,
             hmacAvailable);
 
         foreach (var sourceKey in sourceInventory.Keys.Where(key => !certificateNames.Contains(key.Name)))
@@ -88,15 +99,19 @@ internal static class ReplicationPlanner
         return Order(plan);
     }
 
+    private const string DisabledTargetDetail =
+        "The managed target's current version is disabled, which KeyVaultSync never writes; it was changed outside synchronization.";
+
     private static void AddObjectPlans(
         ICollection<PlanItem> plan,
         string objectType,
-        IEnumerable<(string Name, string Version, bool Replicable)> sourceObjects,
-        IEnumerable<(string Name, string Version)> targetObjects,
+        IEnumerable<(string Name, string? Version, bool Replicable, bool? Enabled)> sourceObjects,
+        IEnumerable<(string Name, string? Version, bool? Enabled)> targetObjects,
         IEnumerable<string> deletedTargetNames,
         VaultPair pair,
         PairState state,
-        bool inventoriesAreComplete,
+        bool objectInventoriesAreComplete,
+        IReadOnlySet<string> incompleteObjectNames,
         bool hmacAvailable)
     {
         var sourceObjectsByName = sourceObjects.ToDictionary(
@@ -113,18 +128,19 @@ internal static class ReplicationPlanner
         {
             var objectStateKey = GetObjectKey(objectType, sourceObject.Name);
             targetObjectsByName.TryGetValue(sourceObject.Name, out var targetObject);
+            // Incomplete inventory is checked first: an unreadable certificate policy is unknown, not non-exportable.
+            if (!objectInventoriesAreComplete || incompleteObjectNames.Contains(sourceObject.Name))
+            {
+                plan.Add(Item(objectType, sourceObject.Name, "None", "BLOCKED_INCOMPLETE_INVENTORY",
+                    sourceObject.Version, targetObject.Version, IncompleteInventoryDetail(objectInventoriesAreComplete)));
+                continue;
+            }
+
             if (!sourceObject.Replicable)
             {
                 plan.Add(Item(objectType, sourceObject.Name, "None", "BLOCKED_CERTIFICATE_REISSUANCE_REQUIRED",
                     sourceObject.Version, targetObject.Version,
                     "The source certificate does not expose exportable PFX material. Reissue or externally import the certificate and private key into the target vault."));
-                continue;
-            }
-
-            if (!inventoriesAreComplete)
-            {
-                plan.Add(Item(objectType, sourceObject.Name, "None", "BLOCKED_INCOMPLETE_INVENTORY",
-                    sourceObject.Version, targetObject.Version, "Complete source and target inventories are required before mutation."));
                 continue;
             }
 
@@ -147,6 +163,16 @@ internal static class ReplicationPlanner
             {
                 plan.Add(Item(objectType, sourceObject.Name, "None", "BLOCKED_SOFT_DELETED_TARGET",
                     sourceObject.Version, targetObject.Version, "The target name is soft-deleted and will not be purged automatically."));
+                continue;
+            }
+
+            // Only the service's current version is replicated. A disabled current version cannot be read by name,
+            // and falling back to an older enabled version would publish something source consumers do not see.
+            if (sourceObject.Enabled == false)
+            {
+                plan.Add(Item(objectType, sourceObject.Name, "None", "BLOCKED_SOURCE_VERSION_DISABLED",
+                    sourceObject.Version, targetObject.Version,
+                    "The source's current version is disabled. Enable it, or make an enabled version current, to resume synchronization."));
                 continue;
             }
 
@@ -177,9 +203,16 @@ internal static class ReplicationPlanner
                 continue;
             }
 
+            if (targetObject.Enabled == false)
+            {
+                plan.Add(Item(objectType, sourceObject.Name, "None", "CONFLICT_EXTERNALLY_MODIFIED",
+                    sourceObject.Version, targetObject.Version, DisabledTargetDetail));
+                continue;
+            }
+
             plan.Add(Item(objectType, sourceObject.Name, "ReconcileObject", "VERIFY_SIGNATURES_THEN_RECONCILE",
                 sourceObject.Version, targetObject.Version,
-                "The executor will verify the live target against the committed baseline and compare the exact pinned source state."));
+                "The executor will read the source's current version, verify the live target against the committed baseline, and compare signatures."));
         }
 
         foreach (var targetObject in targetObjectsByName.Values
@@ -194,10 +227,16 @@ internal static class ReplicationPlanner
                 continue;
             }
 
-            if (!inventoriesAreComplete || !hmacAvailable)
+            if (!objectInventoriesAreComplete || incompleteObjectNames.Contains(targetObject.Name))
             {
-                plan.Add(Item(objectType, targetObject.Name, "None",
-                    inventoriesAreComplete ? "BLOCKED_HMAC_KEY_NOT_CONFIGURED" : "BLOCKED_INCOMPLETE_INVENTORY",
+                plan.Add(Item(objectType, targetObject.Name, "None", "BLOCKED_INCOMPLETE_INVENTORY",
+                    null, targetObject.Version, IncompleteInventoryDetail(objectInventoriesAreComplete)));
+                continue;
+            }
+
+            if (!hmacAvailable)
+            {
+                plan.Add(Item(objectType, targetObject.Name, "None", "BLOCKED_HMAC_KEY_NOT_CONFIGURED",
                     null, targetObject.Version, "Delete evidence requires complete inventory and the integrity key."));
                 continue;
             }
@@ -209,10 +248,33 @@ internal static class ReplicationPlanner
                 continue;
             }
 
+            if (targetObject.Enabled == false)
+            {
+                plan.Add(Item(objectType, targetObject.Name, "None", "CONFLICT_EXTERNALLY_MODIFIED",
+                    null, targetObject.Version, DisabledTargetDetail));
+                continue;
+            }
+
             plan.Add(Item(objectType, targetObject.Name, "DeleteObject", "VERIFY_SIGNATURE_THEN_SOFT_DELETE",
                 null, targetObject.Version, "The source is absent; the executor will verify managed ownership before soft delete."));
         }
     }
+
+    /// <summary>Returns whether every inventory warning is either object-scoped or an authorization warning.</summary>
+    /// <remarks>
+    /// Object-scoped warnings block only their own name. Authorization warnings block RBAC planning through its own
+    /// gate and do not affect object evidence. Anything else, such as an incomplete soft-deleted list, makes absence
+    /// and name-availability decisions unreliable for the whole vault, so all object work fails closed.
+    /// </remarks>
+    internal static bool HasCompleteObjectLists(VaultInventory inventory) =>
+        !inventory.Warnings
+            .Except(inventory.ObjectWarnings.Select(objectWarning => objectWarning.Message), StringComparer.Ordinal)
+            .Except(inventory.Authorization.Warnings, StringComparer.Ordinal)
+            .Any();
+
+    private static string IncompleteInventoryDetail(bool objectInventoriesAreComplete) => objectInventoriesAreComplete
+        ? "This object's inventory metadata is incomplete or ambiguous in the source or target; only this name is blocked."
+        : "A vault-level object listing (such as soft-deleted names) is incomplete; all object mutation for this pair is blocked.";
 
     private static void ApplyDeleteCircuitBreaker(
         IList<PlanItem> plan,

@@ -23,6 +23,26 @@ internal sealed record RunnerOptions
     public string HmacKeyVersion { get; init; } = "app-config-v1";
     /// <summary>Gets the runtime managed identity object ID used to prevent self-revocation during RBAC cleanup.</summary>
     public string? SyncPrincipalId { get; init; }
+    /// <summary>
+    /// Returns the configured sync principal object ID in canonical GUID form, or <see langword="null"/> when unset.
+    /// The canonical form ensures the identity protected from RBAC cleanup matches role-assignment principal IDs exactly.
+    /// </summary>
+    /// <exception cref="ArgumentException">The value is set but is not a GUID.</exception>
+    public static string? NormalizePrincipalId(string? configuredPrincipalId)
+    {
+        if (string.IsNullOrWhiteSpace(configuredPrincipalId))
+        {
+            return null;
+        }
+
+        if (!Guid.TryParse(configuredPrincipalId, out var principalGuid))
+        {
+            throw new ArgumentException("[KVS-CONFIG-PRINCIPAL] KEYVAULTSYNC_PRINCIPAL_ID must be a Microsoft Entra object GUID when configured.");
+        }
+
+        return principalGuid.ToString("D");
+    }
+
     /// <summary>Resolves Function App configuration and rejects invalid or retired settings.</summary>
     /// <param name="args">Must be empty. Runtime configuration is environment-only.</param>
     /// <returns>Validated options; supported writes are selected by an enabled source/target mapping.</returns>
@@ -77,11 +97,7 @@ internal sealed record RunnerOptions
         // by the planner when the key is absent; its version label is a baseline compatibility marker.
         var hmacKeyBase64 = Environment.GetEnvironmentVariable("KEYVAULTSYNC_HMAC_KEY");
         var hmacKeyVersion = Environment.GetEnvironmentVariable("KEYVAULTSYNC_HMAC_KEY_VERSION") ?? "app-config-v1";
-        var syncPrincipalId = Environment.GetEnvironmentVariable("KEYVAULTSYNC_PRINCIPAL_ID");
-        if (!string.IsNullOrWhiteSpace(syncPrincipalId) && !Guid.TryParse(syncPrincipalId, out _))
-        {
-            throw new ArgumentException("[KVS-CONFIG-PRINCIPAL] KEYVAULTSYNC_PRINCIPAL_ID must be a Microsoft Entra object GUID when configured.");
-        }
+        var syncPrincipalId = NormalizePrincipalId(Environment.GetEnvironmentVariable("KEYVAULTSYNC_PRINCIPAL_ID"));
 
         return new RunnerOptions
         {

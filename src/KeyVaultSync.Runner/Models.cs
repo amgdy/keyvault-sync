@@ -66,30 +66,16 @@ internal sealed record DiscoveryResult
     public required IReadOnlyList<string> Issues { get; init; }
 }
 
-/// <summary>Value-free service metadata for an observed secret, key, or certificate version.</summary>
-internal sealed record ObjectVersionSummary
-{
-    /// <summary>Gets the service version ID, or an empty string when the response did not supply it.</summary>
-    public required string Version { get; init; }
-    /// <summary>Gets the service creation timestamp when present; secret head inference uses dated versions only.</summary>
-    public DateTimeOffset? CreatedOn { get; init; }
-    /// <summary>Gets the service metadata-update timestamp when present; it is not used as a value checksum.</summary>
-    public DateTimeOffset? UpdatedOn { get; init; }
-    /// <summary>Gets the nullable service enabled setting; null means the response did not specify a value.</summary>
-    public bool? Enabled { get; init; }
-}
-
-/// <summary>A secret's observed version and managed metadata, deliberately excluding its value.</summary>
-/// <remarks>Metadata and version lists are separate service observations and are not an atomic snapshot.</remarks>
+/// <summary>A secret's current-version metadata, deliberately excluding its value and version ID.</summary>
+/// <remarks>
+/// The secret list response describes the service's current version without naming it. The executor reads that
+/// current version by name at apply time and pins the exact version it read; version history is not inventoried.
+/// </remarks>
 internal sealed record SecretSummary
 {
     /// <summary>Gets the name used for source/target matching within the secret namespace.</summary>
     public required string Name { get; init; }
-    /// <summary>Gets the inferred newest dated version, or an empty string when the head could not be determined.</summary>
-    public required string CurrentVersion { get; init; }
-    /// <summary>Gets observed version properties; collection order is not a latest-version guarantee.</summary>
-    public required IReadOnlyList<ObjectVersionSummary> Versions { get; init; }
-    /// <summary>Gets the observed enabled setting included in managed-metadata comparison.</summary>
+    /// <summary>Gets the current version's enabled setting; a disabled current version is never replicated.</summary>
     public bool? Enabled { get; init; }
     /// <summary>Gets the optional content type copied by supported secret operations.</summary>
     public string? ContentType { get; init; }
@@ -99,8 +85,6 @@ internal sealed record SecretSummary
     public DateTimeOffset? ExpiresOn { get; init; }
     /// <summary>Gets observed secret tags; these are data-plane metadata, not the vault's ARM discovery tags.</summary>
     public IReadOnlyDictionary<string, string> Tags { get; init; } = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets a compatibility alias for CurrentVersion; it can be empty and performs no live head lookup.</summary>
-    public string? LatestVersion => CurrentVersion;
 }
 
 /// <summary>Public key/version observations used for lifecycle planning, never private key export.</summary>
@@ -108,10 +92,8 @@ internal sealed record KeySummary
 {
     /// <summary>Gets the key-namespace name used to compare source and target observations.</summary>
     public required string Name { get; init; }
-    /// <summary>Gets the head returned by GetKey, with listing metadata as fallback; empty means unresolved.</summary>
+    /// <summary>Gets the current version returned by GetKey, with listing metadata as fallback; empty means unresolved.</summary>
     public required string CurrentVersion { get; init; }
-    /// <summary>Gets observed version properties without assuming service enumeration order.</summary>
-    public required IReadOnlyList<ObjectVersionSummary> Versions { get; init; }
     /// <summary>Gets the public key type/protection descriptor; matching types do not prove matching key material.</summary>
     public string? KeyType { get; init; }
     /// <summary>Gets a SHA-256 fingerprint of public JWK components only; private and symmetric key material is excluded.</summary>
@@ -123,8 +105,6 @@ internal sealed record KeySummary
     public DateTimeOffset? ExpiresOn { get; init; }
     public IReadOnlyDictionary<string, string> Tags { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets the observed CurrentVersion alias without reading the service.</summary>
-    public string? LatestVersion => CurrentVersion;
 }
 
 /// <summary>Public certificate observations and the references needed to treat its backing objects as one group.</summary>
@@ -132,10 +112,8 @@ internal sealed record CertificateSummary
 {
     /// <summary>Gets the certificate name, conventionally shared by its backing key and secret.</summary>
     public required string Name { get; init; }
-    /// <summary>Gets the observed head version, or an empty string when unavailable.</summary>
+    /// <summary>Gets the current version returned by GetCertificate, or an empty string when unavailable; informational for planning.</summary>
     public required string CurrentVersion { get; init; }
-    /// <summary>Gets observed version properties; no private payloads are retained.</summary>
-    public required IReadOnlyList<ObjectVersionSummary> Versions { get; init; }
     /// <summary>Gets the hex SHA-256 of public DER when read; it does not prove private-key equivalence or ownership.</summary>
     public string? ThumbprintSha256 { get; init; }
     /// <summary>Gets the backing secret identifier, or null when unavailable; its value is not fetched by inventory.</summary>
@@ -149,8 +127,6 @@ internal sealed record CertificateSummary
     public DateTimeOffset? ExpiresOn { get; init; }
     public IReadOnlyDictionary<string, string> Tags { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Gets the observed CurrentVersion alias, which may be empty.</summary>
-    public string? LatestVersion => CurrentVersion;
 }
 
 /// <summary>A legacy access-policy declaration, not an evaluated permission decision.</summary>
@@ -249,7 +225,18 @@ internal sealed record VaultInventory
     public int DeletedCertificateCount => DeletedCertificateNames.Count;
     /// <summary>Gets all recorded metadata/deleted-list/authorization warnings used to reject complete-scan evidence.</summary>
     public required IReadOnlyList<string> Warnings { get; init; }
+    /// <summary>
+    /// Gets the subset of <see cref="Warnings"/> that concerns one named object. The planner blocks only objects with
+    /// these names; any other non-authorization warning still blocks all object work for the pair.
+    /// </summary>
+    /// <remarks>Defaults to empty, which makes every warning vault-scoped and therefore fails closed.</remarks>
+    public IReadOnlyList<ObjectInventoryWarning> ObjectWarnings { get; init; } = [];
 }
+
+/// <summary>An inventory warning confined to one object name, such as an undeterminable head version.</summary>
+/// <param name="ObjectName">Object name; certificate, backing secret, and backing key share it, so it blocks all three.</param>
+/// <param name="Message">The exact text also recorded in <see cref="VaultInventory.Warnings"/>.</param>
+internal sealed record ObjectInventoryWarning(string ObjectName, string Message);
 
 /// <summary>A planned action or its replacement execution outcome; action/status strings form a shared reporting contract.</summary>
 /// <remarks>Authorization entries identify exact vault- or object-scope role assignments and are applied by the RBAC executor when the run safety gates permit mutation.</remarks>
@@ -263,7 +250,7 @@ internal sealed record PlanItem
     public required string Action { get; init; }
     /// <summary>Gets the decision/outcome token consumed by executor eligibility and aggregate run classification.</summary>
     public required string Status { get; init; }
-    /// <summary>Gets the observed or applied source version, when the object type/action has one.</summary>
+    /// <summary>Gets the source version: informational when planned (absent for secrets), exact once the executor has read it.</summary>
     public string? SourceVersion { get; init; }
     /// <summary>Gets the observed or written target version, or null when unknown/absent.</summary>
     public string? TargetVersion { get; init; }

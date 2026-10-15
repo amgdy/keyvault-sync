@@ -14,7 +14,7 @@
 		{
 			"label": "KeyVaultSync: Verify repository",
 			"type": "shell",
-			"command": "dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj --no-restore && dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj --no-restore -p:GenerateDocumentationFile=true -warnaserror && bash tests/grant-keyvault-access.tests.sh && bash tests/prepare-deployment.tests.sh && bash tests/bicep-tag-wiring.tests.sh && bash tests/postdeploy-keyvault-access.tests.sh && pwsh -NoProfile -File tests/Grant-KeyVaultAccess.Tests.ps1 && pwsh -NoProfile -File tests/Prepare-Deployment.Tests.ps1 && pwsh -NoProfile -File tests/PostDeploy-KeyVaultAccess.Tests.ps1 && az bicep build --file infra/main.bicep --outfile /tmp/keyvaultsync-main.json",
+			"command": "dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj --no-restore && dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj --no-restore -p:GenerateDocumentationFile=true -warnaserror && dotnet build src/KeyVaultSync.Cli/KeyVaultSync.Cli.csproj --no-restore -warnaserror && bash tests/grant-keyvault-access.tests.sh && bash tests/prepare-deployment.tests.sh && bash tests/bicep-tag-wiring.tests.sh && bash tests/postdeploy-keyvault-access.tests.sh && pwsh -NoProfile -File tests/Grant-KeyVaultAccess.Tests.ps1 && pwsh -NoProfile -File tests/Prepare-Deployment.Tests.ps1 && pwsh -NoProfile -File tests/PostDeploy-KeyVaultAccess.Tests.ps1 && az bicep build --file infra/main.bicep --outfile /tmp/keyvaultsync-main.json",
 			"isBackground": false,
 			"problemMatcher": []
 		}

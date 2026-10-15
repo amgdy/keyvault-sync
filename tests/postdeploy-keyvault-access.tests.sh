@@ -28,6 +28,7 @@ export fixture_directory
 export PATH="$fixture_directory/bin:$PATH"
 export AZURE_SUBSCRIPTION_ID='11111111-1111-1111-1111-111111111111'
 export KEYVAULTSYNC_IDENTITY_RESOURCE_ID="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/identity/providers/Microsoft.ManagedIdentity/userAssignedIdentities/keyvaultsync"
+export KEYVAULTSYNC_STORAGE_ACCOUNT_URI='https://kvsstate.blob.core.windows.net/'
 source_one="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/source-one"
 source_two="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/source-two"
 source_disabled="/subscriptions/$AZURE_SUBSCRIPTION_ID/resourceGroups/vaults/providers/Microsoft.KeyVault/vaults/source-disabled"
@@ -64,11 +65,11 @@ printf 'n\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >
 printf 'PASS declining tag confirmation performs no pair previews or writes\n'
 
 : >"$fixture_directory/grants.log"
-hook_output=$(printf 'y\nn\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh")
+hook_output=$(printf 'y\nn\nn\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh")
 jq -eRsc --arg targetOne "$target_one" --arg targetTwo "$target_two" --arg targetThree "$target_three" '
   split("\n") | map(select(length > 0))
   | length == 3
-    and all(.[]; contains("--identity-id") and (contains("--apply") | not))
+    and all(.[]; contains("--identity-id") and (contains("--apply") | not) and (contains("--include-signed-in-user") | not))
     and any(.[]; contains("--target-vault-id") and contains($targetOne))
     and any(.[]; contains("--target-vault-id") and contains($targetTwo))
     and any(.[]; contains("--target-vault-id") and contains($targetThree))' "$fixture_directory/grants.log" >/dev/null
@@ -81,17 +82,34 @@ grep -q "^  2  source  $AZURE_SUBSCRIPTION_ID  *vaults  *source-three$" <<<"$hoo
 printf 'PASS discovered mappings are rendered as an aligned source and target table\n'
 
 : >"$fixture_directory/grants.log"
-printf 'y\ny\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null
+printf 'y\nn\ny\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null
 jq -eRsc '
   split("\n") | map(select(length > 0))
   | length == 6
     and all(.[0:3][]; contains("--apply") | not)
-    and all(.[3:6][]; contains("--apply"))' "$fixture_directory/grants.log" >/dev/null
+    and all(.[3:6][]; contains("--apply"))
+    and all(.[]; contains("--include-signed-in-user") | not)' "$fixture_directory/grants.log" >/dev/null
 printf 'PASS explicit second confirmation applies every preflighted pair\n'
 
 : >"$fixture_directory/grants.log"
+printf 'y\ny\ny\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null
+jq -eRsc --arg storage "$KEYVAULTSYNC_STORAGE_ACCOUNT_URI" '
+  split("\n") | map(select(length > 0))
+  | length == 6
+    and all(.[]; contains("--include-signed-in-user --storage-account-uri " + $storage))
+    and all(.[3:6][]; contains("--apply"))' "$fixture_directory/grants.log" >/dev/null
+printf 'PASS accepting the signed-in identity question previews and applies its grants\n'
+
+: >"$fixture_directory/grants.log"
+printf 'y\ny\n' | env -u KEYVAULTSYNC_STORAGE_ACCOUNT_URI bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null
+jq -eRsc '
+  split("\n") | map(select(length > 0))
+  | length == 6 and all(.[]; contains("--include-signed-in-user") | not)' "$fixture_directory/grants.log" >/dev/null
+printf 'PASS a missing state storage URI skips the signed-in identity question\n'
+
+: >"$fixture_directory/grants.log"
 export mock_preview_failure=true
-if printf 'y\ny\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null 2>&1; then
+if printf 'y\nn\ny\n' | bash "$fixture_directory/scripts/postdeploy-keyvault-access.sh" >/dev/null 2>&1; then
     printf 'Expected preview failure.\n' >&2
     exit 1
 fi

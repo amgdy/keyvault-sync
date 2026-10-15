@@ -11,8 +11,29 @@ using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Serilog;
 using Serilog.Events;
+using Serilog.Formatting.Compact;
 
 namespace KeyVaultSync.Runner;
+
+/// <summary>Console output formats supported by the terminal host.</summary>
+internal enum ConsoleLogFormat
+{
+    /// <summary>Human-readable line: timestamp, level, source, rendered message, then the structured properties as JSON.</summary>
+    Text,
+
+    /// <summary>One rendered compact JSON (CLEF) event per line, the same shape as the log file.</summary>
+    Json,
+}
+
+/// <summary>Terminal-host logging sinks layered on top of the shared Serilog pipeline.</summary>
+internal sealed record TelemetryLogOptions
+{
+    /// <summary>Console output format.</summary>
+    public ConsoleLogFormat ConsoleFormat { get; init; } = ConsoleLogFormat.Text;
+
+    /// <summary>Optional file that receives every console event as rendered compact JSON (CLEF), one per line.</summary>
+    public string? FilePath { get; init; }
+}
 
 /// <summary>Owns the console host's logging and optional OpenTelemetry providers for one process lifetime.</summary>
 /// <remarks>
@@ -47,18 +68,26 @@ internal sealed class TelemetryRuntime : IDisposable
     public bool AzureMonitorEnabled { get; }
     /// <summary>Gets the effective application log threshold after fallback validation.</summary>
     public LogLevel MinimumLogLevel { get; }
+    /// <summary>Gets the full path of the structured log file, or <see langword="null"/> when file logging is off.</summary>
+    public string? LogFilePath { get; private init; }
 
     /// <summary>Creates console logging and, when a connection string is supplied, Azure Monitor export.</summary>
     /// <param name="connectionString">Application Insights routing configuration; null/blank means console-only logs.</param>
     /// <param name="credential">Entra credential for export; the identity requires the relevant Azure Monitor permission.</param>
+    /// <param name="logOptions">Console format and optional structured log file; null means text console only.</param>
     /// <returns>A runtime that the console entry point must dispose when its work has finished.</returns>
     /// <remarks>
     /// Reads <c>KEYVAULTSYNC_LOG_LEVEL</c> once. Invalid values fall back to Information with a warning.
     /// The connection string identifies the telemetry destination; the supplied credential authenticates export.
     /// Exporter configuration and local instrumentation do not verify remote ingestion or redaction.
+    /// The log file receives exactly the console events, which never include secret values or the HMAC key, but do
+    /// include resource identifiers; on Unix it is created owner-read/write only.
     /// </remarks>
-    public static TelemetryRuntime Configure(string? connectionString, TokenCredential credential)
+    /// <exception cref="IOException">The log file or its directory could not be created.</exception>
+    /// <exception cref="UnauthorizedAccessException">The log file location is not writable.</exception>
+    public static TelemetryRuntime Configure(string? connectionString, TokenCredential credential, TelemetryLogOptions? logOptions = null)
     {
+        logOptions ??= new TelemetryLogOptions();
         RunnerTelemetry.Initialize();
         var azureMonitorEnabled = !string.IsNullOrWhiteSpace(connectionString);
         var serviceVersion = Assembly.GetExecutingAssembly().GetName().Version?.ToString() ?? "unknown";
@@ -71,11 +100,22 @@ internal sealed class TelemetryRuntime : IDisposable
         var minimumLevel = TryParseMinimumLogLevel(configuredLevel, out var parsedLevel)
             ? parsedLevel
             : LogLevel.Information;
-        var serilogLogger = new LoggerConfiguration()
+        var serilogConfiguration = new LoggerConfiguration()
             .MinimumLevel.Is(ToSerilogLevel(minimumLevel))
-            .Enrich.FromLogContext()
-            .WriteTo.Console(outputTemplate: "{Timestamp:O} [{Level:u3}] {SourceContext} {Message:lj} {Properties:j}{NewLine}{Exception}")
-            .CreateLogger();
+            .Enrich.FromLogContext();
+        serilogConfiguration = logOptions.ConsoleFormat == ConsoleLogFormat.Json
+            ? serilogConfiguration.WriteTo.Console(new RenderedCompactJsonFormatter())
+            : serilogConfiguration.WriteTo.Console(outputTemplate: "{Timestamp:O} [{Level:u3}] {SourceContext} {Message:lj} {Properties:j}{NewLine}{Exception}");
+
+        string? logFilePath = null;
+        if (!string.IsNullOrWhiteSpace(logOptions.FilePath))
+        {
+            logFilePath = CreatePrivateLogFile(logOptions.FilePath);
+            // Unbuffered so a crash or second Ctrl+C still leaves every written event on disk.
+            serilogConfiguration = serilogConfiguration.WriteTo.File(new RenderedCompactJsonFormatter(), logFilePath, buffered: false);
+        }
+
+        var serilogLogger = serilogConfiguration.CreateLogger();
 
         var loggerFactory = Microsoft.Extensions.Logging.LoggerFactory.Create(builder =>
         {
@@ -115,7 +155,7 @@ internal sealed class TelemetryRuntime : IDisposable
         {
             // No trace/metric listener is installed by this branch. StartActivity can return null;
             // instrumentation call sites must continue to work with logging alone.
-            return new TelemetryRuntime(loggerFactory, null, null, false, minimumLevel);
+            return new TelemetryRuntime(loggerFactory, null, null, false, minimumLevel) { LogFilePath = logFilePath };
         }
 
         // Subscribe to the application's source plus Azure SDK and HTTP dependencies. Trace
@@ -142,7 +182,37 @@ internal sealed class TelemetryRuntime : IDisposable
             })
             .Build();
 
-        return new TelemetryRuntime(loggerFactory, tracerProvider, meterProvider, true, minimumLevel);
+        return new TelemetryRuntime(loggerFactory, tracerProvider, meterProvider, true, minimumLevel) { LogFilePath = logFilePath };
+    }
+
+    /// <summary>Creates the log file (and directory) before Serilog opens it so Unix permissions are owner-only.</summary>
+    /// <remarks>Serilog appends to an existing file and keeps its mode, so pre-creating it is enough.</remarks>
+    private static string CreatePrivateLogFile(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var directory = Path.GetDirectoryName(fullPath)!;
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(directory);
+            using (new FileStream(fullPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite))
+            {
+            }
+
+            return fullPath;
+        }
+
+        Directory.CreateDirectory(directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        using (new FileStream(fullPath, new FileStreamOptions
+        {
+            Mode = FileMode.Append,
+            Access = FileAccess.Write,
+            Share = FileShare.ReadWrite,
+            UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+        }))
+        {
+        }
+
+        return fullPath;
     }
 
     /// <summary>Parses a supported logging threshold shared by both hosts, excluding the silent None level.</summary>

@@ -50,7 +50,10 @@ internal sealed class ObjectExecutor
                 ["ObjectAction"] = objectPlanItem.Action,
             });
             stateLease.EnsureLeaseHeld();
-            var objectResult = objectPlanItem.Action == "DeleteObject"
+            PlanItem objectResult;
+            try
+            {
+                objectResult = objectPlanItem.Action == "DeleteObject"
                 ? await DeleteAsync(objectPlanItem, stateLease, runId, targetVaultClient, signatures, cancellationToken)
                 : await ReconcileAsync(
                     objectPlanItem,
@@ -60,6 +63,15 @@ internal sealed class ObjectExecutor
                     targetVaultClient,
                     signatures,
                     cancellationToken);
+            }
+            catch (PreMutationReadException exception)
+            {
+                // Raised only before an intent exists, so nothing was written and other objects can continue.
+                _logger.LogWarning(exception.InnerException, "Could not read {ObjectName} before mutation; only this object is skipped.", objectPlanItem.Name);
+                objectResult = Outcome(objectPlanItem, "READ_FAILED_BEFORE_MUTATION",
+                    $"The {exception.Side} object could not be read before mutation ({exception.Reason}); nothing was written.");
+            }
+
             objectResults.Add(objectResult);
         }
 
@@ -81,18 +93,18 @@ internal sealed class ObjectExecutor
             return Outcome(item, "BLOCKED_UNRESOLVED_INTENT", "A durable object mutation intent remains unresolved.");
         }
 
-        using var sourceObject = await sourceClient.ReadAsync(
-            item.ObjectType,
-            item.Name,
-            item.SourceVersion,
-            cancellationToken);
-        if (sourceObject is null || !string.Equals(sourceObject.Version, item.SourceVersion, StringComparison.Ordinal))
+        // Always replicate the service's current source version. The version read here is pinned for the
+        // intent, write, verification, and baseline, so later source changes are picked up by the next run.
+        using var sourceObject = await ReadBeforeMutationAsync(sourceClient, "source", item, cancellationToken);
+        if (sourceObject is null || sourceObject.Version.Length == 0)
         {
-            return Outcome(item, "STALE_PLAN_SOURCE_VERSION_UNAVAILABLE", "The exact planned source version is no longer available.");
+            return Outcome(item, "STALE_PLAN_SOURCE_VERSION_UNAVAILABLE", "The source object was no longer readable at execution.");
         }
 
+        item = item with { SourceVersion = sourceObject.Version };
+
         var sourceSignature = signatures.Compute(sourceObject.ToSignatureInput());
-        using var liveTarget = await targetClient.ReadAsync(item.ObjectType, item.Name, null, cancellationToken);
+        using var liveTarget = await ReadBeforeMutationAsync(targetClient, "target", item, cancellationToken);
         lease.State.ObjectBaselines.TryGetValue(objectStateKey, out var baseline);
         if (item.Action == "CreateObject")
         {
@@ -250,7 +262,7 @@ internal sealed class ObjectExecutor
             return Outcome(item, "BLOCKED_INCOMPATIBLE_BASELINE", "A compatible ownership baseline is required for deletion.");
         }
 
-        using var liveTarget = await targetClient.ReadAsync(item.ObjectType, item.Name, null, cancellationToken);
+        using var liveTarget = await ReadBeforeMutationAsync(targetClient, "target", item, cancellationToken);
         if (liveTarget is null)
         {
             return Outcome(item, "CONFLICT_MANAGED_TARGET_MISSING", "The target disappeared before the planned delete.");
@@ -331,6 +343,32 @@ internal sealed class ObjectExecutor
 
         await lease.SaveStateAsync(cancellationToken);
         return Outcome(item, "OBJECT_SOFT_DELETED_AND_VERIFIED", "The target is no longer active; no purge was attempted.");
+    }
+
+    /// <summary>Reads the current object before any intent exists; a read or certificate-payload failure blocks only this object.</summary>
+    private static async Task<ReplicatedObject?> ReadBeforeMutationAsync(
+        IObjectReplicationVaultClient client, string side, PlanItem item, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await client.ReadAsync(item.ObjectType, item.Name, null, cancellationToken);
+        }
+        catch (RequestFailedException exception)
+        {
+            throw new PreMutationReadException(side, $"HTTP {exception.Status}", exception);
+        }
+        catch (Exception exception) when (exception is InvalidDataException or InvalidOperationException)
+        {
+            // Certificate payload validation (non-exportable, missing or malformed backing secret) during the read.
+            throw new PreMutationReadException(side, exception.GetType().Name, exception);
+        }
+    }
+
+    private sealed class PreMutationReadException(string side, string reason, Exception inner)
+        : Exception($"The {side} object read failed before mutation.", inner)
+    {
+        public string Side { get; } = side;
+        public string Reason { get; } = reason;
     }
 
     private static bool IsDefinitiveFailure(Exception exception) =>

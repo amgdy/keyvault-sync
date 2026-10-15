@@ -6,6 +6,8 @@ Coordinates optional interactive postdeploy onboarding for all enabled target-de
 The script discovers vaults across configured subscriptions, previews every pair through
 Grant-KeyVaultAccess.ps1, and asks once before applying. Non-interactive azd runs skip it.
 If a later pair fails, earlier applied assignments are retained and a rerun converges safely.
+An optional, default-No question also grants the signed-in operator the same vault roles plus
+state-storage access so the terminal runner can run as that identity without the Function App.
 #>
 param()
 
@@ -144,12 +146,23 @@ for ($index = 0; $index -lt $targets.Count; $index++) {
     [void] $rows.Add((New-TableRow -Pair '' -Role 'target' -ResourceId $target.Id -FallbackName $target.Name))
 }
 Write-Host (($rows | Format-Table -AutoSize | Out-String -Width 500).Trim())
+
+# The answer is fixed before previews so the reviewed plan and the applied plan are identical.
+$grantParameters = @{ IdentityResourceId = $identityId }
+if ([string]::IsNullOrWhiteSpace($env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI)) {
+    Write-Host "`nKEYVAULTSYNC_STORAGE_ACCOUNT_URI was not provided by azd; skipping the optional signed-in identity grants."
+}
+elseif (Confirm-Step "`nAlso grant the signed-in identity the same vault roles plus Storage Blob Data Contributor on the state storage account, so you can run the terminal runner (src/KeyVaultSync.Cli) as yourself?") {
+    $grantParameters.IncludeSignedInUser = $true
+    $grantParameters.StorageAccountUri = $env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI
+}
+
 Write-Host "`nPreflighting every pair; this phase performs reads only."
 
 # Preview every pair first; no IAM write occurs in this phase.
 foreach ($target in $targets) {
     Write-Host "[KeyVaultSync][postdeploy] Preflighting target vault $($target.Id)."
-    & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $target.Id
+    & $grantScript @grantParameters -TargetVaultResourceId $target.Id
 }
 
 Write-Host "`nAll pair previews completed without writes."
@@ -162,7 +175,7 @@ if (-not (Confirm-Step "Apply the displayed access grants for all $($targets.Cou
 Write-Host 'Applying reviewed grants. A failure can leave earlier pairs applied; rerun to converge safely.'
 foreach ($target in $targets) {
     Write-Host "[KeyVaultSync][postdeploy] Applying reviewed grants for target vault $($target.Id)."
-    & $grantScript -IdentityResourceId $identityId -TargetVaultResourceId $target.Id -Apply -Confirm:$false
+    & $grantScript @grantParameters -TargetVaultResourceId $target.Id -Apply -Confirm:$false
 }
 
 Write-Host "[KeyVaultSync][postdeploy] Key Vault access onboarding completed for $($targets.Count) mapping(s)."

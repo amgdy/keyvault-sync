@@ -33,22 +33,10 @@ internal static class AdminDiagnostics
     /// <summary>Classifies one persisted inventory warning without copying its identifier-bearing text to telemetry.</summary>
     public static AdminDiagnostic ClassifyInventoryWarning(string warning)
     {
-        if (warning.StartsWith("Secret head version could not be determined", StringComparison.Ordinal))
-        {
-            return new("KVS-INV-SECRET-HEAD", "Secret head version metadata is missing or ambiguous.",
-                "Inspect the affected secret versions in the private run record and establish one unambiguous current version.");
-        }
-
         if (warning.StartsWith("Key head version could not be determined", StringComparison.Ordinal))
         {
             return new("KVS-INV-KEY-HEAD", "Key head version could not be determined.",
                 "Inspect the affected key versions and current key metadata before the next run.");
-        }
-
-        if (warning.StartsWith("Key version inventory does not contain the observed head", StringComparison.Ordinal))
-        {
-            return new("KVS-INV-KEY-VERSION-MISMATCH", "The observed key head was absent from version inventory.",
-                "Inspect the affected key's active versions and allow Azure Key Vault metadata to converge before retrying.");
         }
 
         if (warning.StartsWith("Certificate metadata/backing references could not be read", StringComparison.Ordinal))
@@ -60,13 +48,7 @@ internal static class AdminDiagnostics
         if (warning.StartsWith("Certificate head version could not be determined", StringComparison.Ordinal))
         {
             return new("KVS-INV-CERTIFICATE-HEAD", "Certificate head version could not be determined.",
-                "Inspect the affected certificate versions and establish one readable current version.");
-        }
-
-        if (warning.StartsWith("Certificate version inventory does not contain the observed head", StringComparison.Ordinal))
-        {
-            return new("KVS-INV-CERTIFICATE-VERSION-MISMATCH", "The observed certificate head was absent from version inventory.",
-                "Inspect certificate version metadata and allow the service observations to converge before retrying.");
+                "Verify certificate read permissions and inspect the affected certificate's current version.");
         }
 
         if (warning.StartsWith("Deleted-secret inventory is incomplete", StringComparison.Ordinal))
@@ -111,8 +93,8 @@ internal static class AdminDiagnostics
                 "Inventory contains a warning that prevents complete-scan evidence.",
                 "Inspect the private run record, resolve the warning, and allow a new complete inventory."),
             "BLOCKED_INCOMPLETE_INVENTORY" => new("KVS-PLAN-INCOMPLETE-INVENTORY",
-                "Object mutation was blocked because inventory was incomplete.",
-                "Resolve every source and target inventory warning, then allow a new complete run to re-plan the pair."),
+                "Object mutation was blocked because this object's inventory, or a vault-level object listing, was incomplete.",
+                "Resolve the warning for this object name, or the vault-level listing warning, then allow a later run to re-plan the pair."),
             "BLOCKED_HMAC_KEY_NOT_CONFIGURED" => new("KVS-PLAN-HMAC-MISSING",
                 "Object mutation was blocked because protected HMAC material is unavailable.",
                 "Restore the environment's original protected HMAC key; never generate a replacement for committed baselines."),
@@ -122,6 +104,9 @@ internal static class AdminDiagnostics
             "BLOCKED_SOFT_DELETED_TARGET" => new("KVS-PLAN-SOFT-DELETED-NAME",
                 "The target name is occupied by a soft-deleted object.",
                 "Review the soft-deleted object and follow an explicitly approved recovery process; KeyVaultSync never purges it."),
+            "BLOCKED_SOURCE_VERSION_DISABLED" => new("KVS-PLAN-SOURCE-DISABLED",
+                "The source object's current version is disabled, so it was not replicated.",
+                "Enable the current version, or make an enabled version current, if this object should be synchronized; older versions are never used."),
             "BLOCKED_CERTIFICATE_REISSUANCE_REQUIRED" => new("KVS-PLAN-CERTIFICATE-NONEXPORTABLE",
                 "Certificate private material is not exportable.",
                 "Reissue or externally import the certificate and private key into the target vault."),
@@ -162,8 +147,11 @@ internal static class AdminDiagnostics
                 "The live target no longer matches its committed baseline.",
                 "Identify the external writer and resolve ownership; do not force overwrite or silently rebaseline."),
             "STALE_PLAN_SOURCE_VERSION_UNAVAILABLE" => new("KVS-OBJECT-STALE-SOURCE",
-                "The exact source version selected during planning was no longer available at execution.",
-                "Inspect source version lifecycle activity and allow a later run to create a fresh plan."),
+                "The source object was deleted or became unreadable between planning and execution.",
+                "Inspect source lifecycle activity and allow a later run to create a fresh plan."),
+            "READ_FAILED_BEFORE_MUTATION" => new("KVS-OBJECT-READ-FAILED",
+                "The source or target object could not be read before mutation, so only this object was skipped and nothing was written.",
+                "Check the reason in the detail: a disabled current version, missing data-plane read permission, or an invalid certificate payload is the usual cause. A later run retries automatically."),
             "WRITE_FAILED_DEFINITIVELY" => new("KVS-OBJECT-WRITE-DEFINITIVE",
                 "Azure definitively rejected the object write before a successful outcome was possible.",
                 "Inspect the HTTP status and error code, correct permissions, policy, input, or network configuration, then allow a fresh plan."),

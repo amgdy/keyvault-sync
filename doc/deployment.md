@@ -127,7 +127,7 @@ The operator-facing automation is three responsibilities, each implemented for B
 
 - `prepare-deployment.*` runs only as the azd preprovision/predeploy guard;
 - `postdeploy-keyvault-access.*` discovers enabled mappings, lists each pair's source and target subscription, resource group, and vault name in a table, then coordinates optional onboarding;
-- `grant-keyvault-access.*` verifies the current operator's inherited/group RBAC assignment path, then previews or applies the four required per-pair grants.
+- `grant-keyvault-access.*` verifies the current operator's inherited/group RBAC assignment path, then previews or applies the four required per-pair grants, plus optional signed-in-operator grants for the terminal runner.
 
 There are no separate HMAC, storage-validation, backup/restore, or vault-mutation deployment scripts.
 
@@ -152,6 +152,8 @@ Preview is the default. `--apply`/`-Apply` is required for IAM changes. The scri
 All azd hooks emit phase-prefixed progress to stdout so the deployment transcript shows configuration resolution, subscription discovery, permission preflight, storage validation, and each reviewed/apply pair. Protected HMAC values are never printed.
 
 Interactive azd deployments can run the optional post-deploy hook. It discovers target-declared mappings in all configured subscriptions, previews every grant, and asks separately before applying. Non-interactive runs skip it.
+
+`--include-signed-in-user`/`-IncludeSignedInUser` adds the same four vault roles for the signed-in user or service principal, plus Storage Blob Data Contributor on the state storage account named by `--storage-account-uri`/`-StorageAccountUri` (default: `KEYVAULTSYNC_STORAGE_ACCOUNT_URI` from the azd environment). This lets an operator run `src/KeyVaultSync.Cli` as themselves. The preflight also verifies the operator's RBAC administration path on the storage account and checks that the account's blob endpoint matches the URI. It skips these grants when the signed-in identity is the runtime identity. The post-deploy hook asks a separate default-No question for these grants before the preview, and applies exactly what was previewed.
 
 ## State Preservation
 

@@ -165,7 +165,7 @@ internal sealed class BlobStateStore
         {
             activity?.SetStatus(ActivityStatusCode.Ok, "Lease already held");
             leaseTimer.Stop();
-            _logger.LogInformation("Pair lease is already held for {PairId}; this scan will skip the pair.", pair.PairId);
+            _logger.LogInformation("Pair lease is already held; this scan will skip the pair.");
             return null;
         }
 
@@ -194,8 +194,8 @@ internal sealed class BlobStateStore
                 }
 
                 state.SchemaVersion = PairState.CurrentSchemaVersion;
-                _logger.LogInformation("Advanced empty pair-state schema for {PairId} to version {SchemaVersion}.",
-                    pair.PairId, PairState.CurrentSchemaVersion);
+                _logger.LogInformation("Advanced empty pair-state schema to version {SchemaVersion}.",
+                    PairState.CurrentSchemaVersion);
             }
 
             if (!state.SourceVaultId.Equals(pair.Source.Id, StringComparison.OrdinalIgnoreCase)
@@ -210,8 +210,8 @@ internal sealed class BlobStateStore
             activity?.SetTag("pair_state.baseline_count", state.ObjectBaselines.Count);
             activity?.SetTag("pair_state.pending_write_count", state.PendingObjectMutations.Count);
             _logger.LogInformation(PairLeaseAcquisitionEventId,
-                "Pair state lease acquired. {PairId}; state schema {SchemaVersion}; {BaselineCount} object baselines; {PendingWriteCount} pending mutations; waited {DurationMs} ms.",
-                pair.PairId, state.SchemaVersion, state.ObjectBaselines.Count, state.PendingObjectMutations.Count, leaseTimer.Elapsed.TotalMilliseconds);
+                "Pair state lease acquired. State schema {SchemaVersion}; {BaselineCount} object baselines; {PendingWriteCount} pending mutations; waited {DurationMs} ms.",
+                state.SchemaVersion, state.ObjectBaselines.Count, state.PendingObjectMutations.Count, leaseTimer.Elapsed.TotalMilliseconds);
             return new PairLease(blob, leaseClient, lease.LeaseId, download.Value.Details.ETag, state,
                 _loggerFactory.CreateLogger<PairLease>());
         }
@@ -344,15 +344,15 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
             activity?.SetTag("pair_state.baseline_count", State.ObjectBaselines.Count);
             activity?.SetTag("pair_state.pending_write_count", State.PendingObjectMutations.Count);
             _logger.LogInformation(PairStatePersistedEventId,
-                "Pair state persisted. {PairId}; last complete run {LastCompleteRunId}; {BaselineCount} object baselines; {PendingWriteCount} pending mutations.",
-                State.PairId, State.LastCompleteRunId, State.ObjectBaselines.Count, State.PendingObjectMutations.Count);
+                "Pair state persisted. Last complete run {LastCompleteRunId}; {BaselineCount} object baselines; {PendingWriteCount} pending mutations.",
+                State.LastCompleteRunId, State.ObjectBaselines.Count, State.PendingObjectMutations.Count);
         }
         catch (Exception exception)
         {
             RunnerTelemetry.RecordException(activity, exception);
             activity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
             AdminDiagnostics.LogSystemFailure(_logger, "PairStatePersistence", exception);
-            _logger.LogError(exception, "Could not save checkpoint for pair {PairId}.", State.PairId);
+            _logger.LogError(exception, "Could not save the pair state checkpoint.");
             throw;
         }
     }
@@ -371,8 +371,8 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
             {
                 await _leaseClient.RenewAsync(cancellationToken: cancellationToken);
                 _logger.LogDebug(PairLeaseLifecycleEventId,
-                    "Pair state lease renewed. {PairId}; elapsed lease time {ElapsedMs} ms.",
-                    State.PairId, _leaseTimer.Elapsed.TotalMilliseconds);
+                    "Pair state lease renewed. Elapsed lease time {ElapsedMs} ms.",
+                    _leaseTimer.Elapsed.TotalMilliseconds);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -382,7 +382,7 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
         {
             _renewalError = exception;
             AdminDiagnostics.LogSystemFailure(_logger, "PairLeaseRenewal", exception);
-            _logger.LogError(exception, "Blob lease renewal failed for pair {PairId}.", State.PairId);
+            _logger.LogError(exception, "Pair state Blob lease renewal failed.");
         }
     }
 
@@ -406,14 +406,14 @@ internal sealed class PairLease : IAsyncDisposable, IPairStateLease
         {
             await _leaseClient.ReleaseAsync(cancellationToken: CancellationToken.None);
             _logger.LogInformation(PairLeaseLifecycleEventId,
-                "Pair state lease released. {PairId}; lease held for {ElapsedMs} ms.",
-                State.PairId, _leaseTimer.Elapsed.TotalMilliseconds);
+                "Pair state lease released. Lease held for {ElapsedMs} ms.",
+                _leaseTimer.Elapsed.TotalMilliseconds);
         }
         catch (Exception exception)
         {
             // The lease expires automatically if release cannot reach Storage.
             AdminDiagnostics.LogSystemFailure(_logger, "PairLeaseRelease", exception);
-            _logger.LogWarning("Could not release Blob lease for pair {PairId}; it will expire automatically.", State.PairId);
+            _logger.LogWarning("Could not release the pair state Blob lease; it will expire automatically.");
         }
 
         _renewalCancellation.Dispose();

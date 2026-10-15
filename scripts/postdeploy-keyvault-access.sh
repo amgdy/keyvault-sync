@@ -2,6 +2,8 @@
 # Interactive azd postdeploy onboarding for existing, explicitly tagged Key Vault pairs.
 # The script performs a read-only preview for every enabled mapping before asking once
 # for permission to call the per-pair grant script with --apply. Pipelines skip this hook.
+# An optional, default-No question also grants the signed-in operator the same vault roles plus
+# state-storage access so the terminal runner can run as that identity without the Function App.
 set -euo pipefail
 
 # Print one terminal error and stop before any later pair can be applied.
@@ -124,13 +126,23 @@ jq -r '
         + "  " + .vault ] as $lines
     | ($lines | map(length) | max) as $width
     | $lines[0], ("  " + ("-" * ($width - 2))), $lines[1:][]' <<<"$pairs"
+
+# The answer is fixed before previews so the reviewed plan and the applied plan are identical.
+grant_arguments=(--identity-id "$identity_id")
+storage_uri="${KEYVAULTSYNC_STORAGE_ACCOUNT_URI:-}"
+if [[ -z "$storage_uri" ]]; then
+    printf '\nKEYVAULTSYNC_STORAGE_ACCOUNT_URI was not provided by azd; skipping the optional signed-in identity grants.\n'
+elif confirm $'\nAlso grant the signed-in identity the same vault roles plus Storage Blob Data Contributor on the state storage account, so you can run the terminal runner (src/KeyVaultSync.Cli) as yourself?'; then
+    grant_arguments+=(--include-signed-in-user --storage-account-uri "$storage_uri")
+fi
+
 printf '\nPreflighting every pair; this phase performs reads only.\n'
 
 # Preview every pair first; no IAM write occurs in this phase.
 while IFS= read -r pair; do
     vault_id=$(jq -r '.targetId' <<<"$pair")
     printf '[KeyVaultSync][postdeploy] Preflighting target vault %s.\n' "$vault_id"
-    bash "$grant_script" --identity-id "$identity_id" --target-vault-id "$vault_id"
+    bash "$grant_script" "${grant_arguments[@]}" --target-vault-id "$vault_id"
 done < <(jq -c '.[]' <<<"$pairs")
 
 printf '\nAll pair previews completed without writes.\n'
@@ -144,7 +156,7 @@ printf 'Applying reviewed grants. A failure can leave earlier pairs applied; rer
 while IFS= read -r pair; do
     vault_id=$(jq -r '.targetId' <<<"$pair")
     printf '[KeyVaultSync][postdeploy] Applying reviewed grants for target vault %s.\n' "$vault_id"
-    bash "$grant_script" --identity-id "$identity_id" --target-vault-id "$vault_id" --apply
+    bash "$grant_script" "${grant_arguments[@]}" --target-vault-id "$vault_id" --apply
 done < <(jq -c '.[]' <<<"$pairs")
 
 printf '[KeyVaultSync][postdeploy] Key Vault access onboarding completed for %s mapping pair(s).\n' "$pair_count"

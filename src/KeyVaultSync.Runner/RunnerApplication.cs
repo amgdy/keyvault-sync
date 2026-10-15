@@ -21,7 +21,7 @@ namespace KeyVaultSync.Runner;
 public sealed class RunnerApplication
 {
     // These IDs describe orchestration stages. Child services supply their own event IDs while
-    // inheriting the RunId/PairId scopes, so operators can correlate work across logger categories.
+    // inheriting the RunId and Source*/Target* pair scopes, so operators can correlate work across logger categories.
     private static readonly EventId DiscoveryStartedEventId = new(3000, "DiscoveryStarted");
     private static readonly EventId PairProgressEventId = new(3001, "PairProgress");
     private static readonly EventId PlanningProgressEventId = new(3002, "PlanningProgress");
@@ -222,11 +222,8 @@ public sealed class RunnerApplication
                 pairActivity?.SetTag("vault.target.name", pair.Target.Name);
                 pairActivity?.SetTag("sync.pair_index", pairIndex + 1);
                 pairActivity?.SetTag("sync.pair_count", discovery.Pairs.Count);
-                using var pairScope = _logger.BeginScope(new Dictionary<string, object?>
+                using var pairScope = PairLogScope.Begin(_logger, pair, new Dictionary<string, object?>
                 {
-                    ["PairId"] = pair.PairId,
-                    ["SourceVaultName"] = pair.Source.Name,
-                    ["TargetVaultName"] = pair.Target.Name,
                     ["PairNumber"] = pairIndex + 1,
                     ["PairCount"] = discovery.Pairs.Count,
                 });
@@ -248,7 +245,7 @@ public sealed class RunnerApplication
                         pairRun.Status = "SkippedPairAlreadyLocked";
                         pairRun.CompletedAt = DateTimeOffset.UtcNow;
                         pairRun.Errors.Add("Another runner currently holds this pair's Blob lease.");
-                        _logger.LogWarning("Skipped pair {PairId} because another runner holds its state lease.", pair.PairId);
+                        _logger.LogWarning("Skipped pair {SourceVaultName} to {TargetVaultName} because another runner holds its state lease.", pair.Source.Name, pair.Target.Name);
                         await _stateStore.WriteRunRecordAsync(run, cancellationToken);
                         continue;
                     }
@@ -261,7 +258,7 @@ public sealed class RunnerApplication
                         _logger,
                         "SourceInventory",
                         pairRun.Source.Warnings.Count == 0 ? "Completed" : "CompletedWithWarnings",
-                        pairRun.Source.Warnings.Count == 0 ? "Continue" : "BlockObjectMutation");
+                        InventoryDecision(pairRun.Source));
                     _logger.LogInformation(PairProgressEventId, "Source inventory complete for {SourceVaultName}; scanning target vault {TargetVaultName}.",
                         pair.Source.Name, pair.Target.Name);
                     pairRun.Target = await _scanner.ScanAsync(pair.Target, cancellationToken);
@@ -270,7 +267,7 @@ public sealed class RunnerApplication
                         _logger,
                         "TargetInventory",
                         pairRun.Target.Warnings.Count == 0 ? "Completed" : "CompletedWithWarnings",
-                        pairRun.Target.Warnings.Count == 0 ? "Continue" : "BlockObjectMutation");
+                        InventoryDecision(pairRun.Target));
                     RunnerTelemetry.RecordInventory(pairRun.Source, "source");
                     RunnerTelemetry.RecordInventory(pairRun.Target, "target");
                     _logger.LogInformation(PairProgressEventId,
@@ -318,8 +315,13 @@ public sealed class RunnerApplication
                     }
                     else
                     {
+                        // Not a complete-scan checkpoint, but the planner has already confined object-scoped
+                        // and authorization warnings to the affected names or to RBAC, so unaffected work proceeds.
                         pairRun.Status = "PartialInventory";
-                        pairRun.Errors.Add("One or more inventory/read checks failed. This run cannot be used as deletion evidence.");
+                        pairRun.Errors.Add(ReplicationPlanner.HasCompleteObjectLists(pairRun.Source)
+                                           && ReplicationPlanner.HasCompleteObjectLists(pairRun.Target)
+                            ? "Some objects or authorization scopes have inventory warnings; only those are blocked. See the INVENTORY_WARNING plan items."
+                            : "One or more vault-level inventory/read checks failed. Object mutation for this pair is blocked and this run cannot be used as deletion evidence.");
                     }
 
                     pairRun.CompletedAt = DateTimeOffset.UtcNow;
@@ -346,7 +348,7 @@ public sealed class RunnerApplication
                     RunnerTelemetry.RecordException(pairActivity, exception);
                     pairActivity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
                     RunnerTelemetry.Failures.Add(1, new("sync.stage", "pair"), new("error.type", exception.GetType().Name));
-                    _logger.LogError(exception, "Pair scan failed for {PairId}.", pair.PairId);
+                    _logger.LogError(exception, "Pair scan failed for {SourceVaultName} to {TargetVaultName}.", pair.Source.Name, pair.Target.Name);
                     await _stateStore.WriteRunRecordAsync(run, CancellationToken.None);
                 }
                 finally
@@ -402,6 +404,7 @@ public sealed class RunnerApplication
             {
                 foreach (var prepared in preparedPairs.AsEnumerable().Reverse())
                 {
+                    using var releaseScope = PairLogScope.Begin(_logger, prepared.Pair);
                     await prepared.Lease.DisposeAsync();
                 }
             }
@@ -607,11 +610,8 @@ public sealed class RunnerApplication
     {
         var pair = prepared.Pair;
         var report = prepared.Report;
-        using var pairScope = _logger.BeginScope(new Dictionary<string, object?>
+        using var pairScope = PairLogScope.Begin(_logger, pair, new Dictionary<string, object?>
         {
-            ["PairId"] = pair.PairId,
-            ["SourceVaultName"] = pair.Source.Name,
-            ["TargetVaultName"] = pair.Target.Name,
             ["PairNumber"] = prepared.PairIndex + 1,
             ["PairCount"] = pairCount,
         });
@@ -694,7 +694,7 @@ public sealed class RunnerApplication
             AdminDiagnostics.LogSystemFailure(_logger, "PairExecution", exception);
             RunnerTelemetry.RecordException(activity, exception);
             activity?.SetStatus(ActivityStatusCode.Error, exception.GetType().Name);
-            _logger.LogError(exception, "Pair execution failed for {PairId}.", pair.PairId);
+            _logger.LogError(exception, "Pair execution failed for {SourceVaultName} to {TargetVaultName}.", pair.Source.Name, pair.Target.Name);
         }
         finally
         {
@@ -731,18 +731,20 @@ public sealed class RunnerApplication
             pairDiagnostic.AdminAction);
         RunnerTelemetry.PairsProcessed.Add(1, new KeyValuePair<string, object?>("sync.status", report.Status));
         RunnerTelemetry.PairDuration.Record(timer.Elapsed.TotalMilliseconds, new KeyValuePair<string, object?>("sync.status", report.Status));
-        const string message = "Pair {PairId} completed with status {Status} in {DurationMs} ms.";
+        // Completion can be recorded after the pair scope has ended, so it restores the readable pair identity itself.
+        using var pairScope = PairLogScope.Begin(_logger, report.PairId);
+        const string message = "Pair completed with status {Status} in {DurationMs} ms.";
         if (report.Status == "Failed")
         {
-            _logger.LogError(message, report.PairId, report.Status, timer.Elapsed.TotalMilliseconds);
+            _logger.LogError(message, report.Status, timer.Elapsed.TotalMilliseconds);
         }
         else if (report.Status is "PartialInventory" or "SyncCompletedWithUnappliedWork" or "ExecutionBlockedPlanningIncomplete")
         {
-            _logger.LogWarning(message, report.PairId, report.Status, timer.Elapsed.TotalMilliseconds);
+            _logger.LogWarning(message, report.Status, timer.Elapsed.TotalMilliseconds);
         }
         else
         {
-            _logger.LogInformation(message, report.PairId, report.Status, timer.Elapsed.TotalMilliseconds);
+            _logger.LogInformation(message, report.Status, timer.Elapsed.TotalMilliseconds);
         }
     }
 
@@ -998,6 +1000,12 @@ public sealed class RunnerApplication
             ? $"{exception.GetType().Name}: HTTP {requestFailure.Status}, error {requestFailure.ErrorCode ?? "unknown"}."
             : $"{exception.GetType().Name}: {exception.Message}";
     }
+
+    /// <summary>Names the planning consequence of one vault inventory for lifecycle diagnostics.</summary>
+    private static string InventoryDecision(VaultInventory inventory) =>
+        inventory.Warnings.Count == 0 ? "Continue"
+        : ReplicationPlanner.HasCompleteObjectLists(inventory) ? "BlockAffectedItems"
+        : "BlockObjectMutation";
 
     internal static bool HasUnappliedWork(IReadOnlyList<PlanItem> plan)
     {

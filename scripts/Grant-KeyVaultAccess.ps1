@@ -6,12 +6,18 @@ Previews or grants the runtime identity the four built-in Key Vault roles requir
 The target declares its source through sync-source-keyvault-id. Preview is the default.
 -Apply creates only missing direct assignments after re-reading both vaults. The script never
 changes vaults, tags, authorization mode, role definitions, objects, or existing assignments.
+-IncludeSignedInUser also plans the same vault roles plus Storage Blob Data Contributor on the state
+storage account for the signed-in operator, so the terminal runner can run as that identity.
 #>
 param(
     [string] $IdentityResourceId,
 
     [Parameter(Mandatory = $true)]
     [string] $TargetVaultResourceId,
+
+    [switch] $IncludeSignedInUser,
+
+    [string] $StorageAccountUri,
 
     [switch] $Apply
 )
@@ -32,32 +38,51 @@ function ConvertFrom-AzdScalar {
     return $normalized
 }
 
-function Resolve-IdentityResourceId {
-    if (-not [string]::IsNullOrWhiteSpace($IdentityResourceId)) {
-        return (ConvertFrom-AzdScalar $IdentityResourceId)
+# Prefer an explicit parameter, then the hook environment, then the selected azd environment.
+function Resolve-AzdSetting {
+    param(
+        [Parameter(Mandatory = $true)][string] $Name,
+        [AllowEmptyString()][string] $ExplicitValue,
+        [AllowEmptyString()][string] $EnvironmentValue,
+        [Parameter(Mandatory = $true)][string] $ParameterName
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ExplicitValue)) {
+        return (ConvertFrom-AzdScalar $ExplicitValue)
     }
-    if (-not [string]::IsNullOrWhiteSpace($env:KEYVAULTSYNC_IDENTITY_RESOURCE_ID)) {
-        return (ConvertFrom-AzdScalar $env:KEYVAULTSYNC_IDENTITY_RESOURCE_ID)
+    if (-not [string]::IsNullOrWhiteSpace($EnvironmentValue)) {
+        return (ConvertFrom-AzdScalar $EnvironmentValue)
     }
     if ($null -eq (Get-Command azd -ErrorAction SilentlyContinue)) {
-        throw 'azd is required when IdentityResourceId and KEYVAULTSYNC_IDENTITY_RESOURCE_ID are not supplied.'
+        throw "azd is required when $ParameterName and $Name are not supplied."
     }
-    $arguments = @('env', 'get-value', 'KEYVAULTSYNC_IDENTITY_RESOURCE_ID')
+    $arguments = @('env', 'get-value', $Name)
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_ENV_NAME)) {
         $arguments += @('--environment', $env:AZURE_ENV_NAME)
     }
     $output = & azd @arguments 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw 'Could not read KEYVAULTSYNC_IDENTITY_RESOURCE_ID from the current azd environment.'
+        throw "Could not read $Name from the current azd environment."
     }
-    $resolved = ConvertFrom-AzdScalar ($output -join [Environment]::NewLine)
-    if ([string]::IsNullOrWhiteSpace($resolved)) {
-        throw 'No managed identity was resolved. Supply IdentityResourceId or set KEYVAULTSYNC_IDENTITY_RESOURCE_ID in the current azd environment.'
-    }
-    return $resolved
+    return (ConvertFrom-AzdScalar ($output -join [Environment]::NewLine))
 }
 
-$IdentityResourceId = Resolve-IdentityResourceId
+$IdentityResourceId = Resolve-AzdSetting -Name 'KEYVAULTSYNC_IDENTITY_RESOURCE_ID' -ExplicitValue $IdentityResourceId `
+    -EnvironmentValue $env:KEYVAULTSYNC_IDENTITY_RESOURCE_ID -ParameterName 'IdentityResourceId'
+if ([string]::IsNullOrWhiteSpace($IdentityResourceId)) {
+    throw 'No managed identity was resolved. Supply IdentityResourceId or set KEYVAULTSYNC_IDENTITY_RESOURCE_ID in the current azd environment.'
+}
+$storageAccountName = $null
+if ($IncludeSignedInUser) {
+    $StorageAccountUri = Resolve-AzdSetting -Name 'KEYVAULTSYNC_STORAGE_ACCOUNT_URI' -ExplicitValue $StorageAccountUri `
+        -EnvironmentValue $env:KEYVAULTSYNC_STORAGE_ACCOUNT_URI -ParameterName 'StorageAccountUri'
+    if ([string]::IsNullOrWhiteSpace($StorageAccountUri)) {
+        throw 'No state storage account was resolved. Supply StorageAccountUri or set KEYVAULTSYNC_STORAGE_ACCOUNT_URI in the current azd environment.'
+    }
+    if ($StorageAccountUri.ToLowerInvariant() -notmatch '^https://(?<name>[a-z0-9]{3,24})\.blob\.[^/]+/?$') {
+        throw 'StorageAccountUri must be an HTTPS Blob service URI such as https://<account>.blob.core.windows.net/.'
+    }
+    $storageAccountName = $Matches.name
+}
 if ($IdentityResourceId -notmatch $identityPattern) {
     throw 'IdentityResourceId must be a user-assigned managed identity ARM resource ID.'
 }
@@ -156,11 +181,12 @@ if ($account.tenantId -ine $tenantId) {
     throw 'The signed-in operator and runtime identity must belong to the same tenant.'
 }
 
-# Resolve the current signed-in principal and require a role assignment path that can grant Key Vault RBAC.
-function Get-SignedInPrincipalId {
+# Resolve the current signed-in principal and its type; the type selects the
+# --assignee-principal-type used for any optional signed-in grant.
+function Get-SignedInPrincipal {
     $signedIn = & az ad signed-in-user show --query id -o tsv 2>$null
     if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($signedIn)) {
-        return $signedIn.Trim()
+        return [pscustomobject]@{ Id = $signedIn.Trim().ToLowerInvariant(); Type = 'User' }
     }
 
     $accountInfo = Invoke-AzJson -Arguments @('account', 'show', '--subscription', $identitySubscription)
@@ -171,7 +197,7 @@ function Get-SignedInPrincipalId {
 
     $servicePrincipal = & az ad sp show --id $userName --query id -o tsv 2>$null
     if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($servicePrincipal)) {
-        return $servicePrincipal.Trim()
+        return [pscustomobject]@{ Id = $servicePrincipal.Trim().ToLowerInvariant(); Type = 'ServicePrincipal' }
     }
 
     throw 'The current Azure sign-in context cannot assign Key Vault RBAC roles. Sign in with an account that has Owner or User Access Administrator on the vaults.'
@@ -200,7 +226,7 @@ function Assert-CanManageRbacOnScope {
         $name -in @('owner', 'user access administrator', 'role based access control administrator')
     }).Count -gt 0
     if (-not $canGrant) {
-        throw "The current signed-in principal does not have Owner, User Access Administrator, or Role Based Access Control Administrator effective on $Scope. Sign in with a principal that can assign Key Vault RBAC roles before onboarding."
+        throw "The current signed-in principal does not have Owner, User Access Administrator, or Role Based Access Control Administrator effective on $Scope. Sign in with a principal that can assign these RBAC roles before onboarding."
     }
 }
 
@@ -228,42 +254,66 @@ $targetSubscriptionId = Get-SubscriptionId $targetId
 # This remains read-only and prevents a later pair from failing after earlier pairs
 # have already been onboarded.
 Write-Host 'Checking whether the current Azure principal can assign Key Vault RBAC permissions on both vaults.'
-$currentPrincipalId = Get-SignedInPrincipalId
+$currentPrincipal = Get-SignedInPrincipal
+$currentPrincipalId = $currentPrincipal.Id
 Assert-CanManageRbacOnScope -Scope $targetId -SubscriptionId $targetSubscriptionId -PrincipalId $currentPrincipalId
 Write-Host 'Verified the current Azure principal can manage role assignments on the target vault.'
 Assert-CanManageRbacOnScope -Scope $sourceId -SubscriptionId $sourceSubscriptionId -PrincipalId $currentPrincipalId
 Write-Host 'Verified the current Azure principal can manage role assignments on the source vault.'
 
-$plans = @(
-    # Key Vault Administrator (source backup/read access)
-    [pscustomobject]@{
-        Scope = $sourceId
-        Subscription = Get-SubscriptionId $sourceId
-        RoleId = '00482a5a-887f-4fb3-b363-3b7fe8e74483'
-        RoleName = 'Key Vault Administrator'
+# Resolve the state account in the deployment subscription and require its Blob endpoint to match
+# the configured URI so the grant cannot land on a same-named account elsewhere.
+$storageId = $null
+if ($IncludeSignedInUser) {
+    $storage = Invoke-AzJson -Arguments @('storage', 'account', 'show', '--name', $storageAccountName, '--subscription', $identitySubscription)
+    if (([string] $storage.primaryEndpoints.blob).TrimEnd('/') -ine $StorageAccountUri.TrimEnd('/')) {
+        throw 'The resolved storage account Blob endpoint does not match the configured state storage URI.'
     }
-    # Key Vault Data Access Administrator (source role-assignment management)
-    [pscustomobject]@{
-        Scope = $sourceId
-        Subscription = Get-SubscriptionId $sourceId
-        RoleId = '8b54135c-b56d-4d72-a534-26097cfdc8d8'
-        RoleName = 'Key Vault Data Access Administrator'
+    $storageId = [string] $storage.id
+    Assert-CanManageRbacOnScope -Scope $storageId -SubscriptionId (Get-SubscriptionId $storageId) -PrincipalId $currentPrincipalId
+    Write-Host 'Verified the current Azure principal can manage role assignments on the state storage account.'
+}
+
+# Key Vault Administrator (source backup/read access) and Key Vault Data Access Administrator
+# (role-assignment management) on both vaults.
+function New-VaultPlans {
+    param([string] $AssigneeId, [string] $AssigneeType, [string] $AssigneeLabel)
+    foreach ($scope in @($sourceId, $targetId)) {
+        foreach ($role in @(
+                @{ Id = '00482a5a-887f-4fb3-b363-3b7fe8e74483'; Name = 'Key Vault Administrator' },
+                @{ Id = '8b54135c-b56d-4d72-a534-26097cfdc8d8'; Name = 'Key Vault Data Access Administrator' })) {
+            [pscustomobject]@{
+                Scope = $scope
+                Subscription = Get-SubscriptionId $scope
+                RoleId = $role.Id
+                RoleName = $role.Name
+                PrincipalId = $AssigneeId
+                PrincipalType = $AssigneeType
+                PrincipalLabel = $AssigneeLabel
+            }
+        }
     }
-    # Key Vault Administrator
-    [pscustomobject]@{
-        Scope = $targetId
-        Subscription = Get-SubscriptionId $targetId
-        RoleId = '00482a5a-887f-4fb3-b363-3b7fe8e74483'
-        RoleName = 'Key Vault Administrator'
+}
+
+$plans = @(New-VaultPlans -AssigneeId $principalId.ToLowerInvariant() -AssigneeType 'ServicePrincipal' -AssigneeLabel 'runtime identity')
+if ($IncludeSignedInUser) {
+    $signedInLabel = if ($currentPrincipal.Type -eq 'User') { 'signed-in user' } else { 'signed-in service principal' }
+    if ($currentPrincipalId -ieq $principalId) {
+        Write-Host 'The signed-in principal is the runtime identity; no separate signed-in grants are planned.'
     }
-    # Key Vault Data Access Administrator
-    [pscustomobject]@{
-        Scope = $targetId
-        Subscription = Get-SubscriptionId $targetId
-        RoleId = '8b54135c-b56d-4d72-a534-26097cfdc8d8'
-        RoleName = 'Key Vault Data Access Administrator'
+    else {
+        $plans += @(New-VaultPlans -AssigneeId $currentPrincipalId -AssigneeType $currentPrincipal.Type -AssigneeLabel $signedInLabel)
+        $plans += [pscustomobject]@{
+            Scope = $storageId
+            Subscription = Get-SubscriptionId $storageId
+            RoleId = 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+            RoleName = 'Storage Blob Data Contributor'
+            PrincipalId = $currentPrincipalId
+            PrincipalType = $currentPrincipal.Type
+            PrincipalLabel = $signedInLabel
+        }
     }
-)
+}
 
 # Preflight existing direct assignments without changing IAM.
 $missing = [System.Collections.Generic.List[object]]::new()
@@ -271,7 +321,7 @@ foreach ($plan in $plans) {
     $assignments = @(Invoke-AzJson -Arguments @(
         'role', 'assignment', 'list',
         '--scope', $plan.Scope,
-        '--assignee-object-id', $principalId,
+        '--assignee-object-id', $plan.PrincipalId,
         '--subscription', $plan.Subscription,
         '--fill-principal-name', 'false'
     ))
@@ -287,7 +337,7 @@ Write-Host "  Source subscription: $(Get-SubscriptionId $sourceId)"
 Write-Host "  Target subscription: $(Get-SubscriptionId $targetId)"
 foreach ($plan in $plans) {
     $status = if ($missing.Contains($plan)) { 'create' } else { 'existing' }
-    Write-Host "  - $($plan.RoleName) at $($plan.Scope) [$status]"
+    Write-Host "  - $($plan.RoleName) at $($plan.Scope) for $($plan.PrincipalLabel) [$status]"
 }
 
 if (-not $Apply) {
@@ -306,11 +356,11 @@ if ((Normalize-ResourceId (Get-TagValue $currentTarget 'sync-source-keyvault-id'
 
 foreach ($plan in $missing) {
     # ShouldProcess preserves PowerShell -WhatIf/-Confirm behavior at the mutation boundary.
-    if ($PSCmdlet.ShouldProcess("$($plan.Scope) / $($plan.RoleName)", 'Create direct role assignment')) {
+    if ($PSCmdlet.ShouldProcess("$($plan.Scope) / $($plan.RoleName) / $($plan.PrincipalLabel)", 'Create direct role assignment')) {
         [void] (Invoke-AzJson -Arguments @(
             'role', 'assignment', 'create',
-            '--assignee-object-id', $principalId,
-            '--assignee-principal-type', 'ServicePrincipal',
+            '--assignee-object-id', $plan.PrincipalId,
+            '--assignee-principal-type', $plan.PrincipalType,
             '--role', $plan.RoleId,
             '--scope', $plan.Scope,
             '--subscription', $plan.Subscription

@@ -269,11 +269,24 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         activity?.SetTag("sync.disabled", syncDisabled);
         activity?.SetStatus(ActivityStatusCode.Ok);
 
+        var vaultReference = ArmResourceReference.Parse(vault.Id);
+        if (!hasSourceId)
+        {
+            logger.LogInformation(
+                KeyVaultDiscoveredEventId,
+                "Discovered Key Vault {KeyVaultName} (rg {ResourceGroup}, sub {SubscriptionId}) in {Region}. Target source tag {SourceKeyVaultIdTagName} is present: {HasSourceId}; sync disabled: {SyncDisabled}.",
+                vault.Name, vault.ResourceGroup, vaultReference.SubscriptionId, vault.Location,
+                KeyVaultSyncResourceTags.SyncSourceKeyVaultId, hasSourceId, syncDisabled);
+            return;
+        }
+
+        var sourceReference = ArmResourceReference.Parse(sourceId);
         logger.LogInformation(
             KeyVaultDiscoveredEventId,
-            "Discovered Key Vault {KeyVaultName} in resource group {ResourceGroup} at {Region}. Target source tag {SourceKeyVaultIdTagName} is present: {HasSourceId}; source ID: {SourceId}; sync disabled: {SyncDisabled}.",
-            vault.Name, vault.ResourceGroup, vault.Location,
-            KeyVaultSyncResourceTags.SyncSourceKeyVaultId, hasSourceId, sourceId, syncDisabled);
+            "Discovered Key Vault {KeyVaultName} (rg {ResourceGroup}, sub {SubscriptionId}) in {Region}. Target source tag {SourceKeyVaultIdTagName} is present: {HasSourceId}; source {SourceVaultName} (rg {SourceResourceGroup}, sub {SourceSubscriptionId}); sync disabled: {SyncDisabled}.",
+            vault.Name, vault.ResourceGroup, vaultReference.SubscriptionId, vault.Location,
+            KeyVaultSyncResourceTags.SyncSourceKeyVaultId, hasSourceId,
+            sourceReference.Name, sourceReference.ResourceGroup, sourceReference.SubscriptionId, syncDisabled);
     }
 
     /// <summary>Emits one structured event/activity explaining a candidate's enabled, paused, or rejected decision.</summary>
@@ -296,17 +309,15 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         activity?.SetTag("sync.decision", decision);
         activity?.SetStatus(isMappingIssue ? ActivityStatusCode.Error : ActivityStatusCode.Ok, decision);
 
-        const string logMessage = "Key Vault sync pair evaluated. Source {SourceVaultName}; target {TargetVaultName}; sync enabled: {SyncEnabled}; sync ID: {SyncId}; decision: {Decision}.";
-        if (isMappingIssue)
-        {
-            logger.LogWarning(KeyVaultSyncPairEvaluatedEventId, logMessage,
-                source.Name, target?.Name, syncEnabled, syncId, decision);
-        }
-        else
-        {
-            logger.LogInformation(KeyVaultSyncPairEvaluatedEventId, logMessage,
-                source.Name, target?.Name, syncEnabled, syncId, decision);
-        }
+        // Parts come from the IDs because unresolved sources are placeholders without a Name; an invalid tag value is
+        // logged as the source name so the administrator can see what to correct.
+        var sourceReference = ArmResourceReference.Parse(source.Id);
+        var targetReference = ArmResourceReference.Parse(target?.Id ?? syncId);
+        const string logMessage = "Key Vault sync pair evaluated. Source {SourceVaultName} (rg {SourceResourceGroup}, sub {SourceSubscriptionId}); target {TargetVaultName} (rg {TargetResourceGroup}, sub {TargetSubscriptionId}); sync enabled: {SyncEnabled}; decision: {Decision}.";
+        logger.Log(isMappingIssue ? LogLevel.Warning : LogLevel.Information, KeyVaultSyncPairEvaluatedEventId, logMessage,
+            sourceReference.Name, sourceReference.ResourceGroup, sourceReference.SubscriptionId,
+            targetReference.Name, targetReference.ResourceGroup, targetReference.SubscriptionId,
+            syncEnabled, decision);
 
         var diagnostic = AdminDiagnostics.ClassifyDiscoveryDecision(decision);
         logger.Log(
@@ -387,15 +398,18 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
         catch (Exception exception)
         {
             warnings.Add($"Role-assignment inventory is incomplete at {vaultId}: {SafeError(exception)}");
-            logger.LogWarning(exception, "Role-assignment inventory is incomplete at {Scope}.", vaultId);
+            var incompleteVault = ArmResourceReference.Parse(vaultId);
+            logger.LogWarning(exception, "Role-assignment inventory is incomplete for vault {VaultName} (rg {ResourceGroup}, sub {SubscriptionId}).",
+                incompleteVault.Name, incompleteVault.ResourceGroup, incompleteVault.SubscriptionId);
         }
 
         activity?.SetTag("authorization.rbac_enabled", usesRbac);
         activity?.SetTag("authorization.access_policy_count", policies.Count);
         activity?.SetTag("authorization.role_assignment_count", roleAssignments.Count);
         activity?.SetTag("authorization.warning_count", warnings.Count);
-        logger.LogInformation("Authorization inventory for {VaultName} found {AccessPolicyCount} access policies, {RoleAssignmentCount} direct role assignments, and {WarningCount} warnings.",
-            vaultId.Split('/', StringSplitOptions.RemoveEmptyEntries).LastOrDefault(), policies.Count, roleAssignments.Count, warnings.Count);
+        var inventoriedVault = ArmResourceReference.Parse(vaultId);
+        logger.LogInformation("Authorization inventory for vault {VaultName} (rg {ResourceGroup}, sub {SubscriptionId}) found {AccessPolicyCount} access policies, {RoleAssignmentCount} direct role assignments, and {WarningCount} warnings.",
+            inventoriedVault.Name, inventoriedVault.ResourceGroup, inventoriedVault.SubscriptionId, policies.Count, roleAssignments.Count, warnings.Count);
 
         return new VaultAuthorizationSummary
         {
@@ -499,9 +513,10 @@ internal sealed class ArmResourceClient(TokenCredential credential, ILogger<ArmR
                 }
             }
 
+            var scopeReference = ArmResourceReference.Parse(scope);
             logger.LogInformation(RoleAssignmentPageCompletedEventId,
-                "ARM role-assignment page completed. {Scope}; page {PageNumber}; {PageAssignmentCount} assignments on page; {TotalAssignmentCount} retained assignments.",
-                scope, pageNumber, pageAssignmentCount, assignments.Count);
+                "ARM role-assignment page completed for {ScopeName} (rg {ScopeResourceGroup}, sub {ScopeSubscriptionId}); page {PageNumber}; {PageAssignmentCount} assignments on page; {TotalAssignmentCount} retained assignments.",
+                scopeReference.Name, scopeReference.ResourceGroup, scopeReference.SubscriptionId, pageNumber, pageAssignmentCount, assignments.Count);
             requestUri = GetString(document.RootElement, "nextLink") ?? string.Empty;
         }
 

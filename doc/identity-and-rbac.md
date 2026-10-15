@@ -61,6 +61,10 @@ The source administrator role permits the supported object replication reads and
 
 Key Vault Data Access Administrator carries no data actions at all. It grants `Microsoft.Authorization/roleAssignments/write` and `/delete`, constrained by an ABAC condition to the built-in Key Vault data roles. On the target vault it is required, because the runtime creates and deletes target role assignments. On the source vault the runtime never uses it: every mutation path takes a target scope only. It is granted there solely so operators can manage source Key Vault role assignments with the same identity, and it permits granting any built-in Key Vault data role on the source vault to any principal. Grant it only where that authority is intended. The Data Access Administrator assignment is an operational permission and is excluded from source-to-target replication.
 
+### Terminal Runner Operator
+
+The terminal runner (`src/KeyVaultSync.Cli`) runs as the signed-in identity instead of the managed identity. That identity needs the four vault roles above and **Storage Blob Data Contributor** on the state storage account, and it must have Reader on the configured subscriptions through its own assignments. With `--include-signed-in-user --storage-account-uri <uri>` (Bash) or `-IncludeSignedInUser -StorageAccountUri <uri>` (PowerShell), the grant scripts add the vault roles and the storage role for the signed-in user or service principal in the same preview/apply flow. They do not grant subscription Reader. When `KEYVAULTSYNC_PRINCIPAL_ID` is not configured, the CLI uses the signed-in object ID for self-revocation protection.
+
 The scripts never modify tags, access policies, vault authorization mode, role definitions, objects, or unrelated assignments.
 
 ## Replicated Assignments

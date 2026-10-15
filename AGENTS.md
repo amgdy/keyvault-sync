@@ -8,7 +8,7 @@ Use neutral product terminology. Runtime discovery uses target-side `sync-source
 
 ## Current Boundaries
 
-- `KeyVaultSync.Function` is a thin timer/host adapter; `TimerInvocationHandler` owns invocation telemetry and outcome mapping; `RunnerApplication` owns run and pair orchestration.
+- `KeyVaultSync.Function` is a thin timer/host adapter; `KeyVaultSync.Cli` is a thin terminal host that runs one cycle through `RunnerApplication` and must not gain its own orchestration or mutation path (its configuration resolution lives in `TerminalConfiguration`, imports only allowlisted runner settings from the azd environment, and never accepts the HMAC key as an argument); `TimerInvocationHandler` owns invocation telemetry and outcome mapping; `RunnerApplication` owns run and pair orchestration.
 - `ArmResourceClient` owns subscription discovery and declared-authorization inventory.
 - `VaultInventoryScanner` performs value-free inventory; `ReplicationPlanner` is pure; `ObjectExecutor` owns guarded secret/certificate writes and soft deletes; `RbacExecutor` owns allowlisted direct Key Vault RBAC reconciliation.
 - An enabled, unpaused mapping is the runtime opt-in for supported operations. Secrets and exportable PFX certificates are supported. Standalone private/symmetric keys and non-exportable certificate material remain blocked. Purge is never supported.
@@ -19,7 +19,7 @@ Use neutral product terminology. Runtime discovery uses target-side `sync-source
 
 - `prepare-deployment.sh` and `Prepare-Deployment.ps1` are the only azd preparation hooks. The `provision` phase validates subscriptions, obtains or preserves the HMAC key, and handles the optional deployment tag. The `deploy` phase revalidates the HMAC key and deployment-storage reachability before package upload.
 - Never generate or rotate an HMAC key when an environment already has one. A replacement makes existing baselines incompatible. Non-interactive deployment must receive the key through protected pipeline configuration.
-- `postdeploy-keyvault-access.*` discovers enabled mappings and delegates to `grant-keyvault-access.*`. Grant scripts preview by default and require explicit apply approval.
+- `postdeploy-keyvault-access.*` discovers enabled mappings and delegates to `grant-keyvault-access.*`. Grant scripts preview by default and require explicit apply approval. The optional signed-in-user grant (`--include-signed-in-user`/`-IncludeSignedInUser`, or the default-No postdeploy question) adds the same vault roles plus Storage Blob Data Contributor on state storage for terminal-runner operators.
 - Do not add backup/restore, vault replacement, purge, mapping-tag mutation, or live synchronization to deployment hooks.
 
 ## Privacy and Security
@@ -37,6 +37,7 @@ Run focused checks from the repository root:
 ```sh
 dotnet test tests/KeyVaultSync.Runner.Tests/KeyVaultSync.Runner.Tests.csproj --no-restore
 dotnet build src/KeyVaultSync.Function/KeyVaultSync.Function.csproj --no-restore -p:GenerateDocumentationFile=true -warnaserror
+dotnet build src/KeyVaultSync.Cli/KeyVaultSync.Cli.csproj --no-restore -warnaserror
 bash tests/grant-keyvault-access.tests.sh
 bash tests/prepare-deployment.tests.sh
 bash tests/postdeploy-keyvault-access.tests.sh

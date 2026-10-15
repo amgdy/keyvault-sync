@@ -34,10 +34,11 @@ The arrows show runtime dependencies, not resource ownership. In particular, app
 ## Components
 
 - **KeyVaultSync.Function** is a thin .NET 10 isolated timer host.
+- **KeyVaultSync.Cli** is a thin terminal host that runs one cycle through the same `RunnerApplication` and streams console logs; it is a local operator tool and is not deployed.
 - **TimerInvocationHandler** owns the invocation start/completion records, invocation span tags, and the mapping from aggregate run status to invocation result.
 - **RunnerApplication** owns discovery, admission, planning, execution, reporting, and pair coordination.
 - **ArmResourceClient** performs read-only multi-subscription discovery and declared-authorization inventory.
-- **VaultInventoryScanner** produces value-free active and soft-deleted object inventories.
+- **VaultInventoryScanner** produces value-free active and soft-deleted object inventories. It records each object by name with its current-version metadata and does not list version history. Warnings about a single object are recorded as object-scoped so the planner blocks only that name; vault-level listing warnings still block all object work for the pair.
 - **ReplicationPlanner** is deterministic and performs no Azure mutation.
 - **ObjectExecutor** owns guarded secret/certificate creation, reconciliation, and soft deletion.
 - **RbacExecutor** owns supported direct role-assignment creation and deletion.
@@ -117,7 +118,7 @@ Vault RBAC can converge even when object HMAC material is unavailable. Object-sc
 
 ### Secrets
 
-The executor reads the exact planned source version and writes one new target version. Content type, enabled state, validity dates, and tags are included.
+The executor reads the source's current version by name, pins that exact version for the intent, write, verification, and baseline, and writes one new target version. A source whose current version is disabled is blocked (`BLOCKED_SOURCE_VERSION_DISABLED`); older versions are never used. Content type, enabled state, validity dates, and tags are included.
 
 ### Certificates
 
